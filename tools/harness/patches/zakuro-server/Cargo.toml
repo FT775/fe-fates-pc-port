@@ -1,0 +1,35 @@
+# The persistent server mode of the windowless boot (docs/harness/SERVER.md, owner OK "E", 2026-11-13).
+# tools/harness/build.py --server copies this folder to engine/zakuro-server/ (gitignored, beside the Zakuro pin,
+# which is never edited) and builds it into engine/target/zakuro-server/. It links zakuro-core from the pinned,
+# patched Zakuro tree by path, with the same features and release profile as engine/zakuro's workspace builds of
+# examples/boot.rs, so the emulation code is the same code boot.exe runs. Zakuro is MIT; so is this file.
+[package]
+name = "zakuro-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "boot-server"
+path = "src/main.rs"
+
+[dependencies]
+zakuro-core = { path = "../zakuro/crates/zakuro-core" }
+zakuro-common = { path = "../zakuro/crates/zakuro-common" }
+# boot.exe is an example of zakuro-core, so its build turns on zakuro-core's dev-dependency features too
+# (zakuro-fs "testing": NCCH/CIA builders, no effect on a run); kept on so the feature set is the same
+zakuro-fs = { path = "../zakuro/crates/zakuro-fs", features = ["testing"] }
+env_logger = "0.11"
+log = "0.4"
+
+# its own workspace: never a member of engine/zakuro's
+[workspace]
+
+# engine/zakuro/Cargo.toml [profile.release], copied
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+debug = 1

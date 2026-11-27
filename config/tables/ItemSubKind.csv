@@ -1,0 +1,8 @@
+offset,size,type,name,confidence,evidence
+0x00,1,u8,subkind_number,medium,equals the record index in every record (ItemSubKind::Get(int) = table+i*0x10)
+0x01,1,ref8:ItemKind,kind,high,Unit::GetHit 00532DC4 / Unit::GetAttack pass ItemSubKind::Get(Item+0x1A)+0x1 to WeaponBonus::Get(ItemKind::Type); map::BattleInfo::CalculateDetail uses it to index the weapon triangle (80 functions read +0x1)
+0x02,1,u8,origin,medium,anonymous_namespace::ItemGetOrigin 003A8AE4 and spot::WeaponEnumerator::IsExclusion read +0x2; values 0-2 (data: the Hoshido-style kinds and the Nohr-style kinds differ)
+0x03,1,s8,refine_group,medium,"ProcSequence::CreateGemstoneMenu / ItemRefineMenu::DrawWindow / ItemRefineMenuItem::ACall / IsDecideDisable read +0x3 (s8); -1 on staves, stones and items"
+0x04,4,str,mikid_name,medium,data: MIKID_ name message in every record; no read seen yet
+0x08,4,str,mikid_help,high,ItemSubKind::GetHelp 00508710 reads +0x8 (MIKID_H_ message)
+0x0C,4,u32,skill_flags,medium,map::BattleCalculator::CalculateAttackSingle 003628BC tests bit 0 and bit 1 of +0xC before rolling (different) skill activations; AIBattleSimulator::CalculateIndication reads it too; values 0-2

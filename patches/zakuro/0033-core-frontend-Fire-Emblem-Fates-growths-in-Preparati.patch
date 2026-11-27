@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Tue, 24 Nov 2026 15:04:40 -0500
+Subject: [PATCH] core: frontend: Fire Emblem Fates: growths in Preparations on
+ Y
+
+Round 71 (FULL_SWAP_PLAN.md section 5, owner OK "Yes, start round 71"): in
+Preparations the Y button (keyboard: the key for Y, A by default) switches the
+growth view on the unit panel, one switch per press, the press kept from the
+game until let go. Y is taken only while prep_shown(): the Preparations
+sequence is alive (sortie::Sequence::GetInstance, the word at 0x006D9030), its
+View Map is not running (map::SequenceHuman::GetInstance, 0x006D7BA4, zero)
+and the panel shows a unit. No menu of Preparations reads Y (only
+MIMassageName and the debug menus override BasicMenuItem::YCall). Everywhere
+else Y reaches the game unchanged; Select / Tab / a touch on Growths work as in
+round 62.
+
+Preparations' panel (Pick Units, the unit list, Inventory) is the map's panel
+without the grid button: the same stat block, so the same boxes. A second
+frame check (shows_prep_frame, measured on 2080 robot pictures; no match among
+7095 others, none matches both) lets paint() draw there, and only while the
+view is on, so with Y never pressed every picture is the round-62 one. Nothing
+writes guest memory.
+
+"Settings for this game" (Fire Emblem Fates and mods on its title id) gets one
+help line naming the keys: growth_help().
+
+Tests: y_switches_growths_only_in_preparations,
+y_reaches_the_game_everywhere_else, select_on_the_map_is_unchanged,
+preparations_panel_is_painted_only_while_the_view_is_on,
+the_growth_help_names_the_keys_y_is_on.
+---
+ crates/zakuro-core/src/fates_growth_view.rs | 227 +++++++++++++++++++++++++++-
+ crates/zakuro/src/menus.rs                  |  25 +++
+ 2 files changed, 248 insertions(+), 4 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_growth_view.rs b/crates/zakuro-core/src/fates_growth_view.rs
+index d96ca26..0c5c65d 100644
+--- a/crates/zakuro-core/src/fates_growth_view.rs
++++ b/crates/zakuro-core/src/fates_growth_view.rs
+@@ -30,6 +30,20 @@
+ //! - `Personality::Get` 0x001A0B1C: `*0x006D3B98 + 0x40 * i`. `Person::Get(u16)` 0x0044A6F8: the
+ //!   block list at `*0x006D3B28`. `Person::IsFemale` 0x0053ED90: Person's first 8 bytes and the
+ //!   mask cached at 0x006D3B70 (made once, guard bit 0 of 0x006D3B2C).
++//!
++//! Preparations (round 71, FULL_SWAP_PLAN.md section 5): there **Y** switches the view too, and Y
++//! is kept from the game only while `prep_shown` (no menu of Preparations reads Y: only
++//! `MIMassageName` and the debug menus override `BasicMenuItem::YCall`). On the battle map Y
++//! reaches the game as before and Select stays the key. Preparations' unit panel (Pick Units, the
++//! unit list, Inventory) is the map's panel without the grid button: the same stat block, so the
++//! same boxes; it is painted only while the view is on, so with Y never pressed every picture is
++//! the round-62 one.
++//! - `sortie::Sequence::GetInstance` 0x004BCFD8 returns the word at 0x006D902C + 4, set by the
++//!   Preparations sequence's constructor 0x004BD1CC and cleared by its destructor 0x004BD2F4.
++//! - `map::SequenceHuman::GetInstance` 0x00350D74 returns the word at 0x006D7B90 + 0x14, set by
++//!   `Create` 0x00354604 and cleared by the destructor 0x003545A0. Preparations starts it for
++//!   View Map (its proc list in `__sti___18_SortieSequence_cpp`: SetInfoMap, SequenceHuman::Create,
++//!   SetInfoSortie), where the map cursor has its own keys.
+ 
+ use crate::fates_rando::Guest;
+ use crate::services::hid::{InputState, PadState};
+@@ -39,6 +53,10 @@ const PERSONALITY: u32 = 0x006D_3B98;
+ const PERSON_LIST: u32 = 0x006D_3B28;
+ const FEMALE_GUARD: u32 = 0x006D_3B2C;
+ const FEMALE_MASK: u32 = 0x006D_3B70;
++/// the Preparations sequence while it is alive (`sortie::Sequence::GetInstance`)
++pub const SORTIE_SEQUENCE: u32 = 0x006D_9030;
++/// the player's map cursor sequence while it is alive (`map::SequenceHuman::GetInstance`)
++pub const MAP_HUMAN: u32 = 0x006D_7BA4;
+ 
+ /// the stat order of the game: hp, str, mag, skl, spd, lck, def, res.
+ pub const STATS: usize = 8;
+@@ -61,6 +79,10 @@ pub struct GrowthView {
+     pub on: bool,
+     select_held: bool,
+     touch_held: bool,
++    /// Y was down at the last input (a press is new only after a let go)
++    y_down: bool,
++    /// this Y press switched the view in Preparations: kept from the game until let go
++    y_held: bool,
+     /// times the view was switched (for tests and the robot's log)
+     pub toggles: u32,
+ }
+@@ -89,6 +111,13 @@ pub fn panel_unit(g: &mut dyn Guest) -> Option<u32> {
+     Some(unit)
+ }
+ 
++/// Preparations shows the unit panel (Pick Units, the unit list, Inventory): the Preparations
++/// sequence is alive, its View Map is not running, and the panel shows a unit. Read only.
++pub fn prep_shown(g: &mut dyn Guest) -> bool {
++    let alive = |g: &mut dyn Guest, at: u32| g.r32(at).is_some_and(|p| p != 0);
++    alive(g, SORTIE_SEQUENCE) && !alive(g, MAP_HUMAN) && panel_unit(g).is_some()
++}
++
+ fn s8(g: &mut dyn Guest, addr: u32) -> Option<i32> {
+     if !g.readable(addr, 1) {
+         return None;
+@@ -226,8 +255,10 @@ impl GrowthView {
+     }
+ 
+     /// the input the game gets: while the panel is shown, a Select press or a touch on the
+-    /// Growths button switches the view and is kept from the game (held until let go).
++    /// Growths button switches the view and is kept from the game (held until let go). In
++    /// Preparations (`prep_shown`) a Y press does the same; everywhere else Y reaches the game.
+     pub fn filter_input(&mut self, g: &mut dyn Guest, input: &mut InputState) {
++        self.filter_y(g, input);
+         let select = input.buttons.contains(PadState::SELECT);
+         let touch_in = input.touch.is_some_and(in_button);
+         let fresh_select = select && !self.select_held;
+@@ -258,9 +289,28 @@ impl GrowthView {
+         }
+     }
+ 
++    /// Y in Preparations: one switch per press, the press kept from the game until let go. A Y
++    /// already down when Preparations shows the panel, or pressed anywhere else, reaches the game.
++    fn filter_y(&mut self, g: &mut dyn Guest, input: &mut InputState) {
++        let y = input.buttons.contains(PadState::Y);
++        let fresh = y && !self.y_down;
++        self.y_down = y;
++        if !y {
++            self.y_held = false;
++            return;
++        }
++        if fresh && prep_shown(g) && self.toggle(g) {
++            self.y_held = true;
++        }
++        if self.y_held {
++            input.buttons.remove(PadState::Y);
++        }
++    }
++
+     /// paints the Growths button, and the percents while the view is on, into the bottom
+     /// picture (RGBA, `width` x `height`, a whole multiple of 320 x 240), only when the picture
+-    /// shows the panel's stat block. True when it painted.
++    /// shows the panel's stat block. True when it painted. Preparations' panel (no grid button)
++    /// is painted only while the view is on.
+     pub fn paint(&self, g: &mut dyn Guest, pixels: &mut [u8], width: u32, height: u32) -> bool {
+         let scale = width / 320;
+         if scale == 0 || height / 240 != scale || pixels.len() < (width * height * 4) as usize {
+@@ -268,7 +318,7 @@ impl GrowthView {
+         }
+         let Some(unit) = panel_unit(g) else { return false };
+         let mut pic = Pic { px: pixels, width, scale };
+-        if !pic.shows_frame() {
++        if !pic.shows_frame() && !(self.on && pic.shows_prep_frame()) {
+             return false;
+         }
+         let full = pic.shows_panel();
+@@ -331,6 +381,21 @@ impl Pic<'_> {
+             .all(|&((x, y), w)| near(self.at(x, y), w))
+     }
+ 
++    /// Preparations' unit panel (Pick Units, the unit list, Inventory and its item menu): the
++    /// same book button, the right column's dark edge, and the plain dark ground where the map's
++    /// panel has its grid button (measured on 2080 robot pictures of rounds 62 and 70, the three
++    /// routes and Seal of Flames, every pixel the same in all; none of the 7095 other pictures
++    /// matches, and no picture matches both this and `shows_frame`).
++    fn shows_prep_frame(&self) -> bool {
++        let near = |c: [u8; 3], w: [u8; 3]| c.iter().zip(w).all(|(&a, b)| a.abs_diff(b) <= 14);
++        [((14, 218), [161, 79, 21]), ((20, 222), [245, 179, 129]), ((30, 228), [230, 172, 123]),
++         ((291, 15), [79, 19, 0]), ((291, 27), [69, 17, 0]), ((299, 217), [113, 72, 55]),
++         ((305, 218), [109, 68, 51]), ((311, 223), [105, 64, 47]), ((299, 224), [99, 58, 41]),
++         ((304, 230), [97, 64, 47])]
++            .iter()
++            .all(|&((x, y), w)| near(self.at(x, y), w))
++    }
++
+     /// the eight percents as a table (the short page): HP Str Mag Skl | Spd Lck Def Res.
+     fn table(&mut self, t: &[i32; STATS]) {
+         let (l, top, r, b) = (2u32, 161u32, 108u32, 209u32);
+@@ -493,7 +558,7 @@ mod tests {
+     /// a game with the unit panel up (kind 1), a playable unit (unit_kind 1)
+     fn game() -> Fake {
+         let mut m = Fake::default();
+-        m.put(0x006D_3000, &vec![0; 0x3000]); // globals 0x006D3000..0x006D6000
++        m.put(0x006D_3000, &vec![0; 0x7000]); // globals 0x006D3000..0x006DA000
+         m.put(INFO, &vec![0; 0x1100]);
+         m.put(UNIT, &vec![0; 0x140]);
+         m.put(PERSON, &vec![0; 0x98]);
+@@ -604,4 +669,158 @@ mod tests {
+         assert!(!v.paint(&mut m, &mut px, 320, 240)); // a black picture is not the panel
+         assert!(px.iter().all(|&b| b == 0));
+     }
++
++    const SEQ: u32 = 0x3600_0000;
++
++    fn press(b: PadState) -> InputState {
++        InputState { buttons: b, ..Default::default() }
++    }
++
++    /// the game in Preparations: the sequence alive, View Map not running, the panel up
++    fn prep() -> Fake {
++        let mut m = game();
++        m.w32(SORTIE_SEQUENCE, SEQ);
++        m
++    }
++
++    #[test]
++    fn y_switches_growths_only_in_preparations() {
++        let mut m = prep();
++        assert!(prep_shown(&mut m));
++        let mut v = GrowthView::default();
++        let mut i = press(PadState::Y | PadState::DOWN);
++        v.filter_input(&mut m, &mut i);
++        assert!(v.on);
++        assert_eq!(i.buttons, PadState::DOWN); // Y kept from the game, the rest reaches it
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i); // still held: no second switch, still kept
++        assert!(v.on);
++        assert!(i.buttons.is_empty());
++        let mut i = press(PadState::empty());
++        v.filter_input(&mut m, &mut i);
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert!(!v.on);
++        assert!(i.buttons.is_empty());
++        assert_eq!(v.toggles, 2);
++        // the press stays kept until let go, even when the panel goes away under it
++        m.write(INFO + 0x30, &[0]);
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert!(i.buttons.is_empty());
++        let mut i = press(PadState::empty());
++        v.filter_input(&mut m, &mut i);
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert_eq!(i.buttons, PadState::Y);
++        assert_eq!(v.toggles, 2);
++    }
++
++    #[test]
++    fn y_reaches_the_game_everywhere_else() {
++        let mut v = GrowthView::default();
++        let tap = |v: &mut GrowthView, m: &mut Fake| {
++            let mut i = press(PadState::Y);
++            v.filter_input(&mut *m, &mut i);
++            let held = i.buttons;
++            let mut i = press(PadState::empty());
++            v.filter_input(&mut *m, &mut i);
++            held
++        };
++        // the battle map: the panel is up but Preparations is not alive
++        let mut m = game();
++        assert!(!prep_shown(&mut m));
++        assert_eq!(tap(&mut v, &mut m), PadState::Y);
++        // Preparations' View Map: the map cursor runs
++        let mut m = prep();
++        m.w32(MAP_HUMAN, 0x3700_0000);
++        assert!(!prep_shown(&mut m));
++        assert_eq!(tap(&mut v, &mut m), PadState::Y);
++        // Preparations with no unit on the panel (the top menu)
++        let mut m = prep();
++        m.write(INFO + 0x30, &[0]);
++        assert!(!prep_shown(&mut m));
++        assert_eq!(tap(&mut v, &mut m), PadState::Y);
++        assert!(!v.on);
++        assert_eq!(v.toggles, 0);
++        // a Y already down when the panel shows is not a new press: it reaches the game
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        m.write(INFO + 0x30, &[1]);
++        let mut i = press(PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert_eq!(i.buttons, PadState::Y);
++        assert!(!v.on);
++    }
++
++    #[test]
++    fn select_on_the_map_is_unchanged() {
++        // the battle map: Select switches and is kept, Y is left alone
++        let mut m = game();
++        let mut v = GrowthView::default();
++        let mut i = press(PadState::SELECT | PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert!(v.on);
++        assert_eq!(i.buttons, PadState::Y);
++        assert_eq!(v.toggles, 1);
++        // Select and Y pressed together in Preparations switch once each: on, then off
++        let mut i = press(PadState::empty());
++        v.filter_input(&mut m, &mut i);
++        let mut m = prep();
++        let mut i = press(PadState::SELECT | PadState::Y);
++        v.filter_input(&mut m, &mut i);
++        assert_eq!(v.toggles, 3);
++        assert!(v.on);
++        assert!(i.buttons.is_empty());
++    }
++
++    /// a picture of the given points (native 320 x 240, scale 1)
++    fn picture(points: &[((u32, u32), [u8; 3])]) -> Vec<u8> {
++        let mut px = vec![0u8; 320 * 240 * 4];
++        for &((x, y), c) in points {
++            let i = ((y * 320 + x) * 4) as usize;
++            px[i..i + 3].copy_from_slice(&c);
++            px[i + 3] = 255;
++        }
++        px
++    }
++
++    const PREP_FRAME: [((u32, u32), [u8; 3]); 10] = [
++        ((14, 218), [161, 79, 21]), ((20, 222), [245, 179, 129]), ((30, 228), [230, 172, 123]),
++        ((291, 15), [79, 19, 0]), ((291, 27), [69, 17, 0]), ((299, 217), [113, 72, 55]),
++        ((305, 218), [109, 68, 51]), ((311, 223), [105, 64, 47]), ((299, 224), [99, 58, 41]),
++        ((304, 230), [97, 64, 47]),
++    ];
++
++    #[test]
++    fn preparations_panel_is_painted_only_while_the_view_is_on() {
++        let mut m = prep();
++        let mut points = PREP_FRAME.to_vec();
++        // the full page's stat block: cream labels, orange boxes
++        for p in [(10, 164), (58, 215), (59, 215), (7, 185), (12, 185), (58, 198), (59, 198)] {
++            points.push((p, [250, 225, 160]));
++        }
++        for p in [(30, 168), (80, 168), (30, 202), (80, 219), (30, 185), (80, 185)] {
++            points.push((p, [200, 120, 40]));
++        }
++        let clean = picture(&points);
++        assert!(Pic { px: &mut clean.clone(), width: 320, scale: 1 }.shows_prep_frame());
++        assert!(!Pic { px: &mut clean.clone(), width: 320, scale: 1 }.shows_frame());
++        // off: the picture is left as the game drew it
++        let v = GrowthView::default();
++        let mut px = clean.clone();
++        assert!(!v.paint(&mut m, &mut px, 320, 240));
++        assert_eq!(px, clean);
++        // on: the percents and the button go over it
++        let v = GrowthView { on: true, ..Default::default() };
++        let mut px = clean.clone();
++        assert!(v.paint(&mut m, &mut px, 320, 240));
++        assert_ne!(px, clean);
++        // the map's panel (its grid button) is not Preparations' panel
++        let map = picture(&[((296, 222), [141, 75, 17]), ((316, 236), [145, 62, 13]), ((300, 218), [255, 223, 157]),
++                            ((312, 224), [255, 233, 165]), ((306, 228), [249, 200, 142]), ((20, 222), [245, 179, 129]),
++                            ((30, 228), [230, 172, 123]), ((14, 218), [161, 79, 21]), ((291, 15), [79, 19, 0]),
++                            ((291, 27), [69, 17, 0])]);
++        assert!(!Pic { px: &mut map.clone(), width: 320, scale: 1 }.shows_prep_frame());
++    }
+ }
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index 21f45c4..b430dae 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -930,6 +930,11 @@ impl Menus {
+                     ui.separator();
+                     top_screen_extras(ui, &mut game, general);
+                 }
++                if program_id == zakuro_core::fates_rando::TITLE {
++                    // round 71: the growth view's keys (zakuro_core::fates_growth_view)
++                    ui.separator();
++                    ui.label(RichText::new(growth_help(&general.keys, &general.pad)).weak());
++                }
+                 ui.separator();
+                 ui.label(RichText::new("Where the 3D is drawn, its resolution, the texture packs, the language and what runs the code change the next time the game starts, or with Reset.").weak());
+                 if ui.add_enabled(game != GameSettings::default(), egui::Button::new("Follow the general settings in everything")).clicked() {
+@@ -1241,10 +1246,30 @@ pub fn key_name(key: KeyCode) -> String {
+     name
+ }
+ 
++/// round 71: Fire Emblem Fates' growth view keys, the help line of its own settings: Y in
++/// Preparations, Select (or Tab) on the battle map, with the keys and buttons Y is on.
++pub fn growth_help(keys: &Keys, pad: &PadButtons) -> String {
++    format!(
++        "Growths on the unit panel: Y in Preparations (key {}, pad {}), Select or Tab on the battle map.",
++        key_name(keys.y),
++        button_name(pad.y)
++    )
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn the_growth_help_names_the_keys_y_is_on() {
++        assert_eq!(
++            growth_help(&Keys::default(), &PadButtons::default()),
++            "Growths on the unit panel: Y in Preparations (key A, pad Left face), Select or Tab on the battle map."
++        );
++        let keys = Keys { y: KeyCode::KeyG, ..Keys::default() };
++        assert!(growth_help(&keys, &PadButtons::default()).contains("(key G, pad Left face)"));
++    }
++
+     #[test]
+     fn a_background_fills_the_area_without_stretching() {
+         // a square picture in a wide area loses its top and bottom
+-- 
+2.55.0.windows.5
+

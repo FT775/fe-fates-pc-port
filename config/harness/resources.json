@@ -1,0 +1,16 @@
+{
+  "_comment": "Owner's resource budget for robot runs and builds (2026-11-11: 'go for it, if it messes with stuff I'll let you know'). Override per run with FEF_ROBOT_JOBS / FEF_ROBOT_PRIORITY / FEF_ROBOT_MEM_GB.",
+  "max_parallel_runs": 6,
+  "priority": "below_normal",
+  "max_total_memory_gb": 8,
+  "builds": {
+    "parallel": 1,
+    "priority": "below_normal"
+  },
+  "machine": "Ryzen 9 7900X3D, 12 cores / 24 threads, 31 GB RAM",
+  "night": {
+    "_comment": "Owner 2026-11-12: 12 runs at once while the owner is away/asleep; day stays 6. Applied by setting FEF_ROBOT_JOBS=12 (and FEF_ROBOT_MEM_GB=8) for rounds launched overnight; priority stays below_normal.",
+    "max_parallel_runs": 12,
+    "max_total_memory_gb": 8
+  }
+}

@@ -1,0 +1,127 @@
+/* AI attack-score readers, the staff side (Fates class map::ItemHelper::Rod):
+   may a unit use the staff in one of its item slots from a tile.
+   Plain-language description: docs/AI_SCORE.md section 6.
+
+   AIThink::GetInterferenceScore asks map::ItemHelper::Rod::CanUseDisvalueRange
+   for the staves it weighs; the player's item command asks it too
+   (map::Target::PreCheckItemMaskRod, map::ItemHelper::Battle::CanUse). The score
+   function itself stores (its out-pointers, the random generator) and is not
+   here (docs/AI_SCORE.md section 1).
+
+   A reader: it stores nothing. It fills two one-time caches the first time
+   (two ItemUse numbers found by name); the readable code gives up while one is
+   cold, and also while a cache of the two range overrides it calls is cold,
+   before reading anything else. Guest calls left: the ones the game makes
+   (ai_score.h), in the game's order (docs/DECISIONS.md F-018).
+
+   Status: UNVERIFIED (below shadow-clean). Host differential test against the
+   original ARM code: src/readable/ai_score/tests/ai_score_diff.py. */
+
+#include "ai_score.h"
+
+/* The larger / smaller of two signed numbers, kept to 16 bits as the game
+   keeps the scan bounds (SXTH). */
+static int32_t bound_max16(int32_t a, int32_t b) {
+    return (int16_t)(a >= b ? a : b);
+}
+static int32_t bound_min16(int32_t a, int32_t b) {
+    return (int16_t)(a <= b ? a : b);
+}
+
+/* a - b and |v| with 32-bit wrap-around, as the ARM SUB / RSB do */
+static int32_t sub32(int32_t a, int32_t b) {
+    return (int32_t)((uint32_t)a - (uint32_t)b);
+}
+static int32_t abs32(int32_t v) {
+    return v < 0 ? sub32(0, v) : v;
+}
+
+/* The unit standing on (x, y) of the loaded map (map::Image::Unit::GetUnit on
+   the map image's unit grid; the game reloads the map image pointer each time). */
+static gaddr unit_on(Context *ctx, int32_t x, int32_t y) {
+    gaddr grid = guest_ptr(ctx, G_MapImage) + MAPIMAGE_UNITS;
+    return guest_call3(ctx, AS_ImageUnitGetUnit, grid, (uint32_t)x, (uint32_t)y);
+}
+
+/* A "heal all" staff: is there a unit (or its pair partner) at a distance from
+   rmin to rmax of (x, y), inside the playable area, that the staff may be used
+   on (Rod::CanUseTarget)? Rows from the top, columns from the left, the unit
+   before its partner, as the game scans. */
+static uint32_t area_has_target(Context *ctx, gaddr unit, int32_t slot, gaddr item, int32_t x, int32_t y) {
+    int32_t rmin = (int32_t)guest_call2(ctx, AS_UnitGetRangeI, unit, item);
+    int32_t rmax = (int32_t)guest_call2(ctx, AS_UnitGetRangeO, unit, item);
+    int32_t x_lo = bound_max16(sub32(x, rmax), guest_u8(ctx, guest_ptr(ctx, G_MapImage) + MAPIMAGE_PLAY_X_MIN));
+    int32_t y_lo = bound_max16(sub32(y, rmax), guest_u8(ctx, guest_ptr(ctx, G_MapImage) + MAPIMAGE_PLAY_Y_MIN));
+    int32_t x_hi = bound_min16(fe_add32(x, rmax),
+                               (int32_t)guest_u8(ctx, guest_ptr(ctx, G_MapImage) + MAPIMAGE_PLAY_X_END) - 1);
+    int32_t y_hi = bound_min16(fe_add32(y, rmax),
+                               (int32_t)guest_u8(ctx, guest_ptr(ctx, G_MapImage) + MAPIMAGE_PLAY_Y_END) - 1);
+    for (int32_t ty = y_lo; ty <= y_hi; ty++) {
+        for (int32_t tx = x_lo; tx <= x_hi; tx++) {
+            int32_t d = fe_add32(abs32(sub32(x, tx)), abs32(sub32(y, ty)));
+            if (d < rmin || rmax < d)
+                continue;
+            gaddr there = unit_on(ctx, tx, ty);
+            if (there == 0)
+                continue;
+            if (guest_call3(ctx, AS_RodCanUseTarget, unit, (uint32_t)slot, there) != 0)
+                return 1;
+            gaddr partner = guest_ptr(ctx, there + UNIT_PAIR);
+            if (partner != 0 && guest_call3(ctx, AS_RodCanUseTarget, unit, (uint32_t)slot, partner) != 0)
+                return 1;
+            if (fe_gave_up(ctx))
+                return 0;
+        }
+    }
+    return 0;
+}
+
+/* 1 when the unit may use the staff in item slot `slot` standing on (x, y):
+   - not a staff (its sub-kind's kind is not 6), or the unit's condition bit 3:
+     0; Unit::CanItemEquip says no: 0;
+   - a "heal all" staff: some unit in its range from (x, y) may be healed
+     (area_has_target);
+   - a "revival" staff: not in a versus battle, the unit is of the player's army
+     (force type 0), the fallen (force 4) has a first unit and that unit's state
+     bit 7 is set [low for what the bit means];
+   - any other staff: Rod::CanUseTarget on the unit standing on (x, y) itself.
+   Guest function: 0x0034A8CC map::ItemHelper::Rod::CanUseDisvalueRange(const Unit*,int,int,int). */
+uint32_t rod_can_use_from(Context *ctx, gaddr unit, int32_t slot, int32_t x, int32_t y) {
+    if (!fe_static_ready(ctx, S_RodAreaGuard) || !fe_static_ready(ctx, S_RodReviveGuard) ||
+        !fe_static_ready(ctx, S_RodRangeIGuard) || !fe_static_ready(ctx, S_RodRangeOGuard))
+        return fe_use_original(ctx);
+    gaddr item = unit + (gaddr)slot * 4u + UNIT_ITEMS;
+    gaddr record = guest_call1(ctx, AS_ItemToData, item);
+    gaddr sub = guest_call1(ctx, AS_ItemSubKindGet, (uint32_t)(int32_t)READ_FIELD(ctx, ItemData, record, weapon_kind));
+    if (READ_FIELD(ctx, ItemSubKindData, sub, kind) != STAFF_KIND)
+        return 0;
+    if (guest_u8(ctx, unit + UNIT_CONDITION_BYTE) & UNIT_CONDITION_NO_STAFF)
+        return 0;
+    if (guest_call(ctx, AS_UnitCanItemEquip, unit, item, 1u, 1u) == 0)
+        return 0;
+
+    uint32_t use = guest_u8(ctx, guest_call1(ctx, AS_ItemToData, item) + ITEM_USE);
+    if (use == guest_u16(ctx, S_RodAreaUse))
+        return area_has_target(ctx, unit, slot, item, x, y);
+    use = guest_u8(ctx, guest_call1(ctx, AS_ItemToData, item) + ITEM_USE);
+    if (use == guest_u16(ctx, S_RodReviveUse)) {
+        if (guest_call1(ctx, AS_SituationIsVersus, guest_ptr(ctx, G_Situation)) != 0)
+            return 0;
+        if (guest_u8(ctx, guest_ptr(ctx, unit + UNIT_FORCE) + FORCE_TYPE) != 0)
+            return 0;
+        gaddr fallen = guest_call1(ctx, AS_ForceGet, FORCE_DEAD);
+        gaddr first = guest_ptr(ctx, fallen + FORCE_FIRST);
+        if (first == 0)
+            return 0;
+        return (guest_u32(ctx, first + UNIT_STATE_FLAGS) & 0x80u) != 0 ? 1u : 0u;
+    }
+    /* The game ends here with a plain branch into Rod::CanUseTarget, a guest
+       function that is not rewritten: made as a guest call, as image_unit_at's
+       branch into UnitPool::Get is (docs/MOVE.md 9, docs/AI_SCORE.md 6). */
+    gaddr there = unit_on(ctx, x, y);
+    return guest_call3(ctx, AS_RodCanUseTarget, unit, (uint32_t)slot, there);
+}
+
+RECOMP_OVERRIDE(0x0034A8CC) {
+    FE_ENTRY(0x0034A8CC, rod_can_use_from, FE_ARG(0), FE_ARG_S(1), FE_ARG_S(2), FE_ARG_S(3));
+}

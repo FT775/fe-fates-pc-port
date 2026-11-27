@@ -1,0 +1,1123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 21:50:57 -0500
+Subject: [PATCH] page: Fire Emblem Fates helpers: New Game defaults rows
+
+Round 81 (docs/ROUND81_PLAN.md A1, build/r81/home/HOME_DESIGN.md; the owner's
+pick F-057 #5 and its new writer group, answered "ok keep going", run on the
+standing OK F-059 (3)). The words are Grok's (docs/collab/ROUND81_OPTIONS_GROK.md):
+the line's name "New Game defaults" and the battle line "Off plays fights on
+the map. Supports and dances follow this too."
+
+Core (zakuro-core fates_helpers.rs, plain data, no guest access): four enums
+in the EnemyPhase pattern, each with Game's choice first and default:
+BattleAnimations (game / off 0 / on 1), MapSpeed (game / normal 0 / fast 1 /
+fast_while_a 2), EnemySkip (game / off 0 / move 1 / all 2), HpBars (game /
+off 0 / on 1); ALL, name(), key(), byte() -> Option<u8> (None = Game's
+choice). Four new Helpers fields battle_animations, map_speed, enemy_skip,
+hp_bars (never the unread enemy_phase). The getters the New Game writer
+(patch 0040) calls, named at the top of fates_helpers.rs:
+Helpers::any_new_game_row() -> bool (false = no trap word, no guest access),
+Helpers::new_game_bytes() -> Vec<NewGameByte { offset, value, line_values }>
+in the block's order (+0x8, +0xC, +0xD, +0x16; empty at the defaults),
+Helpers::new_game_rows_set() -> usize, the row getters battle_animations(),
+map_speed(), enemy_skip(), hp_bars(), and the constants
+BATTLE_ANIMATIONS_OFFSET / MAP_SPEED_OFFSET / ENEMY_SKIP_OFFSET /
+HP_BARS_OFFSET (0x8 / 0xC / 0xD / 0x16) and *_VALUES (5 / 3 / 3 / 2, the
+game's line sizes; a value at or past one is never stored).
+
+Settings: the four keys sit in the [fates_helpers] table, each with
+skip_serializing_if at Game's choice, so an untouched file writes no table
+and a round-80 file (enemy_phase, true_hit) reads and writes back byte for
+byte. Every key, enemy_phase and true_hit too, is now read on its own with
+fates_helpers::lenient (serde untagged Known / IgnoredAny): a value this
+build does not know gives that key's default and keeps the other keys. This
+changes round 80's U3 on purpose: one bad value used to reset the whole
+table, True hit with it; now only that key falls back (the plan's call 7).
+A table of the wrong kind (fates_helpers = 4) still gives the defaults
+through or_default. One choice for Fire Emblem Fates and Seal of Flames,
+as before; never a randomizer row, so no seed, answer, run id or share code
+changes.
+
+Paused window: under True hit and its help line, menus::helper_rows draws a
+collapsing "New Game defaults" line (egui CollapsingHeader with the fixed id
+salt "fates helpers new game", closed at first), reading "New Game defaults:
+game's choice" or "New Game defaults: 2 set". Open, it shows Battle
+animations, Map speed, Enemy turn skip and HP bars, each a label (help on
+hover) over wrapped choices [Game's choice][...], and the note "Used when
+you start a New Game. A game already going keeps its own settings; change
+those on the game's Options screen. Rows that change how long things take
+can make later enemy moves differ; hits, damage and the battle dice stay the
+same." A change pushes Action::Settings as True hit does. Round 80's help
+line is reworded to name the new row: "Faster enemy turns: set Enemy turn
+skip under New Game defaults below. In a game already going, use the game's
+own Options line 6 (Off, Move, or All), or press the Start key during the
+enemy turn. ..." On an 800 x 480 screen the line sits just below the Paused
+window's fold; the window scrolls to it (round 80's vscroll).
+
+Page robot (pagebot.rs): targets helpers:newgame:section (always drawn for
+Fates; a click opens or closes it) and, only while the line is fully open,
+helpers:opt:<key>=<word> for every choice of the four rows. In
+{"expect_settings": {...}} an expected "game" matches an absent key (a row
+at Game's choice is not written).
+
+Tests (cargo test --lib in the reused targets): core N1
+the_new_game_rows_default_to_the_game, N2 the_choices_are_the_games_order,
+N3 a_bad_word_is_the_games_choice, N4 nothing_to_store_at_the_defaults;
+settings U1-U5 extended (untouched and round-80 files byte for byte, every
+new value round-trips with only its key written, U3 per key now, a round-80
+file has Game's choice on all four, Follow the general settings leaves
+them); game_pick U6 extended (Seal shares the rows); menus U7 (closed: no
+row targets; open: exactly the 14 row targets; opening saves nothing), U8
+(a New Game row click saves once, the same value again nothing, Game's
+choice back to the default, the line stays open while its words change),
+U9 (800 x 480 and 800 x 360, closed and open, every target inside the
+window's width; the test scrolls the window with the wheel to a target
+below the fold), the words test; pagebot
+the_robot_sets_the_new_game_rows_and_reads_them_back. zakuro-core 246
+passed (engine/target/zakuro-core-test), zakuro 131 passed, 2 ignored
+(engine/target/zakuro-frontend-test).
+
+Nothing here reads or writes guest memory; with every row at Game's choice
+nothing acts at all.
+
+Repair (round 81 B2, V's R13 look at the game's own Options screen,
+build/r81/review/sheet.png): two value words now match the game's screen
+words. Map speed byte 2 reads "Manual" (was "Fast while A is held"; the
+game's help for it is to hold the A Button to speed up) and Enemy turn skip
+byte 1 reads "Movement" (was "Move"); the help lines say the same. The
+settings keys (fast_while_a, move), the bytes and every other word are
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/zakuro-core/src/fates_helpers.rs | 334 +++++++++++++++++++++++-
+ crates/zakuro/src/game_pick.rs          |  10 +-
+ crates/zakuro/src/menus.rs              | 232 +++++++++++++---
+ crates/zakuro/src/pagebot.rs            |  69 ++++-
+ crates/zakuro/src/settings.rs           |  96 ++++++-
+ 5 files changed, 681 insertions(+), 60 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_helpers.rs b/crates/zakuro-core/src/fates_helpers.rs
+index c27a74f..7a9eae6 100644
+--- a/crates/zakuro-core/src/fates_helpers.rs
++++ b/crates/zakuro-core/src/fates_helpers.rs
+@@ -1,26 +1,53 @@
+-//! Fire Emblem Fates: the Helpers (round 80, owner pick F-057): two comfort rows under the Esc
++//! Fire Emblem Fates: the Helpers (round 80, owner pick F-057): comfort rows under the Esc
+ //! window's Randomizer button, kept in Zakuro's settings.toml as a `[fates_helpers]` table.
++//! Round 81 (owner pick F-057 #5, docs/ROUND81_PLAN.md) adds the "New Game defaults" rows: four
++//! of the game's own Options lines, set once when a New Game is picked.
+ //!
+ //! The getters the other parts call (their names are fixed here):
+ //! - `System::helpers()` -> [`Helpers`]: the rows in force for the running game; the defaults
+-//!   (Normal, Off) for any title that is not Fire Emblem Fates (Seal of Flames shares its title id).
++//!   (Normal, Off, Game's choice everywhere) for any title that is not Fire Emblem Fates (Seal of
++//!   Flames shares its title id).
+ //! - [`Helpers::enemy_phase()`] -> [`EnemyPhase`] (Normal / X2 / X4) and
+-//!   [`EnemyPhase::factor()`] -> 1, 2 or 4 (the enemy-phase pacing reads it, round 80 A2).
++//!   [`EnemyPhase::factor()`] -> 1, 2 or 4 (round 80 cut 3: nothing reads it).
+ //! - [`Helpers::true_hit()`] -> bool (the forecast's real-chance painter reads it, round 80 A3).
+ //! - `System::set_helpers(Helpers)`: the frontend hands the rows over at game start and on every
+ //!   settings change (`apply_settings`).
+ //!
+-//! The defaults are today's game: with Normal and Off nothing reads guest memory for these rows
+-//! and nothing changes. Neither row is ever a randomizer input, so no seed or share code moves.
+-//! True hit only paints the host's copy of the screen; the enemy-phase pacing only runs more
+-//! emulated frames per real second. Neither writes guest memory. The game's own enemy-phase
+-//! option (its Options line 6, Off / Move / All) and the Start key are left as they are.
++//! Round 81, for the New Game writer (patch 0040, `fates_options.rs`):
++//! - [`Helpers::any_new_game_row()`] -> bool: at least one New Game row is not Game's choice.
++//!   False = the writer lays no trap word and touches no guest memory at all.
++//! - [`Helpers::new_game_bytes()`] -> `Vec<NewGameByte>`: one entry per row that is set, in the
++//!   block's order (+0x8, +0xC, +0xD, +0x16), each [`NewGameByte`] `{ offset, value,
++//!   line_values }`: the byte's offset in `GameConfigData` (the block `*G_GameConfig` points
++//!   at), the value to store, and how many values the game's own line holds (a value at or past
++//!   it is refused). Empty at the defaults.
++//! - [`Helpers::new_game_rows_set()`] -> usize: how many rows are set (the closed line's "2 set").
++//! - The rows one by one: [`Helpers::battle_animations()`] -> [`BattleAnimations`],
++//!   [`Helpers::map_speed()`] -> [`MapSpeed`], [`Helpers::enemy_skip()`] -> [`EnemySkip`],
++//!   [`Helpers::hp_bars()`] -> [`HpBars`]; each enum's `byte()` -> `Option<u8>` (None = Game's
++//!   choice), `name()` (the word the row shows), `key()` (the word in settings.toml and in the
++//!   page robot's targets) and `ALL` (Game's choice first, then the game's order).
++//! - The offsets and line sizes as constants: [`BATTLE_ANIMATIONS_OFFSET`] 0x8
++//!   ([`BATTLE_ANIMATIONS_VALUES`] 5), [`MAP_SPEED_OFFSET`] 0xC ([`MAP_SPEED_VALUES`] 3),
++//!   [`ENEMY_SKIP_OFFSET`] 0xD ([`ENEMY_SKIP_VALUES`] 3), [`HP_BARS_OFFSET`] 0x16
++//!   ([`HP_BARS_VALUES`] 2).
++//!
++//! The defaults are today's game: with Normal, Off and Game's choice nothing reads guest memory
++//! for these rows and nothing changes. No row is ever a randomizer input, so no seed or share
++//! code moves. True hit only paints the host's copy of the screen. The New Game rows are stored
++//! by the core's writer only, never by anything in this file; the game's own enemy-phase option
++//! (its Options line 6, Off / Movement / All) and the Start key are left as they are.
+ //!
+ //! Round 80 cut 3 (docs/ROUND80_PLAN.md; robot proof E2 found the 2x / 4x pacing could not reach
+ //! its time goal while every fight and turn banner stays at normal speed): the Esc window has no
+ //! Enemy phase row and nothing in this build reads [`Helpers::enemy_phase()`]. The field stays in
+ //! the `[fates_helpers]` table (read and written as before) so a later round can bring the row
+-//! back without a new file format.
++//! back without a new file format. The New Game "Enemy turn skip" row is the game's own line 6
++//! and has its own key (`enemy_skip`); it never reuses `enemy_phase`.
++//!
++//! Reading the table (round 81): every key is read on its own ([`lenient`]): a value this build
++//! does not know gives that key's default and keeps every other key (round 80 let one bad value
++//! reset the whole table).
+ 
+ use serde::{Deserialize, Serialize};
+ 
+@@ -68,12 +95,141 @@ impl EnemyPhase {
+     }
+ }
+ 
+-/// the Helpers rows. `Default` (Normal, Off) is today's game and is never written to the file.
++/// the first choice of every New Game row.
++pub const GAMES_CHOICE: &str = "Game's choice";
++
++/// round 81: the "New Game defaults" rows' enums share this shape: Game's choice first and the
++/// default (nothing stored), then the game's own values in the game's order (byte 0, 1, ...).
++macro_rules! new_game_row {
++    ($(#[$doc:meta])* $name:ident { $($variant:ident = $key:literal, $word:literal, $byte:literal;)* }) => {
++        $(#[$doc])*
++        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
++        pub enum $name {
++            /// Game's choice: the game's own setting is left alone (the default).
++            #[default]
++            #[serde(rename = "game")]
++            Game,
++            $(#[serde(rename = $key)] $variant,)*
++        }
++
++        impl $name {
++            /// Game's choice first, then the game's values in the game's order.
++            pub const ALL: &'static [$name] = &[$name::Game, $($name::$variant),*];
++
++            /// the byte the game's Options block gets; None for Game's choice (nothing stored).
++            pub fn byte(self) -> Option<u8> {
++                match self {
++                    $name::Game => None,
++                    $($name::$variant => Some($byte),)*
++                }
++            }
++
++            /// the word the row shows.
++            pub fn name(self) -> &'static str {
++                match self {
++                    $name::Game => GAMES_CHOICE,
++                    $($name::$variant => $word,)*
++                }
++            }
++
++            /// the value written in settings.toml (and in the page robot's target names).
++            pub fn key(self) -> &'static str {
++                match self {
++                    $name::Game => "game",
++                    $($name::$variant => $key,)*
++                }
++            }
++        }
++    };
++}
++
++new_game_row! {
++    /// round 81: the "Battle animations" row (GameConfigData +0x8; the game's line holds 5
++    /// values, only 0 and 1 are offered: 2..4 are per-army / per-unit choices not traced).
++    BattleAnimations { Off = "off", "Off", 0; On = "on", "On", 1; }
++}
++
++new_game_row! {
++    /// round 81: the "Map speed" row (GameConfigData +0xC; 3 values).
++    MapSpeed { Normal = "normal", "Normal", 0; Fast = "fast", "Fast", 1; FastWhileA = "fast_while_a", "Manual", 2; }
++}
++
++new_game_row! {
++    /// round 81: the "Enemy turn skip" row (GameConfigData +0xD, the game's Options line 6; 3
++    /// values).
++    EnemySkip { Off = "off", "Off", 0; Move = "move", "Movement", 1; All = "all", "All", 2; }
++}
++
++new_game_row! {
++    /// round 81: the "HP bars" row (GameConfigData +0x16; 2 values).
++    HpBars { Off = "off", "Off", 0; On = "on", "On", 1; }
++}
++
++/// where each New Game row's byte lives in `GameConfigData` (the block `*G_GameConfig`,
++/// 0x006DA0F8, points at; docs/MENUS.md section 1, build/r81/options/OPTIONS_TRACE.md).
++pub const BATTLE_ANIMATIONS_OFFSET: u32 = 0x8;
++pub const MAP_SPEED_OFFSET: u32 = 0xC;
++pub const ENEMY_SKIP_OFFSET: u32 = 0xD;
++pub const HP_BARS_OFFSET: u32 = 0x16;
++/// how many values each of those lines holds in the game (its `GetNum`): a value at or past
++/// it is never stored.
++pub const BATTLE_ANIMATIONS_VALUES: u8 = 5;
++pub const MAP_SPEED_VALUES: u8 = 3;
++pub const ENEMY_SKIP_VALUES: u8 = 3;
++pub const HP_BARS_VALUES: u8 = 2;
++
++/// round 81: one byte the New Game writer stores: at `offset` in `GameConfigData`, the value
++/// `value`, on a line of the game that holds `line_values` values.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct NewGameByte {
++    pub offset: u32,
++    pub value: u8,
++    pub line_values: u8,
++}
++
++/// round 81: reads one key on its own: a value this build does not know (a word it never wrote,
++/// a number, a table) gives that key's default and leaves every other key as read. Serde only,
++/// so it works under any format (settings.toml goes through toml).
++pub fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
++where
++    D: serde::Deserializer<'de>,
++    T: Deserialize<'de> + Default,
++{
++    #[derive(Deserialize)]
++    #[serde(untagged)]
++    enum Either<T> {
++        Known(T),
++        Other(serde::de::IgnoredAny),
++    }
++    Ok(match Either::<T>::deserialize(deserializer)? {
++        Either::Known(value) => value,
++        Either::Other(_) => T::default(),
++    })
++}
++
++fn is_default<T: Default + PartialEq>(value: &T) -> bool {
++    *value == T::default()
++}
++
++/// the Helpers rows. `Default` (Normal, Off, Game's choice) is today's game and is never written
++/// to the file. The New Game rows are written only when set, so a round-80 file (enemy_phase and
++/// true_hit only) reads and writes back byte for byte.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ #[serde(default)]
+ pub struct Helpers {
++    #[serde(deserialize_with = "lenient")]
+     pub enemy_phase: EnemyPhase,
++    #[serde(deserialize_with = "lenient")]
+     pub true_hit: bool,
++    /// round 81: the New Game defaults rows.
++    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_default")]
++    pub battle_animations: BattleAnimations,
++    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_default")]
++    pub map_speed: MapSpeed,
++    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_default")]
++    pub enemy_skip: EnemySkip,
++    #[serde(deserialize_with = "lenient", skip_serializing_if = "is_default")]
++    pub hp_bars: HpBars,
+ }
+ 
+ impl Helpers {
+@@ -87,7 +243,54 @@ impl Helpers {
+         self.true_hit
+     }
+ 
+-    /// both rows at today's game.
++    /// round 81: the "Battle animations" New Game row.
++    pub fn battle_animations(&self) -> BattleAnimations {
++        self.battle_animations
++    }
++
++    /// round 81: the "Map speed" New Game row.
++    pub fn map_speed(&self) -> MapSpeed {
++        self.map_speed
++    }
++
++    /// round 81: the "Enemy turn skip" New Game row (the game's Options line 6).
++    pub fn enemy_skip(&self) -> EnemySkip {
++        self.enemy_skip
++    }
++
++    /// round 81: the "HP bars" New Game row.
++    pub fn hp_bars(&self) -> HpBars {
++        self.hp_bars
++    }
++
++    /// round 81: what the New Game writer stores, one entry per set row in the block's order;
++    /// empty when every row is Game's choice.
++    pub fn new_game_bytes(&self) -> Vec<NewGameByte> {
++        [
++            (BATTLE_ANIMATIONS_OFFSET, self.battle_animations.byte(), BATTLE_ANIMATIONS_VALUES),
++            (MAP_SPEED_OFFSET, self.map_speed.byte(), MAP_SPEED_VALUES),
++            (ENEMY_SKIP_OFFSET, self.enemy_skip.byte(), ENEMY_SKIP_VALUES),
++            (HP_BARS_OFFSET, self.hp_bars.byte(), HP_BARS_VALUES),
++        ]
++        .into_iter()
++        .filter_map(|(offset, value, line_values)| value.map(|value| NewGameByte { offset, value, line_values }))
++        .collect()
++    }
++
++    /// round 81: how many New Game rows are set (not Game's choice).
++    pub fn new_game_rows_set(&self) -> usize {
++        [self.battle_animations.byte(), self.map_speed.byte(), self.enemy_skip.byte(), self.hp_bars.byte()]
++            .iter()
++            .filter(|byte| byte.is_some())
++            .count()
++    }
++
++    /// round 81: at least one New Game row is set; false = the writer does nothing at all.
++    pub fn any_new_game_row(&self) -> bool {
++        self.new_game_rows_set() > 0
++    }
++
++    /// every row at today's game.
+     pub fn is_default(&self) -> bool {
+         *self == Helpers::default()
+     }
+@@ -110,7 +313,112 @@ mod tests {
+     fn the_factors_and_words() {
+         let got: Vec<_> = EnemyPhase::ALL.iter().map(|p| (p.factor(), p.name(), p.key())).collect();
+         assert_eq!(got, [(1, "Normal", "normal"), (2, "2x", "2x"), (4, "4x", "4x")]);
+-        assert!(!Helpers { enemy_phase: EnemyPhase::X4, true_hit: false }.is_default());
+-        assert!(!Helpers { enemy_phase: EnemyPhase::Normal, true_hit: true }.is_default());
++        assert!(!Helpers { enemy_phase: EnemyPhase::X4, ..Helpers::default() }.is_default());
++        assert!(!Helpers { true_hit: true, ..Helpers::default() }.is_default());
++    }
++
++    // round 81: the New Game defaults rows (N1-N4; build/r81/home/HOME_DESIGN.md section 6)
++
++    /// N1: all four rows start on Game's choice, which stores nothing.
++    #[test]
++    fn the_new_game_rows_default_to_the_game() {
++        let helpers = Helpers::default();
++        assert_eq!(helpers.battle_animations(), BattleAnimations::Game);
++        assert_eq!(helpers.map_speed(), MapSpeed::Game);
++        assert_eq!(helpers.enemy_skip(), EnemySkip::Game);
++        assert_eq!(helpers.hp_bars(), HpBars::Game);
++        assert!(helpers.is_default());
++        assert_eq!(helpers.battle_animations().byte(), None);
++        assert_eq!(helpers.map_speed().byte(), None);
++        assert_eq!(helpers.enemy_skip().byte(), None);
++        assert_eq!(helpers.hp_bars().byte(), None);
++        assert!(!helpers.any_new_game_row());
++        assert_eq!(helpers.new_game_rows_set(), 0);
++        for row in [
++            Helpers { battle_animations: BattleAnimations::Off, ..Helpers::default() },
++            Helpers { map_speed: MapSpeed::Normal, ..Helpers::default() },
++            Helpers { enemy_skip: EnemySkip::Off, ..Helpers::default() },
++            Helpers { hp_bars: HpBars::Off, ..Helpers::default() },
++        ] {
++            assert!(!row.is_default() && row.any_new_game_row() && row.new_game_rows_set() == 1, "{row:?}");
++        }
++    }
++
++    /// N2: per row, Game's choice first, then the game's values in the game's byte order, with
++    /// the words of build/r81/home/HOME_DESIGN.md 2.1 and the Grok consult, two value words changed to
++    /// the game's own screen words (round 81 V, R13): Manual (not "Fast while A is held") and Movement.
++    #[test]
++    fn the_choices_are_the_games_order() {
++        type Row = (&'static str, &'static str, Option<u8>);
++        fn table<T: Copy>(all: &[T], f: impl Fn(T) -> Row) -> Vec<Row> {
++            all.iter().map(|&v| f(v)).collect()
++        }
++        assert_eq!(table(BattleAnimations::ALL, |v| (v.key(), v.name(), v.byte())), [
++            ("game", "Game's choice", None), ("off", "Off", Some(0)), ("on", "On", Some(1))
++        ]);
++        assert_eq!(table(MapSpeed::ALL, |v| (v.key(), v.name(), v.byte())), [
++            ("game", "Game's choice", None), ("normal", "Normal", Some(0)), ("fast", "Fast", Some(1)),
++            ("fast_while_a", "Manual", Some(2))
++        ]);
++        assert_eq!(table(EnemySkip::ALL, |v| (v.key(), v.name(), v.byte())), [
++            ("game", "Game's choice", None), ("off", "Off", Some(0)), ("move", "Movement", Some(1)), ("all", "All", Some(2))
++        ]);
++        assert_eq!(table(HpBars::ALL, |v| (v.key(), v.name(), v.byte())), [
++            ("game", "Game's choice", None), ("off", "Off", Some(0)), ("on", "On", Some(1))
++        ]);
++        // every offered byte is inside its line
++        assert!(BattleAnimations::ALL.iter().filter_map(|v| v.byte()).all(|b| b < BATTLE_ANIMATIONS_VALUES));
++        assert!(MapSpeed::ALL.iter().filter_map(|v| v.byte()).all(|b| b < MAP_SPEED_VALUES));
++        assert!(EnemySkip::ALL.iter().filter_map(|v| v.byte()).all(|b| b < ENEMY_SKIP_VALUES));
++        assert!(HpBars::ALL.iter().filter_map(|v| v.byte()).all(|b| b < HP_BARS_VALUES));
++    }
++
++    /// N3: `lenient` gives Game's choice (the default) for a word this build does not know, a
++    /// number or a table, and the value for a known word. (settings.rs U3 checks a whole
++    /// `[fates_helpers]` table through toml: only the bad key falls back.)
++    #[test]
++    fn a_bad_word_is_the_games_choice() {
++        use serde::de::value::{BoolDeserializer, Error, MapDeserializer, StrDeserializer, U64Deserializer};
++        let word = |w: &str| lenient::<_, MapSpeed>(StrDeserializer::<Error>::new(w)).unwrap();
++        assert_eq!(word("fast"), MapSpeed::Fast);
++        assert_eq!(word("fast_while_a"), MapSpeed::FastWhileA);
++        assert_eq!(word("game"), MapSpeed::Game);
++        assert_eq!(word("warp"), MapSpeed::Game);
++        assert_eq!(word("Fast"), MapSpeed::Game, "the words are lower case, as written");
++        assert_eq!(lenient::<_, HpBars>(U64Deserializer::<Error>::new(3)).unwrap(), HpBars::Game);
++        assert_eq!(lenient::<_, EnemySkip>(BoolDeserializer::<Error>::new(true)).unwrap(), EnemySkip::Game);
++        let table = MapDeserializer::<_, Error>::new(vec![("off", 1u64)].into_iter());
++        assert_eq!(lenient::<_, BattleAnimations>(table).unwrap(), BattleAnimations::Game);
++        // the round-80 keys read the same way now
++        assert!(lenient::<_, bool>(BoolDeserializer::<Error>::new(true)).unwrap());
++        assert!(!lenient::<_, bool>(StrDeserializer::<Error>::new("yes")).unwrap());
++        assert_eq!(lenient::<_, EnemyPhase>(StrDeserializer::<Error>::new("8x")).unwrap(), EnemyPhase::Normal);
++        assert_eq!(lenient::<_, EnemyPhase>(StrDeserializer::<Error>::new("4x")).unwrap(), EnemyPhase::X4);
++    }
++
++    /// N4: what the writer would store: nothing at the defaults (and True hit alone stores
++    /// nothing either), exactly the set rows otherwise, in the block's order.
++    #[test]
++    fn nothing_to_store_at_the_defaults() {
++        assert!(Helpers::default().new_game_bytes().is_empty());
++        assert!(Helpers { true_hit: true, enemy_phase: EnemyPhase::X2, ..Helpers::default() }.new_game_bytes().is_empty());
++        let byte = |offset, value, line_values| NewGameByte { offset, value, line_values };
++        let two = Helpers { hp_bars: HpBars::Off, battle_animations: BattleAnimations::On, ..Helpers::default() };
++        assert_eq!(two.new_game_bytes(), [byte(0x8, 1, 5), byte(0x16, 0, 2)]);
++        assert_eq!(two.new_game_rows_set(), 2);
++        let all = Helpers {
++            battle_animations: BattleAnimations::Off,
++            map_speed: MapSpeed::FastWhileA,
++            enemy_skip: EnemySkip::All,
++            hp_bars: HpBars::On,
++            ..Helpers::default()
++        };
++        assert_eq!(all.new_game_bytes(), [byte(0x8, 0, 5), byte(0xC, 2, 3), byte(0xD, 2, 3), byte(0x16, 1, 2)]);
++        // never the on/off word +0x4 or the danger zone +0xE
++        for b in all.new_game_bytes() {
++            assert!(b.offset != 0x4 && b.offset != 0xE && b.value < b.line_values, "{b:?}");
++        }
++        let one = Helpers { map_speed: MapSpeed::Normal, ..Helpers::default() };
++        assert_eq!(one.new_game_bytes(), [byte(0xC, 0, 3)]);
+     }
+ }
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+index bf05511..88baa69 100644
+--- a/crates/zakuro/src/game_pick.rs
++++ b/crates/zakuro/src/game_pick.rs
+@@ -645,20 +645,22 @@ mod tests {
+     /// game bits.
+     #[test]
+     fn seal_and_fates_share_the_helpers() {
+-        use zakuro_core::fates_helpers::{EnemyPhase, Helpers};
++        use zakuro_core::fates_helpers::{EnemyPhase, EnemySkip, Helpers, MapSpeed};
+         let mut settings = Settings::first_run();
+         let owner = take_bits(&settings);
+         let seal = owner.clone();
+         put_bits(&mut settings, seal);
+-        settings.fates_helpers = Helpers { enemy_phase: EnemyPhase::X4, true_hit: true };
++        // round 81: the New Game rows go with them
++        let set = Helpers { enemy_phase: EnemyPhase::X4, true_hit: true, map_speed: MapSpeed::Fast, enemy_skip: EnemySkip::All, ..Helpers::default() };
++        settings.fates_helpers = set;
+         let (shared, seal_now) = split_for_save(&settings, &owner);
+         assert_eq!(shared.fates_helpers, settings.fates_helpers);
+         let bits = toml::to_string_pretty(&SealFile { format: 1, bits: seal_now.clone() }).unwrap();
+-        assert!(!bits.contains("fates_helpers") && !bits.contains("enemy_phase"), "{bits}");
++        assert!(!bits.contains("fates_helpers") && !bits.contains("enemy_phase") && !bits.contains("map_speed") && !bits.contains("enemy_skip"), "{bits}");
+         // back on Fire Emblem Fates the owner's bits return, the helpers stay
+         let mut fates_again = shared.clone();
+         put_bits(&mut fates_again, owner.clone());
+-        assert_eq!(fates_again.fates_helpers, Helpers { enemy_phase: EnemyPhase::X4, true_hit: true });
++        assert_eq!(fates_again.fates_helpers, set);
+     }
+ 
+     #[test]
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index e9db354..508b5b2 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -1209,20 +1209,44 @@ fn code(ui: &mut egui::Ui, recompiled: &mut bool) {
+     ui.radio_value(recompiled, false, "Interpreter only");
+ }
+ 
+-/// a line a GameOverlay keeps over the game, in the bottom right corner.
+ /// round 80: the Helpers rows' words (Grok's, docs/collab/ROUND80_HELPERS_GROK.md).
+ pub const HELPERS_HEADING: &str = "Helpers";
+ pub const TRUE_HIT_HELP: &str = "Also shows the real chance to hit, such as 70 (real 79). It never changes a roll.";
+ /// round 80 cut 3 (docs/ROUND80_PLAN.md): no 2x / 4x row; the line points at the game's own
+-/// enemy-turn skip, with what robot proof E1 (R4) found about it.
+-pub const HELPERS_LINE: &str = "Faster enemy turns: use the game's own Options line 6 (Off, Move, or All), or press the Start key during the enemy turn. Units, HP and hits stay the same, but later enemy moves can differ, as when you take more or less time on your turn.";
++/// enemy-turn skip, with what robot proof E1 (R4) found about it. Round 81: it names the new
++/// Enemy turn skip row too (set once for every New Game); a game already going keeps line 6.
++pub const HELPERS_LINE: &str = "Faster enemy turns: set Enemy turn skip under New Game defaults below. In a game already going, use the game's own Options line 6 (Off, Movement, or All), or press the Start key during the enemy turn. Units, HP and hits stay the same, but later enemy moves can differ, as when you take more or less time on your turn.";
++/// round 81: the "New Game defaults" rows' words (Grok's name and battle line,
++/// docs/collab/ROUND81_OPTIONS_GROK.md; the rest from build/r81/home/HOME_DESIGN.md 2.3 and
++/// docs/ROUND81_PLAN.md).
++pub const NEW_GAME_HEADING: &str = "New Game defaults";
++pub const GAMES_CHOICE_HELP: &str = "Leaves the game's own setting.";
++pub const BATTLE_ANIMATIONS_HELP: &str = "Off plays fights on the map. Supports and dances follow this too.";
++pub const MAP_SPEED_HELP: &str = "How fast units walk and the cursor moves on the map, on your turn and the enemy's. Manual: units go fast while you hold the A Button. The game starts at Manual.";
++pub const ENEMY_SKIP_HELP: &str = "The game's own Options line 6. Movement places enemy units at once, with no camera moves. All skips the enemy's moves behind a dark screen. Units, HP and hits stay the same, but later enemy moves can differ.";
++pub const HP_BARS_HELP: &str = "The small HP bars under units on the map. Some chapters hide them anyway.";
++pub const NEW_GAME_NOTE: &str = "Used when you start a New Game. A game already going keeps its own settings; change those on the game's Options screen. Rows that change how long things take can make later enemy moves differ; hits, damage and the battle dice stay the same.";
++
++/// round 81: the New Game defaults line's words: "New Game defaults: game's choice" when every
++/// row is Game's choice, else "New Game defaults: 2 set".
++pub fn new_game_title(helpers: &Helpers) -> String {
++    match helpers.new_game_rows_set() {
++        0 => format!("{NEW_GAME_HEADING}: game's choice"),
++        set => format!("{NEW_GAME_HEADING}: {set} set"),
++    }
++}
+ 
+ /// round 80: Fire Emblem Fates' Helpers in the Paused window, under the Randomizer button: the
+ /// heading, the True hit row and the help line (the Enemy phase row was cut, round 80 cut 3:
+-/// the line points at the game's own skip). Each control reports where it is drawn
+-/// (`helpers:section`, `helpers:opt:true_hit=<off|on>`), for the page robot. True when a row changed (the caller
+-/// saves the settings and hands them to the game).
++/// the line points at the game's own skip). Round 81: under them a collapsing "New Game
++/// defaults" line (closed at first) with four rows of the game's own Options (Battle
++/// animations, Map speed, Enemy turn skip, HP bars), each starting on Game's choice, and a note.
++/// Each control reports where it is drawn (`helpers:section`, `helpers:opt:true_hit=<off|on>`,
++/// `helpers:newgame:section`, and while fully open `helpers:opt:<key>=<word>` for every choice), for
++/// the page robot. True when a row changed (the caller saves the settings and hands them to the
++/// game).
+ pub fn helper_rows(ui: &mut egui::Ui, helpers: &mut Helpers, targets: &mut Vec<(String, egui::Rect)>) -> bool {
++    use zakuro_core::fates_helpers::{BattleAnimations, EnemySkip, HpBars, MapSpeed};
+     let before = *helpers;
+     ui.add_space(4.0);
+     let heading = ui.label(RichText::new(HELPERS_HEADING).strong().color(Color32::from_rgb(150, 200, 255)));
+@@ -1240,11 +1264,55 @@ pub fn helper_rows(ui: &mut egui::Ui, helpers: &mut Helpers, targets: &mut Vec<(
+     ui.scope(|ui| {
+         ui.set_max_width(210.0);
+         ui.label(RichText::new(HELPERS_LINE).weak().small());
++        // round 81: the New Game defaults line; its egui id is fixed so open / closed survives
++        // the changing words. Its rows' targets are reported only while it is fully open (not
++        // while it slides open or shut, when a row can be cut off), so the page robot clicks
++        // a row only where it can be clicked.
++        let mut rows = Vec::new();
++        let section = egui::CollapsingHeader::new(new_game_title(helpers))
++            .id_salt("fates helpers new game")
++            .default_open(false)
++            .show(ui, |ui| {
++                choice_row(ui, "Battle animations", BATTLE_ANIMATIONS_HELP, "battle_animations", &mut helpers.battle_animations, BattleAnimations::ALL, BattleAnimations::name, BattleAnimations::key, &mut rows);
++                choice_row(ui, "Map speed", MAP_SPEED_HELP, "map_speed", &mut helpers.map_speed, MapSpeed::ALL, MapSpeed::name, MapSpeed::key, &mut rows);
++                choice_row(ui, "Enemy turn skip", ENEMY_SKIP_HELP, "enemy_skip", &mut helpers.enemy_skip, EnemySkip::ALL, EnemySkip::name, EnemySkip::key, &mut rows);
++                choice_row(ui, "HP bars", HP_BARS_HELP, "hp_bars", &mut helpers.hp_bars, HpBars::ALL, HpBars::name, HpBars::key, &mut rows);
++                ui.label(RichText::new(NEW_GAME_NOTE).weak().small());
++            });
++        targets.push(("helpers:newgame:section".to_owned(), section.header_response.rect));
++        if section.fully_open() {
++            targets.extend(rows);
++        }
+     });
+     ui.add_space(4.0);
+     *helpers != before
+ }
+ 
++/// round 81: one New Game row: its label (with its help on hover), then its choices, wrapped
++/// inside the column; every choice reports its target `helpers:opt:<key>=<word>`.
++#[allow(clippy::too_many_arguments)]
++fn choice_row<T: Copy + PartialEq>(
++    ui: &mut egui::Ui,
++    label: &str,
++    help: &str,
++    key: &str,
++    value: &mut T,
++    all: &[T],
++    name: fn(T) -> &'static str,
++    word: fn(T) -> &'static str,
++    targets: &mut Vec<(String, egui::Rect)>,
++) {
++    ui.label(label).on_hover_text(help);
++    ui.horizontal_wrapped(|ui| {
++        for &choice in all {
++            let hover = if word(choice) == "game" { GAMES_CHOICE_HELP } else { help };
++            let response = ui.selectable_value(value, choice, name(choice)).on_hover_text(hover);
++            targets.push((format!("helpers:opt:{key}={}", word(choice)), response.rect));
++        }
++    });
++}
++
++/// a line a GameOverlay keeps over the game, in the bottom right corner.
+ pub fn corner(ctx: &egui::Context, text: &str) {
+     egui::Area::new(egui::Id::new("overlay corner"))
+         .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-8.0, -8.0))
+@@ -1441,7 +1509,8 @@ mod tests {
+         assert_eq!(ids(idle(games(), std::slice::from_ref(&job), &[])), [1, 2, 3]);
+     }
+ 
+-    // round 80: the Helpers rows (U7-U9; HOME_DESIGN 3)
++    // round 80: the Helpers rows (U7-U9; HOME_DESIGN 3); round 81: the New Game defaults rows
++    // (U7-U9 extended; build/r81/home/HOME_DESIGN.md section 6)
+ 
+     /// one frame of the Paused window over a game, with a click at `click` when given.
+     fn paused_frame(ctx: &egui::Context, menus: &mut Menus, program_id: u64, helpers: &mut Helpers, screen: Vec2, click: Option<egui::Pos2>) -> Vec<Action> {
+@@ -1450,7 +1519,14 @@ mod tests {
+             let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+             events.extend([egui::Event::PointerMoved(at), press(true), press(false)]);
+         }
+-        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), events, ..Default::default() };
++        paused_frame_with(ctx, menus, program_id, helpers, screen, events)
++    }
++
++    /// round 81: one frame of the Paused window with these input events.
++    fn paused_frame_with(ctx: &egui::Context, menus: &mut Menus, program_id: u64, helpers: &mut Helpers, screen: Vec2, events: Vec<egui::Event>) -> Vec<Action> {
++        // round 81: the clock moves 1/60 s a frame, so the New Game line's slide ends
++        let time = Some(ctx.input(|input| input.time) + 1.0 / 60.0);
++        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), events, time, ..Default::default() };
+         let mut actions = Vec::new();
+         ctx.run_ui(input, |ui| {
+             actions = menus.game(ui, "A game", Some(program_id), None, false, false, &[], 0, None, helpers);
+@@ -1459,8 +1535,52 @@ mod tests {
+         actions
+     }
+ 
++    /// round 81: the targets of the closed Helpers part, then the ones the open New Game
++    /// defaults line adds (HOME_DESIGN 2.6), in drawing order.
++    const CLOSED_TARGETS: [&str; 4] = ["helpers:section", "helpers:opt:true_hit=off", "helpers:opt:true_hit=on", "helpers:newgame:section"];
++    const NEW_GAME_TARGETS: [&str; 14] = [
++        "helpers:opt:battle_animations=game", "helpers:opt:battle_animations=off", "helpers:opt:battle_animations=on",
++        "helpers:opt:map_speed=game", "helpers:opt:map_speed=normal", "helpers:opt:map_speed=fast", "helpers:opt:map_speed=fast_while_a",
++        "helpers:opt:enemy_skip=game", "helpers:opt:enemy_skip=off", "helpers:opt:enemy_skip=move", "helpers:opt:enemy_skip=all",
++        "helpers:opt:hp_bars=game", "helpers:opt:hp_bars=off", "helpers:opt:hp_bars=on",
++    ];
++
++    fn target_names(menus: &Menus) -> Vec<&str> {
++        menus.helper_targets.iter().map(|(name, _)| name.as_str()).collect()
++    }
++
++    /// round 81: a click on a Helpers target, then quiet frames (the New Game line opens and
++    /// closes with a short slide); the Action::Settings count of the click's frame.
++    /// The Paused window is taller than a short screen: the Helpers part sits below its fold, so
++    /// first the wheel scrolls the window until the target is in its view, as a player would.
++    fn click_helper(ctx: &egui::Context, menus: &mut Menus, program_id: u64, helpers: &mut Helpers, screen: Vec2, name: &str) -> usize {
++        let find = |menus: &Menus| menus.helper_targets.iter().find(|(n, _)| n == name).map(|(_, r)| *r).unwrap_or_else(|| panic!("{name} not drawn"));
++        for _ in 0..40 {
++            let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("Paused"))).unwrap();
++            // the part of the window that shows the scrolled rows: below its title, above its edge
++            let view = egui::Rect::from_min_max(egui::pos2(window.min.x, window.min.y + 32.0), egui::pos2(window.max.x, window.max.y - 12.0));
++            let rect = find(menus);
++            if view.y_range().contains(rect.min.y) && view.y_range().contains(rect.max.y) {
++                break;
++            }
++            let delta = if rect.center().y > view.center().y { -40.0 } else { 40.0 };
++            let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, delta), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE };
++            paused_frame_with(ctx, menus, program_id, helpers, screen, vec![egui::Event::PointerMoved(view.center()), wheel]);
++            for _ in 0..3 {
++                paused_frame(ctx, menus, program_id, helpers, screen, None);
++            }
++        }
++        let pos = find(menus).center();
++        let actions = paused_frame(ctx, menus, program_id, helpers, screen, Some(pos));
++        for _ in 0..12 {
++            assert!(paused_frame(ctx, menus, program_id, helpers, screen, None).is_empty(), "a quiet frame changes nothing");
++        }
++        actions.iter().filter(|a| matches!(a, Action::Settings)).count()
++    }
++
+     /// U7: the heading and its rows show for Fire Emblem Fates' title id (Seal of Flames shares
+-    /// it), and for no other game.
++    /// it), and for no other game. Round 81: the New Game defaults line is closed at first (no
++    /// row targets); open, it adds exactly its rows' targets; opening it saves nothing.
+     #[test]
+     fn helper_rows_show_only_for_fates() {
+         let screen = Vec2::new(800.0, 480.0);
+@@ -1472,13 +1592,15 @@ mod tests {
+                 let actions = paused_frame(&ctx, &mut menus, program_id, &mut helpers, screen, None);
+                 assert!(actions.is_empty(), "drawing alone changes nothing");
+             }
+-            let names: Vec<&str> = menus.helper_targets.iter().map(|(name, _)| name.as_str()).collect();
+             if shown {
+-                assert_eq!(names, [
+-                    "helpers:section", "helpers:opt:true_hit=off", "helpers:opt:true_hit=on"
+-                ]);
++                assert_eq!(target_names(&menus), CLOSED_TARGETS);
++                assert_eq!(click_helper(&ctx, &mut menus, program_id, &mut helpers, screen, "helpers:newgame:section"), 0, "opening saves nothing");
++                let open: Vec<&str> = CLOSED_TARGETS.iter().chain(NEW_GAME_TARGETS.iter()).copied().collect();
++                assert_eq!(target_names(&menus), open);
++                assert_eq!(click_helper(&ctx, &mut menus, program_id, &mut helpers, screen, "helpers:newgame:section"), 0, "closing saves nothing");
++                assert_eq!(target_names(&menus), CLOSED_TARGETS);
+             } else {
+-                assert!(names.is_empty(), "{names:?}");
++                assert!(target_names(&menus).is_empty(), "{:?}", target_names(&menus));
+             }
+             assert_eq!(helpers, Helpers::default());
+         }
+@@ -1487,7 +1609,7 @@ mod tests {
+         let mut menus = Menus { menu_open: true, rando_blocked: true, ..Menus::default() };
+         let mut helpers = Helpers::default();
+         paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
+-        assert_eq!(menus.helper_targets.len(), 3);
++        assert_eq!(target_names(&menus), CLOSED_TARGETS);
+         // the menu closed: nothing drawn
+         menus.menu_open = false;
+         paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
+@@ -1496,59 +1618,107 @@ mod tests {
+ 
+     /// U8: a click on True hit On changes the row and asks for the settings to be saved and put
+     /// to use (Action::Settings), as the Settings window does; a click on the value already
+-    /// chosen asks for nothing. (Round 80 cut 3: there is no 2x / 4x row to click.)
++    /// chosen asks for nothing. (Round 80 cut 3: there is no 2x / 4x row to click.) Round 81:
++    /// the same for the New Game rows; Game's choice puts a row back to the default; the line
++    /// stays open while its words change ("1 set").
+     #[test]
+     fn clicking_true_hit_saves() {
++        use zakuro_core::fates_helpers::{BattleAnimations, EnemySkip, MapSpeed};
+         let screen = Vec2::new(800.0, 480.0);
++        let fates = crate::rando_page::FATES;
+         let ctx = egui::Context::default();
+         let mut menus = Menus { menu_open: true, ..Menus::default() };
+         let mut helpers = Helpers::default();
+         for _ in 0..3 {
+-            paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
++            paused_frame(&ctx, &mut menus, fates, &mut helpers, screen, None);
+         }
+-        let at = |menus: &Menus, name: &str| menus.helper_targets.iter().find(|(n, _)| n == name).map(|(_, r)| r.center()).unwrap();
+-        let click = |menus: &mut Menus, helpers: &mut Helpers, name: &str| {
+-            let pos = at(menus, name);
+-            let actions = paused_frame(&ctx, menus, crate::rando_page::FATES, helpers, screen, Some(pos));
+-            // and a quiet frame after it
+-            paused_frame(&ctx, menus, crate::rando_page::FATES, helpers, screen, None);
+-            actions.iter().filter(|a| matches!(a, Action::Settings)).count()
+-        };
++        let click = |menus: &mut Menus, helpers: &mut Helpers, name: &str| click_helper(&ctx, menus, fates, helpers, screen, name);
+         assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=on"), 1);
+         assert_eq!(helpers, Helpers { true_hit: true, ..Helpers::default() });
+         assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=on"), 0, "the same value again saves nothing");
+         assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=off"), 1);
+         assert!(helpers.is_default());
++        // round 81
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:newgame:section"), 0);
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:map_speed=fast"), 1);
++        assert_eq!(helpers, Helpers { map_speed: MapSpeed::Fast, ..Helpers::default() });
++        assert_eq!(new_game_title(&helpers), "New Game defaults: 1 set");
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:map_speed=fast"), 0, "the same value again saves nothing");
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:enemy_skip=all"), 1);
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:battle_animations=off"), 1);
++        assert_eq!(helpers, Helpers { map_speed: MapSpeed::Fast, enemy_skip: EnemySkip::All, battle_animations: BattleAnimations::Off, ..Helpers::default() });
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:map_speed=game"), 1);
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:enemy_skip=game"), 1);
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:battle_animations=game"), 1);
++        assert!(helpers.is_default(), "Game's choice is the default again: {helpers:?}");
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:hp_bars=game"), 0, "Game's choice again saves nothing");
++        assert_eq!(new_game_title(&helpers), "New Game defaults: game's choice");
++        assert!(target_names(&menus).contains(&"helpers:opt:hp_bars=on"), "the line stayed open while its words changed");
+     }
+ 
+     /// U9: with the Helpers heading the Paused window stays inside a short screen (800 x 480,
+     /// window scale 1, and 800 x 360), scrolling in it rather than running past its bottom, and
+-    /// keeps its full width and a useful height. Every game's Paused window scrolls now.
++    /// keeps its full width and a useful height. Every game's Paused window scrolls now. Round
++    /// 81: with the New Game defaults line closed and open (also with every row set, so the
++    /// closed words are "4 set"), every target inside the window's width.
+     #[test]
+     fn the_paused_window_fits_a_short_screen() {
+-        for (height, program_id) in [(480.0, crate::rando_page::FATES), (360.0, crate::rando_page::FATES), (360.0, 0x0004_0000_000A_0500)] {
++        use zakuro_core::fates_helpers::{BattleAnimations, EnemySkip, HpBars, MapSpeed};
++        let all_set = Helpers { battle_animations: BattleAnimations::Off, map_speed: MapSpeed::FastWhileA, enemy_skip: EnemySkip::All, hp_bars: HpBars::On, ..Helpers::default() };
++        for (height, program_id, open, start) in [
++            (480.0, crate::rando_page::FATES, false, Helpers::default()),
++            (360.0, crate::rando_page::FATES, false, Helpers::default()),
++            (360.0, 0x0004_0000_000A_0500, false, Helpers::default()),
++            (480.0, crate::rando_page::FATES, true, Helpers::default()),
++            (360.0, crate::rando_page::FATES, true, Helpers::default()),
++            (480.0, crate::rando_page::FATES, true, all_set),
++            (360.0, crate::rando_page::FATES, true, all_set),
++            (360.0, crate::rando_page::FATES, false, all_set),
++        ] {
+             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, height));
+             let ctx = egui::Context::default();
+             let mut menus = Menus { menu_open: true, ..Menus::default() };
+-            let mut helpers = Helpers::default();
++            let mut helpers = start;
+             for _ in 0..4 {
+                 paused_frame(&ctx, &mut menus, program_id, &mut helpers, screen.size(), None);
+             }
++            if open {
++                click_helper(&ctx, &mut menus, program_id, &mut helpers, screen.size(), "helpers:newgame:section");
++                assert_eq!(menus.helper_targets.len(), CLOSED_TARGETS.len() + NEW_GAME_TARGETS.len(), "open at {height}");
++            }
++            assert_eq!(helpers, start, "opening and drawing change nothing");
+             let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("Paused"))).unwrap();
+-            assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
++            assert!(screen.contains_rect(window), "{window:?} in {screen:?} (open {open})");
+             assert!(window.width() >= 200.0 && window.height() >= height * 0.6, "{window:?}");
+             for (name, rect) in &menus.helper_targets {
+-                assert!(rect.min.x >= window.min.x && rect.max.x <= window.max.x, "{name} {rect:?} in {window:?}");
++                assert!(rect.min.x >= window.min.x && rect.max.x <= window.max.x, "{name} {rect:?} in {window:?} (open {open})");
+             }
+         }
+     }
+ 
+     #[test]
+     fn the_helper_words_say_what_the_plan_asks() {
+-        assert!(HELPERS_LINE.contains("Options line 6") && HELPERS_LINE.contains("Off, Move, or All") && HELPERS_LINE.contains("Start key"));
++        use zakuro_core::fates_helpers::{HpBars, MapSpeed};
++        assert!(HELPERS_LINE.contains("Options line 6") && HELPERS_LINE.contains("Off, Movement, or All") && HELPERS_LINE.contains("Start key"));
+         // E1 (R4): the game's own skip can change later enemy turns; the line says so plainly
+         assert!(HELPERS_LINE.contains("later enemy moves can differ"));
+         assert!(TRUE_HIT_HELP.contains("70 (real 79)") && TRUE_HIT_HELP.contains("never changes a roll"));
++        // round 81: the line names the new row and where it is
++        assert!(HELPERS_LINE.contains("Enemy turn skip") && HELPERS_LINE.contains("New Game defaults"));
++        // round 81: Grok's name and battle line, the note, the skip's timing sentence
++        assert_eq!(NEW_GAME_HEADING, "New Game defaults");
++        assert_eq!(BATTLE_ANIMATIONS_HELP, "Off plays fights on the map. Supports and dances follow this too.");
++        assert!(NEW_GAME_NOTE.contains("New Game") && NEW_GAME_NOTE.contains("game already going") && NEW_GAME_NOTE.contains("Options screen"));
++        assert!(NEW_GAME_NOTE.contains("hits, damage and the battle dice stay the same"));
++        assert!(ENEMY_SKIP_HELP.contains("later enemy moves can differ") && ENEMY_SKIP_HELP.contains("Options line 6"));
++        assert!(MAP_SPEED_HELP.contains("Manual") && MAP_SPEED_HELP.contains("hold the A Button"));
++        assert!(HP_BARS_HELP.contains("HP bars"));
++        assert_eq!(GAMES_CHOICE_HELP, "Leaves the game's own setting.");
++        assert_eq!(new_game_title(&Helpers::default()), "New Game defaults: game's choice");
++        let two = Helpers { hp_bars: HpBars::Off, map_speed: MapSpeed::Normal, ..Helpers::default() };
++        assert_eq!(new_game_title(&two), "New Game defaults: 2 set");
++        // True hit is not a New Game row
++        assert_eq!(new_game_title(&Helpers { true_hit: true, ..Helpers::default() }), "New Game defaults: game's choice");
+     }
+ 
+     #[test]
+diff --git a/crates/zakuro/src/pagebot.rs b/crates/zakuro/src/pagebot.rs
+index b6978b6..4e68392 100644
+--- a/crates/zakuro/src/pagebot.rs
++++ b/crates/zakuro/src/pagebot.rs
+@@ -33,6 +33,13 @@
+ //! closes them, and `{"expect_settings": {"true_hit": true}}` checks the
+ //! `[fates_helpers]` table of the settings.toml the program writes (`settings::path()`).
+ //!
++//! Round 81 (docs/ROUND81_PLAN.md A1): the collapsing "New Game defaults" line is clicked by
++//! `helpers:newgame:section` (it opens and closes); while it is fully open its rows are clicked
++//! by `helpers:opt:<key>=<word>` (`battle_animations=game|off|on`,
++//! `map_speed=game|normal|fast|fast_while_a`, `enemy_skip=game|off|move|all`,
++//! `hp_bars=game|off|on`). A row at Game's choice is not written to the file, so in
++//! `expect_settings` an expected `"game"` matches a key that is absent.
++//!
+ //! Nothing here runs without FEF_PAGEBOT: the program does exactly what it did before.
+ 
+ use std::io::Write;
+@@ -416,7 +423,8 @@ impl PageBot {
+             let table = text.as_deref().is_some_and(|t| t.contains("[fates_helpers]"));
+             let saved = text.as_deref().and_then(|t| toml::from_str::<crate::settings::Settings>(t).ok()).map(|s| s.fates_helpers);
+             let got = saved.map(|h| serde_json::to_value(h).unwrap_or(Value::Null)).unwrap_or(Value::Null);
+-            let ok = saved.is_some() && want.iter().all(|(k, v)| got.get(k) == Some(v));
++            // round 81: a New Game row at Game's choice is not written: "game" = the key absent
++            let ok = saved.is_some() && want.iter().all(|(k, v)| got.get(k) == Some(v) || (v == "game" && got.get(k).is_none()));
+             let file = self.settings_file.as_ref().map(|f| f.display().to_string());
+             let mut extra = json!({"expect": step["expect_settings"], "ok": ok, "saved": got, "table": table, "file": file});
+             if let Some(mark) = step["mark"].as_str() {
+@@ -572,6 +580,65 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// round 81 (the page robot's `newgame` scenario, HOME_DESIGN 6, in a unit test): the script
++    /// opens the New Game defaults line, sets two rows, puts one back to Game's choice and reads
++    /// the file back each time; "game" matches an absent key, and a planted wrong expect fails.
++    #[test]
++    fn the_robot_sets_the_new_game_rows_and_reads_them_back() {
++        use zakuro_core::fates_helpers::{EnemySkip, Helpers};
++        let dir = std::env::temp_dir().join(format!("zakuro-r81-pagebot-newgame-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let log = dir.join("pagebot.jsonl");
++        let file = dir.join("settings.toml");
++        let mut settings = crate::settings::Settings::default();
++        std::fs::write(&file, toml::to_string_pretty(&settings).unwrap()).unwrap();
++        let mut bot = bot(json!([
++            {"esc": "paused"},
++            {"expect_settings": {"battle_animations": "game", "map_speed": "game", "enemy_skip": "game", "hp_bars": "game", "true_hit": false}, "mark": "before"},
++            {"click": "helpers:newgame:section"},
++            {"click": "helpers:opt:battle_animations=off"},
++            {"click": "helpers:opt:enemy_skip=all"},
++            {"expect_settings": {"battle_animations": "off", "enemy_skip": "all", "map_speed": "game"}, "mark": "set"},
++            {"click": "helpers:opt:battle_animations=game"},
++            {"expect_settings": {"battle_animations": "game", "enemy_skip": "all"}, "mark": "back"},
++            {"expect_settings": {"enemy_skip": "game"}, "mark": "planted"},
++            {"expect_target": "helpers:opt:hp_bars=on"},
++            {"esc": "close"}
++        ]), &log);
++        bot.settings_file = Some(file.clone());
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA).unwrap());
++        for frame in 0..600 {
++            let (_, changed) = bot.frame_with(&mut page, Some(&dir), frame, Some(&mut settings.fates_helpers));
++            if changed {
++                std::fs::write(&file, toml::to_string_pretty(&settings).unwrap()).unwrap();
++            }
++            if bot.finished() {
++                break;
++            }
++        }
++        assert!(bot.finished());
++        assert!(!bot.helpers_open());
++        assert_eq!(settings.fates_helpers, Helpers { enemy_skip: EnemySkip::All, ..Helpers::default() });
++        let text = std::fs::read_to_string(&file).unwrap();
++        assert!(text.contains("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = false\nenemy_skip = \"all\"\n"), "{text}");
++        for key in ["battle_animations", "map_speed", "hp_bars"] {
++            assert!(!text.contains(key), "{key} in {text}");
++        }
++        drop(bot);
++        let events = events_of(&log);
++        let named = |name: &str| events.iter().filter(|e| e["event"] == name).cloned().collect::<Vec<_>>();
++        assert!(named("unknown_step").is_empty(), "{events:?}");
++        let expects = named("expect_settings");
++        let oks: Vec<_> = expects.iter().map(|e| (e["mark"].as_str().unwrap_or(""), e["ok"].as_bool().unwrap())).collect();
++        assert_eq!(oks, [("before", true), ("set", true), ("back", true), ("planted", false)], "{expects:?}");
++        assert_eq!(expects[2]["saved"], json!({"enemy_phase": "normal", "true_hit": false, "enemy_skip": "all"}));
++        assert_eq!(named("helpers_changed").len(), 3);
++        assert_eq!(named("click").len(), 4);
++        assert_eq!(named("expect_target")[0]["ok"], json!(true), "the lowest row fits the 800 x 480 screen");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     /// round 74: the pagebot SCHEMA with two made-up presets.
+     const SCHEMA_74: &str = r#"{"format": 1, "rows": [
+         {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true, "section": "Basics", "help": "On uses the settings below."},
+diff --git a/crates/zakuro/src/settings.rs b/crates/zakuro/src/settings.rs
+index 1b20447..447c6bd 100644
+--- a/crates/zakuro/src/settings.rs
++++ b/crates/zakuro/src/settings.rs
+@@ -630,7 +630,10 @@ pub struct Settings {
+     /// the Fates port's Helpers (round 80, zakuro-core's fates_helpers): the Esc window's Enemy
+     /// phase and True hit rows, one choice for every save of Fire Emblem Fates and Seal of
+     /// Flames. at the defaults (today's game) nothing is written, so an untouched file stays as
+-    /// it was; a value this build does not know gives the defaults and keeps the rest.
++    /// it was. Round 81 adds the New Game defaults rows (battle_animations, map_speed,
++    /// enemy_skip, hp_bars), each written only when it is not Game's choice, and reads every key
++    /// on its own (fates_helpers::lenient): a value this build does not know gives that key's
++    /// default and keeps the other keys; a table of the wrong kind still gives the defaults.
+     #[serde(deserialize_with = "or_default", skip_serializing_if = "is_default")]
+     pub fates_helpers: zakuro_core::fates_helpers::Helpers,
+ }
+@@ -964,38 +967,88 @@ mod tests {
+ 
+     // round 80: the Helpers (U1-U6; HOME_DESIGN 3)
+ 
+-    use zakuro_core::fates_helpers::{EnemyPhase, Helpers};
++    use zakuro_core::fates_helpers::{BattleAnimations, EnemyPhase, EnemySkip, Helpers, HpBars, MapSpeed};
+ 
+     /// U1: an untouched settings file gets no `[fates_helpers]` table: today's files stay as they are.
++    /// Round 81: and a round-80 file (True hit On, no New Game rows) writes back byte for byte,
++    /// with none of the New Game keys.
+     #[test]
+     fn untouched_settings_write_no_helpers_table() {
+         for settings in [Settings::default(), Settings::first_run()] {
+             let text = toml::to_string_pretty(&settings).unwrap();
+             assert!(!text.contains("fates_helpers"), "{text}");
+             assert!(!text.contains("enemy_phase") && !text.contains("true_hit"));
++            for key in ["battle_animations", "map_speed", "enemy_skip", "hp_bars"] {
++                assert!(!text.contains(key), "{key} in {text}");
++            }
+         }
+         // an explicit table at the defaults loads, and is not written back
+         let explicit: Settings = toml::from_str("show_fps = true\n[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = false\n").unwrap();
+         assert!(explicit.fates_helpers.is_default());
+         assert_eq!(toml::to_string_pretty(&explicit).unwrap(), toml::to_string_pretty(&Settings { show_fps: true, ..Settings::default() }).unwrap());
++        // the four New Game rows written as "game" load as Game's choice and are not written back
++        let games: Settings = toml::from_str("show_fps = true\n[fates_helpers]\nbattle_animations = \"game\"\nmap_speed = \"game\"\nenemy_skip = \"game\"\nhp_bars = \"game\"\n").unwrap();
++        assert!(games.fates_helpers.is_default());
++        assert_eq!(toml::to_string_pretty(&games).unwrap(), toml::to_string_pretty(&Settings { show_fps: true, ..Settings::default() }).unwrap());
++        // a round-80 file: True hit On; it comes back byte for byte
++        let round_80 = toml::to_string_pretty(&Settings { fates_helpers: Helpers { true_hit: true, ..Helpers::default() }, ..Settings::first_run() }).unwrap();
++        assert!(round_80.contains("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = true\n"), "{round_80}");
++        let read: Settings = toml::from_str(&round_80).unwrap();
++        assert_eq!(toml::to_string_pretty(&read).unwrap(), round_80);
++        for key in ["battle_animations", "map_speed", "enemy_skip", "hp_bars"] {
++            assert!(!round_80.contains(key), "{key} in {round_80}");
++        }
+     }
+ 
+-    /// U2: every value of both rows comes back as it was saved, and only a changed row is written.
++    /// U2: every value of every row comes back as it was saved, and only a changed row is written.
+     #[test]
+     fn helpers_round_trip() {
+         for enemy_phase in EnemyPhase::ALL {
+             for true_hit in [false, true] {
+-                let settings = Settings { fates_helpers: Helpers { enemy_phase, true_hit }, ..Settings::default() };
++                let settings = Settings { fates_helpers: Helpers { enemy_phase, true_hit, ..Helpers::default() }, ..Settings::default() };
+                 let text = toml::to_string_pretty(&settings).unwrap();
+                 assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings, "{text}");
+                 assert_eq!(text.contains("[fates_helpers]"), !settings.fates_helpers.is_default());
+             }
+         }
+-        let text = toml::to_string_pretty(&Settings { fates_helpers: Helpers { enemy_phase: EnemyPhase::X4, true_hit: true }, ..Settings::default() }).unwrap();
++        let text = toml::to_string_pretty(&Settings { fates_helpers: Helpers { enemy_phase: EnemyPhase::X4, true_hit: true, ..Helpers::default() }, ..Settings::default() }).unwrap();
+         assert!(text.contains("[fates_helpers]\nenemy_phase = \"4x\"\ntrue_hit = true\n"), "{text}");
++        // round 81: every value of the New Game rows, one row at a time; the table holds only that row
++        let mut rows: Vec<(Helpers, &str, &str)> = Vec::new();
++        for &v in BattleAnimations::ALL {
++            rows.push((Helpers { battle_animations: v, ..Helpers::default() }, "battle_animations", v.key()));
++        }
++        for &v in MapSpeed::ALL {
++            rows.push((Helpers { map_speed: v, ..Helpers::default() }, "map_speed", v.key()));
++        }
++        for &v in EnemySkip::ALL {
++            rows.push((Helpers { enemy_skip: v, ..Helpers::default() }, "enemy_skip", v.key()));
++        }
++        for &v in HpBars::ALL {
++            rows.push((Helpers { hp_bars: v, ..Helpers::default() }, "hp_bars", v.key()));
++        }
++        for (helpers, key, word) in rows {
++            let settings = Settings { fates_helpers: helpers, ..Settings::default() };
++            let text = toml::to_string_pretty(&settings).unwrap();
++            assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings, "{text}");
++            let set_keys = ["battle_animations", "map_speed", "enemy_skip", "hp_bars"].into_iter().filter(|k| text.contains(&format!("{k} ="))).collect::<Vec<_>>();
++            if word == "game" {
++                assert!(!text.contains("[fates_helpers]") && set_keys.is_empty(), "{text}");
++            } else {
++                assert!(text.contains(&format!("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = false\n{key} = \"{word}\"\n")), "{text}");
++                assert_eq!(set_keys, [key], "{text}");
++            }
++        }
++        // all four set at once, with True hit
++        let all = Helpers { true_hit: true, battle_animations: BattleAnimations::Off, map_speed: MapSpeed::FastWhileA, enemy_skip: EnemySkip::All, hp_bars: HpBars::On, ..Helpers::default() };
++        let text = toml::to_string_pretty(&Settings { fates_helpers: all, ..Settings::default() }).unwrap();
++        assert!(text.contains("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = true\nbattle_animations = \"off\"\nmap_speed = \"fast_while_a\"\nenemy_skip = \"all\"\nhp_bars = \"on\"\n"), "{text}");
++        assert_eq!(toml::from_str::<Settings>(&text).unwrap().fates_helpers, all);
+     }
+ 
+-    /// U3: a value this build does not know gives the defaults and keeps every other setting.
++    /// U3: a value this build does not know gives that key's default and keeps every other key
++    /// and setting. Round 81 changes round 80's rule on purpose: one bad value used to reset the
++    /// whole table (True hit with it); now each key is read on its own (fates_helpers::lenient).
+     #[test]
+     fn a_bad_helper_value_keeps_the_rest() {
+         let text = "show_fps = true\nscale = 3\n[fates_helpers]\nenemy_phase = \"8x\"\ntrue_hit = true\n[keys]\na = \"KeyK\"\n";
+@@ -1003,14 +1056,28 @@ mod tests {
+         assert!(settings.show_fps);
+         assert_eq!(settings.scale, 3);
+         assert_eq!(settings.keys.a, KeyCode::KeyK);
+-        assert_eq!(settings.fates_helpers, Helpers::default(), "the whole table falls back, nothing else does");
++        assert_eq!(settings.fates_helpers, Helpers { true_hit: true, ..Helpers::default() }, "only the bad key falls back");
+         let wrong_kind: Settings = toml::from_str("show_fps = true\nfates_helpers = 4\n").unwrap();
+         assert!(wrong_kind.show_fps && wrong_kind.fates_helpers.is_default());
+         let half: Settings = toml::from_str("[fates_helpers]\ntrue_hit = true\n").unwrap();
+-        assert_eq!(half.fates_helpers, Helpers { enemy_phase: EnemyPhase::Normal, true_hit: true });
++        assert_eq!(half.fates_helpers, Helpers { enemy_phase: EnemyPhase::Normal, true_hit: true, ..Helpers::default() });
++        // a bad map_speed keeps True hit and the other New Game rows
++        let text = "show_fps = true\n[fates_helpers]\ntrue_hit = true\nbattle_animations = \"off\"\nmap_speed = \"warp\"\nenemy_skip = \"move\"\nhp_bars = 3\n[keys]\na = \"KeyK\"\n";
++        let settings: Settings = toml::from_str(text).unwrap();
++        assert!(settings.show_fps);
++        assert_eq!(settings.keys.a, KeyCode::KeyK);
++        assert_eq!(settings.fates_helpers, Helpers { true_hit: true, battle_animations: BattleAnimations::Off, enemy_skip: EnemySkip::Move, ..Helpers::default() });
++        // a bad True hit keeps the New Game rows
++        let settings: Settings = toml::from_str("[fates_helpers]\ntrue_hit = \"yes\"\nhp_bars = \"off\"\n").unwrap();
++        assert_eq!(settings.fates_helpers, Helpers { hp_bars: HpBars::Off, ..Helpers::default() });
++        // a key this build does not know is passed over
++        let settings: Settings = toml::from_str("[fates_helpers]\ndanger_zone = \"on\"\nmap_speed = \"fast\"\n").unwrap();
++        assert_eq!(settings.fates_helpers, Helpers { map_speed: MapSpeed::Fast, ..Helpers::default() });
+     }
+ 
+-    /// U4: a settings file of the round-77 program (no table) loads as Normal / Off.
++    /// U4: a settings file of the round-77 program (no table) loads as Normal / Off / Game's
++    /// choice; round 81: a round-80 file (enemy_phase, true_hit only) has the four New Game rows
++    /// at Game's choice.
+     #[test]
+     fn an_older_file_has_the_default_helpers() {
+         let mut older = toml::to_string_pretty(&Settings::first_run()).unwrap();
+@@ -1020,20 +1087,27 @@ mod tests {
+         assert_eq!(settings.fates_helpers, Helpers::default());
+         assert_eq!(settings.fates_helpers.enemy_phase().factor(), 1);
+         assert!(!settings.fates_helpers.true_hit());
++        let round_80: Settings = toml::from_str("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = true\n").unwrap();
++        let helpers = round_80.fates_helpers;
++        assert!(helpers.true_hit());
++        assert_eq!((helpers.battle_animations(), helpers.map_speed(), helpers.enemy_skip(), helpers.hp_bars()), (BattleAnimations::Game, MapSpeed::Game, EnemySkip::Game, HpBars::Game));
++        assert!(!helpers.any_new_game_row() && helpers.new_game_bytes().is_empty());
+     }
+ 
+     /// U5: the helpers are not a game's own settings: "Follow the general settings in
+     /// everything" (per_game removed) leaves them, and setting them gives Fates nothing of its own.
++    /// Round 81: the New Game rows too.
+     #[test]
+     fn follow_the_general_settings_leaves_the_helpers() {
+         let mut settings = Settings::default();
+-        settings.fates_helpers = Helpers { enemy_phase: EnemyPhase::X2, true_hit: true };
++        let set = Helpers { enemy_phase: EnemyPhase::X2, true_hit: true, map_speed: MapSpeed::Fast, hp_bars: HpBars::Off, ..Helpers::default() };
++        settings.fates_helpers = set;
+         assert!(!settings.has_own(FATES_SE_USA), "a helper is not a game setting of its own");
+         settings.per_game.insert(game_key(FATES_SE_USA), GameSettings { resolution: Some(4), ..GameSettings::default() });
+         // the button's effect (menus.rs game_settings): the game's own settings go
+         settings.per_game.remove(&game_key(FATES_SE_USA));
+         assert!(!settings.has_own(FATES_SE_USA));
+-        assert_eq!(settings.fates_helpers, Helpers { enemy_phase: EnemyPhase::X2, true_hit: true });
++        assert_eq!(settings.fates_helpers, set);
+         assert_eq!(settings.for_game(Some(FATES_SE_USA)).fates_helpers, settings.fates_helpers);
+         assert_eq!(settings.for_game(None).fates_helpers, settings.fates_helpers);
+     }

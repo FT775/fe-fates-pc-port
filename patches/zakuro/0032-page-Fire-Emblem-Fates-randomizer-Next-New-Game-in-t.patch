@@ -1,0 +1,1061 @@
+From 85a8dffc68b468b31f8f1e79b02e0947cd7c522c Mon Sep 17 00:00:00 2001
+From: "fef engine.py" <engine@localhost>
+Date: Tue, 24 Nov 2026 15:09:24 -0500
+Subject: [PATCH] page: Fire Emblem Fates randomizer: Next New Game in the Esc
+ window, the help line fits
+
+The Esc menu's Randomizer window keeps This run (read only) and gains a Next New Game
+part under it (docs/rando/FULL_SWAP_PLAN.md section 6, round 71): the New Game page's rows
+and sections on a draft of the form (rows() under push_id("next"), its own scroll area),
+the grey line "These never change the game you are playing." at its top, the same help
+line, Keep for next New Game / Defaults / Randomize everything and no Start. Keep
+(keep_next) puts the draft in the form and writes <data>/rando/last.json through the shared
+write_last (the file and format Start game writes), with Randomizer off too, then lets the
+background guess follow the kept values; closing the window throws the draft away; without
+a data folder Keep is grey and nothing is written (Grok, round 71). The part is hidden while
+the New Game page is open and never changes the game playing. draw_this_run takes the data
+folder (lib.rs). Robot targets of the part start with next:; the page robot hook gets
+{"esc": "randomizer"|"close"}, {"wait": "next_open"} and {"expect_last": {...}}, and
+the window holds the game while the script has it open.
+
+The help line fits: Randomize everything writes one line ("Randomize everything turned on
+N settings. This run lists them after Start."), and help_line() draws a LayoutJob of at most
+two rows (word breaks, an ellipsis, the full text on hover) in a box of exactly two rows,
+so the buttons under it never move.
+
+Rows marked omit_default (round 71: Recolour, Chest and village items) are left
+out of the answer while at their default, as ingame.py page_answers / make_args
+do, so every old answer keeps its text and run id (Row::omit_default, read in
+parse_schema, skipped in answers_with_seed; test
+late_rows_at_their_default_leave_the_answer_and_run_id_unchanged).
+---
+ crates/zakuro/src/lib.rs        |   8 +-
+ crates/zakuro/src/pagebot.rs    | 133 ++++++-
+ crates/zakuro/src/rando_page.rs | 612 ++++++++++++++++++++++++++++++--
+ 3 files changed, 708 insertions(+), 45 deletions(-)
+
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 0a47d74..75c9380 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -1372,9 +1372,12 @@ impl App {
+         loop {
+             let Some(mut bot) = self.pagebot.take() else { return true };
+             let actions = bot.frame(&mut self.menus.rando, data.as_deref(), ran);
++            let finished = bot.finished();
+             self.pagebot = Some(bot);
+             self.rando(actions);
+-            if !self.menus.rando.new_game {
++            // round 71: the Esc Randomizer window opened by the script holds the game too (as
++            // the Esc menu does with a window) until the script closes it or ends
++            if !self.menus.rando.new_game && (!self.menus.rando.this_run_open || finished) {
+                 break;
+             }
+             frames += 1;
+@@ -2597,7 +2600,8 @@ impl App {
+             if game.is_some() {
+                 rando_actions.extend(menus.rando.draw_new_game(ui.ctx(), rando_data.as_deref()));
+                 if menus.rando.this_run_open {
+-                    rando_actions.extend(menus.rando.draw_this_run(ui.ctx()));
++                    // round 71: the data folder, for the Next New Game part's Keep
++                    rando_actions.extend(menus.rando.draw_this_run(ui.ctx(), rando_data.as_deref()));
+                 }
+             }
+             if let Some(request) = &keyboard {
+diff --git a/crates/zakuro/src/pagebot.rs b/crates/zakuro/src/pagebot.rs
+index c9c7e2d..1788c0b 100644
+--- a/crates/zakuro/src/pagebot.rs
++++ b/crates/zakuro/src/pagebot.rs
+@@ -8,6 +8,12 @@
+ //! page is open the game waits, as with a window. One JSON line per event goes to the log.
+ //! When the script's last step is done the run ends by itself.
+ //!
++//! Round 71: `{"esc": "randomizer"}` opens the Esc menu's Randomizer window (This run and its
++//! Next New Game part, `draw_this_run`), drawn the same way into the same context; while it
++//! is open the game waits (as under the Esc menu) and its controls are clicked by their
++//! `next:` targets. `{"wait": "next_open"}` waits for the part, `{"esc": "close"}` closes the
++//! window, `{"expect_last": {key: value}}` checks `<data>/rando/last.json`.
++//!
+ //! Nothing here runs without FEF_PAGEBOT: the program does exactly what it did before.
+ 
+ use std::io::Write;
+@@ -103,7 +109,7 @@ impl PageBot {
+     /// one page frame: the next script step, then the real page drawn with its events. Called
+     /// every frame, the page open or not (closed, the page only makes its early guess).
+     pub fn frame(&mut self, page: &mut RandoPage, data: Option<&Path>, game_frame: u64) -> Vec<PageAction> {
+-        if page.new_game {
++        if page.new_game || page.this_run_open {
+             self.open_frames = self.open_frames.saturating_add(1);
+             self.page_frames += 1;
+         } else {
+@@ -131,8 +137,8 @@ impl PageBot {
+         for id in std::mem::take(&mut page.thrown) {
+             self.event("discarded", json!({"id": id}));
+         }
+-        if page.new_game {
+-            self.step(page);
++        if page.new_game || page.this_run_open || self.esc_step_next() {
++            self.step(page, data);
+         }
+         self.time += 1.0 / 60.0;
+         let mut events = std::mem::take(&mut self.pending);
+@@ -150,11 +156,23 @@ impl PageBot {
+         };
+         let mut actions = Vec::new();
+         self.ctx
+-            .run_ui(input, |ui| actions = page.draw_new_game(ui.ctx(), data))
++            .run_ui(input, |ui| {
++                actions = page.draw_new_game(ui.ctx(), data);
++                if page.this_run_open {
++                    // round 71: the Esc Randomizer window, as the program draws it
++                    actions.extend(page.draw_this_run(ui.ctx(), data));
++                }
++            })
+             .drop_without_applying_deltas();
+         actions
+     }
+ 
++    /// round 71: the next step opens or closes the Esc Randomizer window (it runs with the
++    /// New Game page closed).
++    fn esc_step_next(&self) -> bool {
++        self.steps.get(self.next).is_some_and(|step| step.get("esc").is_some())
++    }
++
+     /// the waits that need no page frame (laid, avatar): called after every game frame.
+     pub fn tick(&mut self, game_frame: u64) {
+         let Some(step) = self.steps.get(self.next).cloned() else { return };
+@@ -173,11 +191,27 @@ impl PageBot {
+         }
+     }
+ 
+-    fn step(&mut self, page: &mut RandoPage) {
+-        if self.release.is_some() || self.open_frames < SETTLE_FRAMES {
+-            return; // a click's release goes out first; a new window settles first
++    fn step(&mut self, page: &mut RandoPage, data: Option<&Path>) {
++        if self.release.is_some() {
++            return; // a click's release goes out first
+         }
+         let Some(step) = self.steps.get(self.next).cloned() else { return };
++        if let Some(what) = step["esc"].as_str() {
++            // round 71: the Esc menu's Randomizer window (the New Game page is not open then)
++            let open = what != "close";
++            if open && page.new_game {
++                return; // the program offers the Esc window only over the game
++            }
++            page.this_run_open = open;
++            self.open_frames = 0;
++            let window = if open { "open" } else { "closed" };
++            self.event("esc", json!({"window": window}));
++            self.next += 1;
++            return;
++        }
++        if self.open_frames < SETTLE_FRAMES {
++            return; // a new window settles first
++        }
+         if let Some(w) = step["wait"].as_str() {
+             if w == "page_open" && page.rows_settled() && !page.has_rows() {
+                 // no rows (no Python or no tool): the page offers only the original game; the
+@@ -188,6 +222,7 @@ impl PageBot {
+             }
+             let done = match w {
+                 "page_open" => page.has_rows() && page.targets.iter().any(|(k, _)| k == "btn:start"),
++                "next_open" => page.next_shown() && page.targets.iter().any(|(k, _)| k == "next:btn:keep"),
+                 "prebuild_done" => page.prebuild.as_ref().is_some_and(|p| p.result.is_some()),
+                 _ => false, // laid / avatar: tick()
+             };
+@@ -240,8 +275,92 @@ impl PageBot {
+             self.next += 1;
+             return;
+         }
++        if let Some(want) = step["expect_last"].as_object() {
++            // round 71: what Keep for next New Game (or Start game) wrote
++            let file = data.map(crate::rando_page::last_path);
++            let kept: Value = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
++            let ok = want.iter().all(|(k, v)| kept.get(k) == Some(v));
++            self.event("expect_last", json!({"expect": step["expect_last"], "ok": ok, "last": kept, "note": page.next_note_text(data)}));
++            self.next += 1;
++            return;
++        }
+         // a step this hook does not know: logged and skipped
+         self.event("unknown_step", json!({"step": step}));
+         self.next += 1;
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::rando_page::{last_path, parse_schema};
++
++    const SCHEMA: &str = r#"{"format": 1, "rows": [
++        {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true, "section": "Basics", "help": "On uses the settings below."},
++        {"key": "seed", "label": "Seed", "kind": "seed", "default": "", "section": "Basics", "help": "The same seed makes the same game."},
++        {"key": "classes", "label": "Classes", "kind": "onoff", "default": true, "all": true, "flag": "--classes", "section": "Classes", "help": "On: people can start in another class."}
++    ]}"#;
++
++    fn bot(steps: Value, log: &Path) -> PageBot {
++        PageBot {
++            steps: steps.as_array().cloned().unwrap(),
++            next: 0,
++            ctx: egui::Context::default(),
++            log: std::fs::File::create(log).unwrap(),
++            started: Instant::now(),
++            pending: Vec::new(),
++            release: None,
++            time: 0.0,
++            last_prebuild: None,
++            open_frames: 0,
++            seen: None,
++            page_frames: 0,
++            avatar_after: None,
++            laid_at: None,
++            answered: None,
++        }
++    }
++
++    /// round 71: the script opens the Esc Randomizer window, sets a row in Next New Game,
++    /// presses Keep, checks last.json and closes the window, with the New Game page closed
++    /// (Randomizer stays off, so no background make starts in a test).
++    #[test]
++    fn the_robot_keeps_a_next_new_game_value_from_the_esc_window() {
++        let dir = std::env::temp_dir().join(format!("zakuro-r71-pagebot-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let log = dir.join("pagebot.jsonl");
++        let mut bot = bot(json!([
++            {"esc": "randomizer"},
++            {"wait": "next_open"},
++            {"click": "next:opt:classes=off"},
++            {"click": "next:btn:keep"},
++            {"expect_last": {"randomizer": false, "classes": false}},
++            {"expect": {"randomizer": false}},
++            {"esc": "close"}
++        ]), &log);
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA).unwrap());
++        for frame in 0..400 {
++            bot.frame(&mut page, Some(&dir), frame);
++            if bot.finished() {
++                break;
++            }
++        }
++        assert!(bot.finished());
++        assert!(!page.this_run_open && !page.new_game, "the window closed, the page never opened");
++        let kept: Value = serde_json::from_str(&std::fs::read_to_string(last_path(&dir)).unwrap()).unwrap();
++        assert_eq!(kept["randomizer"], json!(false));
++        assert_eq!(kept["classes"], json!(false));
++        assert!(page.prebuild.is_none(), "Randomizer off: no background make");
++        drop(bot);
++        let events: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
++        let named = |name: &str| events.iter().filter(|e| e["event"] == name).cloned().collect::<Vec<_>>();
++        assert_eq!(named("esc").len(), 2);
++        assert_eq!(named("click").len(), 2);
++        assert!(named("expect_last")[0]["ok"].as_bool().unwrap(), "{events:?}");
++        assert_eq!(named("expect_last")[0]["note"], json!("Kept for the next New Game."));
++        assert!(named("expect")[0]["ok"].as_bool().unwrap(), "{events:?}");
++        assert!(named("unknown_step").is_empty());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+index 881599d..8cb0f20 100644
+--- a/crates/zakuro/src/rando_page.rs
++++ b/crates/zakuro/src/rando_page.rs
+@@ -189,6 +189,9 @@ pub struct Row {
+     pub hidden: bool,
+     /// round 62b: a page row that is never in the answer (Spoiler log, the two switches).
+     pub page_only: bool,
++    /// round 71: left out of the answer while at its default (ingame.py page_answers /
++    /// make_args the same), so a row added later never changes an old answer's text or run id.
++    pub omit_default: bool,
+     /// round 62b: an on/off switch over another (hidden) row: on when that row is not at
+     /// `off`; turned on it gives that row `on` (an old value other than `off` is kept).
+     pub drives: Option<Drive>,
+@@ -272,6 +275,7 @@ pub fn parse_schema(text: &str) -> Result<Vec<Row>, String> {
+             help: text("help").unwrap_or_default(),
+             hidden: row.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+             page_only: row.get("page_only").and_then(Value::as_bool).unwrap_or(false),
++            omit_default: row.get("omit_default").and_then(Value::as_bool).unwrap_or(false),
+             drives: row.get("drives").and_then(|d| Some(Drive {
+                 key: d.get("key")?.as_str()?.to_owned(),
+                 off: d.get("off")?.clone(),
+@@ -455,6 +459,10 @@ impl RandoForm {
+         // hidden rows are, so an old answer gives the same text and run id
+         for row in self.rows.iter().filter(|row| !row.page_only) {
+             let value = if row.fixed { row.default.clone() } else { self.get(&row.key).clone() };
++            // round 71: a late row (Recolour, Chest and village items) at its default is not answered
++            if row.omit_default && value == row.default {
++                continue;
++            }
+             out.insert(row.key.clone(), value);
+         }
+         if let Some(seed) = seed {
+@@ -519,6 +527,63 @@ pub fn last_path(data: &Path) -> PathBuf {
+     data.join("rando").join("last.json")
+ }
+ 
++/// round 71: writes the form's values to `<data>/rando/last.json`, the one writer of that
++/// file (Start game of a randomized game, and the Esc window's Keep for next New Game).
++pub fn write_last(data: &Path, form: &RandoForm) -> Result<(), String> {
++    let path = last_path(data);
++    let text = serde_json::to_string_pretty(&Value::Object(form.values.clone())).unwrap_or_default();
++    path.parent()
++        .map_or(Ok(()), std::fs::create_dir_all)
++        .and_then(|()| std::fs::write(&path, text))
++        .map_err(|error| format!("{} could not be written: {error}", path.display()))
++}
++
++/// round 71: Randomize everything's note, one line (Grok, docs/collab/FULL_SWAP_R70_GROK.md):
++/// how many shown settings it changed; This run lists them once the game is started.
++pub fn everything_note(turned: &[String]) -> String {
++    match turned.len() {
++        0 => "Randomize everything: nothing more to turn on.".to_owned(),
++        1 => "Randomize everything turned on 1 setting. This run lists it after Start.".to_owned(),
++        n => format!("Randomize everything turned on {n} settings. This run lists them after Start."),
++    }
++}
++
++/// round 71: the help line while no setting is pointed at.
++pub const HELP_REST: &str = "Point at a setting to see what it changes.";
++
++/// the help line's text: the note, else the pointed row's one sentence, else the resting line.
++fn help_text(form: &RandoForm, key: Option<&String>, note: Option<&String>) -> String {
++    note.cloned()
++        .or_else(|| key
++            .and_then(|key| form.rows.iter().find(|row| &row.key == key))
++            .filter(|row| !row.help.is_empty())
++            .map(|row| format!("{}: {}", row.label, row.help)))
++        .unwrap_or_else(|| HELP_REST.to_owned())
++}
++
++/// round 71: the help line, always exactly two text rows high: wrapped at word breaks, cut
++/// with an ellipsis after the second row, the full text when the pointer rests on it. The
++/// buttons under it never move, whatever it says (docs/rando/FULL_SWAP_PLAN.md 6.5).
++pub fn help_line(ui: &mut egui::Ui, text: &str) -> egui::Response {
++    let font = egui::TextStyle::Body.resolve(ui.style());
++    let colour = Color32::from_rgb(230, 220, 170);
++    let width = ui.available_width().max(40.0);
++    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font.clone(), colour, width);
++    job.wrap.max_rows = 2;
++    job.wrap.break_anywhere = false;
++    job.wrap.overflow_character = Some('\u{2026}');
++    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
++    let height = 2.0 * ui.fonts_mut(|fonts| fonts.row_height(&font));
++    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
++    let elided = galley.elided;
++    ui.painter_at(rect).galley(rect.min, galley, colour);
++    if elided {
++        response.on_hover_text(text)
++    } else {
++        response
++    }
++}
++
+ /// `<data>/rando/<title>/runs/<run>/`, what the core keeps of a randomized game (the
+ /// core's own folder, one definition).
+ pub fn run_dir(data: &Path, run: &str) -> PathBuf {
+@@ -657,6 +722,17 @@ pub struct RandoPage {
+     /// round 62b: what "Randomize everything" turned on, shown in the help line until a row
+     /// is pointed at.
+     pub note: Option<String>,
++    /// round 71: the Esc window's "Next New Game" part: a draft of the form, made when the
++    /// window opens, put in the form and last.json only by Keep (`keep_next`), thrown away
++    /// when the window closes (Grok: a change must not rewrite the next game while someone
++    /// is only looking).
++    pub next_form: Option<RandoForm>,
++    /// round 71: the row whose help the Next New Game part's help line shows.
++    pub next_help_key: Option<String>,
++    /// round 71: what Randomize everything turned on in the draft (its help line).
++    pub next_note: Option<String>,
++    /// round 71: Keep wrote last.json since the window opened (Err: why it could not).
++    pub next_kept: Option<Result<(), String>>,
+ }
+ 
+ impl Default for RandoPage {
+@@ -683,6 +759,10 @@ impl Default for RandoPage {
+             thrown: Vec::new(),
+             help_key: None,
+             note: None,
++            next_form: None,
++            next_help_key: None,
++            next_note: None,
++            next_kept: None,
+         }
+     }
+ }
+@@ -753,6 +833,7 @@ impl RandoPage {
+         }
+         self.form = Some(form);
+         self.form_game = self.game.clone();
++        self.next_form = None;
+     }
+ 
+     /// the core picked up the mode pick: open the page (the game waits).
+@@ -878,6 +959,15 @@ impl RandoPage {
+         }
+     }
+ 
++    /// tests (here and in pagebot.rs): a page whose rows are read, its form at their defaults.
++    #[cfg(test)]
++    pub(crate) fn with_rows(rows: Vec<Row>) -> RandoPage {
++        let mut page = RandoPage::default();
++        page.form = Some(RandoForm::new(rows.clone()));
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows });
++        page
++    }
++
+     /// round 61 (page robot hook): the exact text Start game sends with the page's values
+     /// now (the proposed seed when none is typed, as Start game puts it in).
+     pub fn values_text(&self) -> String {
+@@ -910,10 +1000,8 @@ impl RandoPage {
+                 if let (Some(data), Some(form)) = (data, &self.form) {
+                     // kept only for a randomized game: an original one writes nothing
+                     if run.seed.is_some() {
+-                        let path = last_path(data);
+-                        let text = serde_json::to_string_pretty(&Value::Object(form.values.clone())).unwrap_or_default();
+-                        if let Err(error) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, text)) {
+-                            log::warn!(target: "zakuro::rando", "{} could not be written: {error}", path.display());
++                        if let Err(error) = write_last(data, form) {
++                            log::warn!(target: "zakuro::rando", "{error}");
+                         }
+                     }
+                 }
+@@ -976,6 +1064,10 @@ impl RandoPage {
+         let mut actions = Vec::new();
+         let mut start_text: Option<String> = None;
+         self.poll(data);
++        if !self.this_run_open {
++            // round 71: the Esc window is closed: its draft is thrown away, its targets gone
++            self.close_next();
++        }
+         if !self.new_game {
+             // round 59: the last values (restored from last.json) guessed once per game start,
+             // in the background, before the page even opens: thrown away like any guess if
+@@ -1040,33 +1132,26 @@ impl RandoPage {
+                 }
+                 match (&self.rows, &mut self.form) {
+                     (Rows::Ready(_), Some(form)) => {
+-                        let pointed = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form, targets)).inner;
++                        let pointed = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form, targets, "")).inner;
+                         if let Some(key) = pointed {
+                             if self.help_key.as_deref() != Some(key.as_str()) {
+                                 self.note = None;
+                             }
+                             self.help_key = Some(key);
+                         }
+-                        // round 62b: the help line, the pointed (or focused) row's one sentence
+-                        let help = self.note.clone().or_else(|| self.help_key.as_ref()
+-                            .and_then(|key| form.rows.iter().find(|row| &row.key == key))
+-                            .filter(|row| !row.help.is_empty())
+-                            .map(|row| format!("{}: {}", row.label, row.help)))
+-                            .unwrap_or_else(|| "Point at a setting to see what it changes.".to_owned());
++                        // round 62b: the help line, the pointed (or focused) row's one sentence;
++                        // round 71: always two rows high
++                        let help = help_text(form, self.help_key.as_ref(), self.note.as_ref());
+                         ui.separator();
+-                        let line = ui.add(egui::Label::new(RichText::new(help).color(Color32::from_rgb(230, 220, 170))).wrap());
++                        let line = help_line(ui, &help);
+                         targets.push(("help:line".into(), line.rect));
+                         ui.separator();
+                         ui.horizontal(|ui| {
+                             let all = ui.button("Randomize everything");
+                             targets.push(("btn:everything_on".into(), all.rect));
+                             if all.clicked() {
+-                                let turned = form.everything_on();
+-                                self.note = Some(if turned.is_empty() {
+-                                    "Randomize everything: nothing more to turn on.".to_owned()
+-                                } else {
+-                                    format!("Randomize everything turned on: {}.", turned.join(", "))
+-                                });
++                                // round 71: one line (This run lists the rows after Start)
++                                self.note = Some(everything_note(&form.everything_on()));
+                             }
+                             let defaults = ui.button("Defaults");
+                             targets.push(("btn:defaults".into(), defaults.rect));
+@@ -1121,10 +1206,73 @@ impl RandoPage {
+         actions
+     }
+ 
+-    /// the menu's Randomizer window, when open: This run, read only.
+-    pub fn draw_this_run(&mut self, ctx: &egui::Context) -> Vec<PageAction> {
++    /// round 71: the Esc window's Next New Game part can show: the rows are read, the form
++    /// is there and the New Game page is not open (it never changes the game playing).
++    pub fn next_shown(&self) -> bool {
++        matches!(self.rows, Rows::Ready(_)) && self.form.is_some() && !self.new_game
++    }
++
++    /// round 71: the Next New Game part closed: its draft thrown away, its targets removed.
++    fn close_next(&mut self) {
++        self.next_form = None;
++        self.next_note = None;
++        self.next_kept = None;
++        self.targets.retain(|(key, _)| !key.starts_with("next:"));
++    }
++
++    /// round 71, Keep for next New Game: the draft becomes the form (the next New Game page
++    /// opens with it) and is written to `<data>/rando/last.json` by `write_last`, the file
++    /// and format Start game writes. Unlike Start game it writes with Randomizer off too
++    /// (Keep is the player's own choice: "off next time" is remembered). The background
++    /// guess then follows the kept values (a guess made for other values is thrown away).
++    /// Without a data folder nothing is written or changed.
++    pub fn keep_next(&mut self, data: Option<&Path>) -> Result<(), String> {
++        let result = self.keep_next_in(data);
++        match &result {
++            Ok(()) => log::info!(target: "zakuro::rando", "kept for the next New Game: {}", self.values_text()),
++            Err(why) => log::warn!(target: "zakuro::rando", "Keep for next New Game: {why}"),
++        }
++        self.next_kept = Some(result.clone());
++        result
++    }
++
++    fn keep_next_in(&mut self, data: Option<&Path>) -> Result<(), String> {
++        let data = data.ok_or("No data folder: nothing can be kept.")?;
++        let form = self.next_form.as_ref().or(self.form.as_ref()).ok_or("The randomizer's settings are not read yet.")?;
++        write_last(data, form)?;
++        if let Some(draft) = self.next_form.clone() {
++            self.form = Some(draft);
++        }
++        let want = self.form.as_ref().filter(|form| form.on()).map(|form| form.answers_preview(&self.proposed_seed).to_string());
++        if self.prebuild.as_ref().is_some_and(|p| Some(&p.text) != want.as_ref()) {
++            let old = self.prebuild.take().unwrap();
++            old.cancel();
++            log::info!(target: "zakuro::rando", "background make of {} thrown away (other values kept)", old.id);
++            self.thrown.push(old.id.clone());
++            self.discarded.push(old);
++        }
++        self.early_guess = false;
++        Ok(())
++    }
++
++    /// the menu's Randomizer window, when open: This run, read only; round 71: under it the
++    /// Next New Game part (the New Game page's rows on a draft, Keep / Defaults / Randomize
++    /// everything, no Start), hidden while the New Game page is open.
++    pub fn draw_this_run(&mut self, ctx: &egui::Context, data: Option<&Path>) -> Vec<PageAction> {
+         let mut actions = Vec::new();
+         let mut open = self.this_run_open;
++        self.targets.retain(|(key, _)| !key.starts_with("next:"));
++        let show_next = self.next_shown();
++        if !show_next {
++            self.next_form = None;
++        } else if self.next_form.is_none() {
++            self.next_form = self.form.clone();
++            self.next_kept = None;
++            self.next_note = None;
++        }
++        let rows_height = (ctx.content_rect().height() * 0.35).max(100.0);
++        let mut keep = false;
++        let targets = &mut self.targets;
+         egui::Window::new("Randomizer").id(egui::Id::new("rando this run")).open(&mut open).default_width(360.0).show(ctx, |ui| {
+             ui.label(RichText::new("This run").strong());
+             match &self.this_run.seed {
+@@ -1148,21 +1296,92 @@ impl RandoPage {
+                 ui.label(RichText::new(notice).color(Color32::LIGHT_RED));
+             }
+             ui.separator();
+-            ui.label(RichText::new("The settings are chosen when a New Game's mode is picked. Changing them never changes a game already started.").weak().small());
+-            if let Rows::Missing(why) = &self.rows {
+-                ui.label(RichText::new(why).weak().small());
+-            }
++            let Some(draft) = self.next_form.as_mut().filter(|_| show_next) else {
++                // round 71: only when the Next New Game part cannot show (its own line says it)
++                ui.label(RichText::new("The settings are chosen when a New Game's mode is picked. Changing them never changes a game already started.").weak().small());
++                if let Rows::Missing(why) = &self.rows {
++                    ui.label(RichText::new(why).weak().small());
++                }
++                return;
++            };
++            // round 71: the Next New Game part (Grok: same rows, the grey line at its top)
++            let header = ui.label(RichText::new("Next New Game").strong());
++            targets.push(("next:header".into(), header.rect));
++            ui.label(RichText::new("These never change the game you are playing.").weak().small());
++            ui.push_id("next", |ui| {
++                let pointed = egui::ScrollArea::vertical()
++                    .id_salt("next rows")
++                    .max_height(rows_height)
++                    .show(ui, |ui| rows(ui, draft, targets, "next:"))
++                    .inner;
++                if let Some(key) = pointed {
++                    if self.next_help_key.as_deref() != Some(key.as_str()) {
++                        self.next_note = None;
++                    }
++                    self.next_help_key = Some(key);
++                }
++                ui.separator();
++                let line = help_line(ui, &help_text(draft, self.next_help_key.as_ref(), self.next_note.as_ref()));
++                targets.push(("next:help:line".into(), line.rect));
++                ui.separator();
++                ui.horizontal(|ui| {
++                    let kept = ui.add_enabled(data.is_some(), egui::Button::new(RichText::new("Keep for next New Game").strong()));
++                    targets.push(("next:btn:keep".into(), kept.rect));
++                    keep |= kept.clicked();
++                    let defaults = ui.button("Defaults");
++                    targets.push(("next:btn:defaults".into(), defaults.rect));
++                    if defaults.clicked() {
++                        draft.defaults();
++                        self.next_note = None;
++                    }
++                    let all = ui.button("Randomize everything");
++                    targets.push(("next:btn:everything_on".into(), all.rect));
++                    if all.clicked() {
++                        self.next_note = Some(everything_note(&draft.everything_on()));
++                    }
++                });
++                if let Some((text, colour)) = next_status(self.form.as_ref(), draft, self.next_kept.as_ref(), data.is_some()) {
++                    let shown = ui.label(RichText::new(text).color(colour).small());
++                    targets.push(("next:note".into(), shown.rect));
++                }
++            });
+         });
++        if keep {
++            let _ = self.keep_next(data);
++        }
++        if !open {
++            self.close_next();
++        }
+         self.this_run_open = open;
+         actions
+     }
++
++    /// round 71 (page robot hook and tests): the Next New Game part's note as drawn now.
++    pub fn next_note_text(&self, data: Option<&Path>) -> Option<String> {
++        let draft = self.next_form.as_ref()?;
++        next_status(self.form.as_ref(), draft, self.next_kept.as_ref(), data.is_some()).map(|(text, _)| text)
++    }
++}
++
++/// round 71: the Next New Game part's note (Grok's words, docs/collab/PAGE_R71_GROK.md): no
++/// data folder; the draft differs from the kept form; Keep wrote it (or why not); else none.
++fn next_status(form: Option<&RandoForm>, draft: &RandoForm, kept: Option<&Result<(), String>>, has_data: bool) -> Option<(String, Color32)> {
++    let kept_now = form.is_some_and(|form| form.values == draft.values);
++    match kept {
++        _ if !has_data => Some(("No data folder: nothing can be kept.".to_owned(), Color32::GRAY)),
++        Some(Err(why)) => Some((why.clone(), Color32::LIGHT_RED)),
++        _ if !kept_now => Some(("Not kept yet: press Keep for next New Game.".to_owned(), Color32::from_rgb(230, 200, 120))),
++        Some(Ok(())) => Some(("Kept for the next New Game.".to_owned(), Color32::LIGHT_GREEN)),
++        None => None,
++    }
+ }
+ 
+ /// the rows, under their section headers (round 62b; hidden rows are not drawn). With
+ /// Randomizer off they show grey but can still be set (the FE8 port's rule); a fixed row
+ /// (the full swap look) is grey and cannot be changed. Returns the row pointed at or
+-/// focused this frame (its help goes in the help line).
+-fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>) -> Option<String> {
++/// focused this frame (its help goes in the help line). Round 71: every target name starts
++/// with `prefix` ("" on the New Game page, "next:" in the Esc window's Next New Game part).
++fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>, prefix: &str) -> Option<String> {
+     let on = form.on();
+     let rows = form.rows.clone();
+     let mut pointed = None;
+@@ -1172,7 +1391,7 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+             if let Some(s) = row.section.as_deref().filter(|s| Some(*s) != section) {
+                 section = Some(s);
+                 let header = ui.label(RichText::new(s).strong().color(Color32::from_rgb(150, 200, 255)));
+-                targets.push((format!("section:{s}"), header.rect));
++                targets.push((format!("{prefix}section:{s}"), header.rect));
+                 ui.end_row();
+             }
+             let mut label = RichText::new(if row.indent { format!("    {}", row.label) } else { row.label.clone() });
+@@ -1197,7 +1416,7 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                                 let words = if choice == "on" { "On".to_owned() } else if choice == "off" { "Off".to_owned() } else { row.shown(&json!(choice)) };
+                                 let half = ui.selectable_value(&mut v, choice.clone(), words);
+                                 focus |= half.has_focus();
+-                                targets.push((format!("opt:{}={}", row.key, choice), half.rect));
++                                targets.push((format!("{prefix}opt:{}={}", row.key, choice), half.rect));
+                             }
+                         });
+                         if value.as_str() != Some(v.as_str()) {
+@@ -1209,10 +1428,10 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                         ui.horizontal(|ui| {
+                             let off = ui.selectable_value(&mut v, false, "Off");
+                             focus |= off.has_focus();
+-                            targets.push((format!("opt:{}=off", row.key), off.rect));
++                            targets.push((format!("{prefix}opt:{}=off", row.key), off.rect));
+                             let on = ui.selectable_value(&mut v, true, "On");
+                             focus |= on.has_focus();
+-                            targets.push((format!("opt:{}=on", row.key), on.rect));
++                            targets.push((format!("{prefix}opt:{}=on", row.key), on.rect));
+                         });
+                         if Value::Bool(v) != value {
+                             form.set(&row.key, Value::Bool(v));
+@@ -1223,9 +1442,9 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                         ui.horizontal(|ui| {
+                             let edit = ui.add(egui::TextEdit::singleline(&mut text).char_limit(32).hint_text("new one at Start game").desired_width(160.0));
+                             focus |= edit.has_focus();
+-                            targets.push((format!("row:{}", row.key), edit.rect));
++                            targets.push((format!("{prefix}row:{}", row.key), edit.rect));
+                             let random = ui.button("Random");
+-                            targets.push(("btn:random".into(), random.rect));
++                            targets.push((format!("{prefix}btn:random"), random.rect));
+                             if random.clicked() {
+                                 text = random_seed();
+                             }
+@@ -1240,11 +1459,11 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                         let shown = egui::ComboBox::from_id_salt(&row.key).selected_text(row.shown(&value)).show_ui(ui, |ui| {
+                             for choice in choices {
+                                 let entry = ui.selectable_value(&mut v, choice.clone(), row.shown(&json!(choice)));
+-                                targets.push((format!("opt:{}={}", row.key, choice), entry.rect));
++                                targets.push((format!("{prefix}opt:{}={}", row.key, choice), entry.rect));
+                             }
+                         });
+                         focus |= shown.response.has_focus();
+-                        targets.push((format!("row:{}", row.key), shown.response.rect));
++                        targets.push((format!("{prefix}row:{}", row.key), shown.response.rect));
+                         if value.as_str() != Some(v.as_str()) {
+                             form.set(&row.key, Value::String(v));
+                         }
+@@ -1253,7 +1472,7 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                         let mut v = value.as_i64().unwrap_or(*min);
+                         let number = ui.add(egui::DragValue::new(&mut v).range(*min..=*max));
+                         focus |= number.has_focus();
+-                        targets.push((format!("row:{}", row.key), number.rect));
++                        targets.push((format!("{prefix}row:{}", row.key), number.rect));
+                         if value.as_i64() != Some(v) {
+                             form.set(&row.key, json!(v));
+                         }
+@@ -1474,7 +1693,7 @@ mod tests {
+             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+             ctx.run_ui(input, |ui| {
+                 assert!(page.draw_new_game(ui.ctx(), None).is_empty());
+-                assert!(page.draw_this_run(ui.ctx()).is_empty());
++                assert!(page.draw_this_run(ui.ctx(), None).is_empty());
+             })
+             .drop_without_applying_deltas();
+         }
+@@ -1642,6 +1861,60 @@ mod tests {
+         }
+     }
+ 
++    /// round 71: SCHEMA_62B plus the two late rows as `rando.py schema` prints them (omit_default).
++    fn schema_71() -> String {
++        SCHEMA_62B.replace(
++            r#"        {"key": "nuzlocke","#,
++            concat!(
++                r#"        {"key": "recolour", "label": "Recolour", "kind": "choice", "choices": ["on", "clear", "off"], "default": "on", "all": "on", "flag": "--recolour", "omit_default": true, "section": "Characters", "help": "Hair colour."},"#, "
++",
++                r#"        {"key": "chests", "label": "Chest and village items", "kind": "onoff", "default": false, "all": false, "flag": "--chests", "omit_default": true, "section": "Items and shops", "help": "Chests change."},"#, "
++",
++                r#"        {"key": "nuzlocke","#,
++            ),
++        )
++    }
++
++    #[test]
++    fn late_rows_at_their_default_leave_the_answer_and_run_id_unchanged() {
++        let schema = schema_71();
++        let rows = parse_schema(&schema).unwrap();
++        assert!(rows.iter().find(|row| row.key == "recolour").unwrap().omit_default);
++        assert!(rows.iter().find(|row| row.key == "chests").unwrap().omit_default);
++        assert!(!rows.iter().find(|row| row.key == "classes").unwrap().omit_default);
++        let saved = [
++            r#"{"randomizer": true, "seed": "s1"}"#,
++            r#"{"randomizer": true, "seed": "s2", "promotions": "on", "growth_mode": "full", "growth_min": 10, "enemy_upgrade": 50, "children": true}"#,
++            r#"{"randomizer": false, "classes": false}"#,
++        ];
++        for game in [None, Some("seal")] {
++            for text in saved {
++                let mut old = form_for(SCHEMA_62B, game);
++                old.restore(text);
++                let mut new = form_for(&schema, game);
++                new.restore(text);
++                let a = new.answers_preview("p");
++                assert!(a.get("recolour").is_none() && a.get("chests").is_none(), "{game:?} {text}");
++                assert_eq!(a.to_string(), old.answers_preview("p").to_string(), "{game:?} {text}");
++                let id = |form: &RandoForm| zakuro_core::fates_rando_session::run_id_for(&form.answers_preview("p").to_string(), game);
++                if old.on() {
++                    assert_eq!(id(&new).unwrap(), id(&old).unwrap());
++                }
++                // away from the default the row is answered (Randomizer on; off answers only
++                // {"randomizer": false})
++                assert!(new.set("chests", json!(true)));
++                assert!(new.set("recolour", json!("clear")));
++                let b = new.answers_preview("p");
++                if new.on() {
++                    assert_eq!(b["chests"], json!(true));
++                    assert_eq!(b["recolour"], json!("clear"));
++                } else {
++                    assert_eq!(b, json!({"randomizer": false}));
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn page_only_rows_are_never_answered_and_hidden_rows_are() {
+         let mut form = form_for(SCHEMA_62B, None);
+@@ -1789,6 +2062,273 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    // ------------------------------------------------------------- round 71: Next New Game
++
++    fn temp_data(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("zakuro-r71-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    /// draws the New Game page and, when open, the Esc window (as the program does) `frames`
++    /// times in one context.
++    fn draw_both(page: &mut RandoPage, data: Option<&Path>, size: Vec2, frames: usize) {
++        let ctx = egui::Context::default();
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
++        for _ in 0..frames {
++            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                page.draw_new_game(ui.ctx(), data);
++                if page.this_run_open {
++                    page.draw_this_run(ui.ctx(), data);
++                }
++            })
++            .drop_without_applying_deltas();
++        }
++    }
++
++    fn keys(page: &RandoPage) -> Vec<String> {
++        page.targets.iter().map(|(k, _)| k.clone()).collect()
++    }
++
++    fn target(page: &RandoPage, key: &str) -> egui::Rect {
++        page.targets.iter().find(|(k, _)| k == key).map(|(_, r)| *r).unwrap_or_else(|| panic!("{key} missing from {:?}", keys(page)))
++    }
++
++    #[test]
++    fn keep_next_writes_last_json_even_with_randomizer_off() {
++        let data = temp_data("keep");
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        // a randomized game was started with these; Keep turns Randomizer off for next time
++        // (drawn without the data folder: no background make starts in a test)
++        page.form.as_mut().unwrap().set("randomizer", json!(true));
++        page.this_run_open = true;
++        draw_both(&mut page, None, Vec2::new(800.0, 960.0), 1);
++        let draft = page.next_form.as_mut().expect("the window made a draft");
++        draft.set("randomizer", json!(false));
++        draft.set("classes", json!(false));
++        // a draft changes nothing until Keep: not the form, not the file
++        assert_eq!(page.form.as_ref().unwrap().get("classes"), &json!(true));
++        assert!(!last_path(&data).exists());
++        assert_eq!(page.next_note_text(Some(&data)).as_deref(), Some("Not kept yet: press Keep for next New Game."));
++        page.keep_next(Some(&data)).unwrap();
++        let kept: Value = serde_json::from_str(&std::fs::read_to_string(last_path(&data)).unwrap()).unwrap();
++        assert_eq!(kept["randomizer"], json!(false));
++        assert_eq!(kept["classes"], json!(false));
++        // the form (the next New Game page) has them, and a fresh form restores them
++        assert_eq!(page.form.as_ref().unwrap().get("classes"), &json!(false));
++        assert!(!page.form.as_ref().unwrap().on());
++        let mut again = form_for(SCHEMA_62B, None);
++        again.restore(&std::fs::read_to_string(last_path(&data)).unwrap());
++        assert_eq!(&again, page.form.as_ref().unwrap());
++        assert_eq!(page.next_note_text(Some(&data)).as_deref(), Some("Kept for the next New Game."));
++        // the background guess follows the kept values
++        assert!(!page.early_guess);
++        // same file and format as Start game's (one writer)
++        let mut other = form_for(SCHEMA_62B, None);
++        other.set("growth_mode", json!("full"));
++        write_last(&data, &other).unwrap();
++        assert!(std::fs::read_to_string(last_path(&data)).unwrap().contains("\"growth_mode\": \"full\""));
++        // no data folder: nothing written, nothing changed, and the note says so
++        let mut bare = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        bare.next_form = bare.form.clone();
++        bare.next_form.as_mut().unwrap().set("classes", json!(false));
++        assert_eq!(bare.keep_next(None).unwrap_err(), "No data folder: nothing can be kept.");
++        assert_eq!(bare.form.as_ref().unwrap().get("classes"), &json!(true));
++        assert_eq!(bare.next_note_text(None).as_deref(), Some("No data folder: nothing can be kept."));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn the_keep_button_is_clicked_like_any_control() {
++        // a real pointer click on the reported rectangle, as the page robot does it (Randomizer
++        // stays off: no background make starts in a test)
++        let data = temp_data("click");
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        page.this_run_open = true;
++        let ctx = egui::Context::default();
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 960.0));
++        let mut time = 0.0;
++        let mut frame = |page: &mut RandoPage, events: Vec<egui::Event>| {
++            time += 1.0 / 60.0;
++            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), focused: true, events, ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                page.draw_new_game(ui.ctx(), Some(&data));
++                page.draw_this_run(ui.ctx(), Some(&data));
++            })
++            .drop_without_applying_deltas();
++        };
++        let click = |pos: egui::Pos2| vec![
++            egui::Event::PointerMoved(pos),
++            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
++        ];
++        let release = |pos: egui::Pos2| vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }];
++        for _ in 0..4 {
++            frame(&mut page, vec![]);
++        }
++        for key in ["next:opt:classes=off", "next:opt:promotions=on", "next:btn:keep"] {
++            let at = target(&page, key).center();
++            frame(&mut page, click(at));
++            frame(&mut page, release(at));
++            frame(&mut page, vec![]);
++        }
++        let kept: Value = serde_json::from_str(&std::fs::read_to_string(last_path(&data)).unwrap()).unwrap();
++        assert_eq!(kept["randomizer"], json!(false));
++        assert_eq!(kept["classes"], json!(false));
++        assert_eq!(kept["promotions"], json!("on"));
++        assert_eq!(page.form.as_ref().unwrap().get("classes"), &json!(false));
++        assert!(page.prebuild.is_none());
++        assert_eq!(page.next_note_text(Some(&data)).as_deref(), Some("Kept for the next New Game."));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn closing_the_window_throws_the_draft_away() {
++        let data = temp_data("close");
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        page.this_run_open = true;
++        draw_both(&mut page, Some(&data), Vec2::new(800.0, 960.0), 2);
++        page.next_form.as_mut().unwrap().set("classes", json!(false));
++        page.this_run_open = false;
++        draw_both(&mut page, Some(&data), Vec2::new(800.0, 960.0), 1);
++        assert!(page.next_form.is_none());
++        assert!(!keys(&page).iter().any(|k| k.starts_with("next:")));
++        page.this_run_open = true;
++        draw_both(&mut page, Some(&data), Vec2::new(800.0, 960.0), 1);
++        assert_eq!(page.next_form.as_ref().unwrap().get("classes"), &json!(true));
++        assert_eq!(page.form.as_ref().unwrap().get("classes"), &json!(true));
++        assert!(!last_path(&data).exists());
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn the_next_part_is_hidden_while_the_page_is_open() {
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        page.open_new_game();
++        page.this_run_open = true;
++        draw_both(&mut page, None, Vec2::new(800.0, 960.0), 2);
++        let k = keys(&page);
++        assert!(k.iter().any(|k| k == "btn:start"));
++        assert!(!k.iter().any(|k| k.starts_with("next:")), "{k:?}");
++        assert!(page.next_form.is_none() && !page.next_shown());
++        page.answered(Ok(ThisRun::default()), None);
++        draw_both(&mut page, None, Vec2::new(800.0, 960.0), 2);
++        assert!(page.next_shown());
++        assert!(keys(&page).iter().any(|k| k == "next:btn:keep"));
++        // rows not read: no part (the old grey line instead)
++        let mut missing = RandoPage::default();
++        missing.rows = Rows::Missing("Python 3 was not found".into());
++        missing.this_run_open = true;
++        draw_both(&mut missing, None, Vec2::new(800.0, 960.0), 2);
++        assert!(!keys(&missing).iter().any(|k| k.starts_with("next:")));
++    }
++
++    #[test]
++    fn next_targets_are_named_apart() {
++        let data = temp_data("names");
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        page.this_run_open = true;
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
++        draw_both(&mut page, Some(&data), screen.size(), 3);
++        let k = keys(&page);
++        for key in ["next:header", "next:section:Basics", "next:opt:randomizer=on", "next:opt:classes=off", "next:row:seed",
++                    "next:btn:random", "next:row:growth_mode", "next:opt:promotions=on", "next:help:line",
++                    "next:btn:keep", "next:btn:defaults", "next:btn:everything_on"] {
++            assert!(k.iter().any(|k| k == key), "{key} missing from {k:?}");
++        }
++        // every target of the window is a next: one; the New Game page's names are not used
++        assert!(k.iter().all(|k| k.starts_with("next:")), "{k:?}");
++        assert!(!k.iter().any(|k| k.contains("btn:start")), "no Start in the Esc window");
++        // the buttons fit on the page robot's 800x480 screen
++        for (key, rect) in page.targets.iter().filter(|(k, _)| k.starts_with("next:btn:") && *k != "next:btn:random") {
++            assert!(screen.contains_rect(*rect), "{key} {rect:?} outside {screen:?}");
++        }
++        assert_eq!(k.iter().filter(|k| k.starts_with("next:section:")).count(), 6);
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn the_everything_note_is_one_short_line() {
++        let many: Vec<String> = (0..23).map(|n| format!("A long setting name number {n}")).collect();
++        let note = everything_note(&many);
++        assert_eq!(note, "Randomize everything turned on 23 settings. This run lists them after Start.");
++        assert!(!note.contains('\n') && note.len() < 90);
++        assert_eq!(everything_note(&many[..1]), "Randomize everything turned on 1 setting. This run lists it after Start.");
++        assert_eq!(everything_note(&[]), "Randomize everything: nothing more to turn on.");
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++        let turned = page.form.as_mut().unwrap().everything_on();
++        assert_eq!(everything_note(&turned), "Randomize everything turned on 4 settings. This run lists them after Start.");
++        // the note wins over the pointed row until another row is pointed at
++        page.note = Some(everything_note(&turned));
++        let form = page.form.as_ref().unwrap();
++        assert_eq!(help_text(form, Some(&"classes".to_owned()), page.note.as_ref()), page.note.clone().unwrap());
++        assert_eq!(help_text(form, Some(&"classes".to_owned()), None), "Classes: On: people can start in another class.");
++        assert_eq!(help_text(form, None, None), HELP_REST);
++    }
++
++    #[test]
++    fn the_buttons_do_not_move_when_the_help_changes() {
++        let long = "Randomize everything turned on: Randomizer, Classes, Class trees, Growths, How growths change, \
++                    Join stats, Starting items, Shops, Rewards, Enemy classes, Enemy weapons, Stronger enemy weapons, \
++                    Boss classes, Tougher bosses, Music on maps, Music in battles, Promotion choices, Recolour. ".repeat(3);
++        for size in [Vec2::new(800.0, 480.0), Vec2::new(800.0, 960.0)] {
++            let place = |note: Option<String>| {
++                let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++                page.open_new_game();
++                page.note = note;
++                draw_both(&mut page, None, size, 4);
++                (target(&page, "btn:start"), target(&page, "btn:everything_on"), target(&page, "help:line"))
++            };
++            let (start_long, all_long, line_long) = place(Some(long.clone()));
++            let (start_short, all_short, line_short) = place(Some("Short.".into()));
++            let (start_none, _, _) = place(None);
++            assert_eq!(start_long, start_short, "{size:?}");
++            assert_eq!(start_long, start_none, "{size:?}");
++            assert_eq!(all_long, all_short, "{size:?}");
++            assert_eq!(line_long.height(), line_short.height(), "{size:?}");
++            assert!(line_long.height() < 3.0 * 14.0, "{line_long:?}: two rows, never more");
++        }
++        // the Esc window's part keeps its buttons still too
++        let data = temp_data("still");
++        let place = |note: Option<String>| {
++            let mut page = RandoPage::with_rows(parse_schema(SCHEMA_62B).unwrap());
++            page.this_run_open = true;
++            draw_both(&mut page, Some(&data), Vec2::new(800.0, 480.0), 1);
++            page.next_note = note;
++            draw_both(&mut page, Some(&data), Vec2::new(800.0, 480.0), 4);
++            target(&page, "next:btn:keep")
++        };
++        assert_eq!(place(Some(long.clone())), place(Some("Short.".into())));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn a_long_help_line_is_cut_to_two_rows() {
++        let ctx = egui::Context::default();
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(400.0, 300.0));
++        let long = "word ".repeat(200);
++        let mut heights = Vec::new();
++        for text in ["Short.", long.as_str()] {
++            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                let height = help_line(ui, text).rect.height();
++                let font = egui::TextStyle::Body.resolve(ui.style());
++                let row = ui.fonts_mut(|f| f.row_height(&font));
++                assert_eq!(height, 2.0 * row);
++                heights.push(height);
++                let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, Color32::WHITE, 380.0);
++                job.wrap.max_rows = 2;
++                job.wrap.overflow_character = Some('\u{2026}');
++                let galley = ui.fonts_mut(|f| f.layout_job(job));
++                assert!(galley.rows.len() <= 2);
++                assert_eq!(galley.elided, text.len() > 100);
++            })
++            .drop_without_applying_deltas();
++        }
++        assert_eq!(heights[0], heights[1]);
++    }
++
+     #[test]
+     fn data_files_live_in_the_data_folder() {
+         let data = Path::new("D:/x");
+-- 
+2.55.0.windows.5
+

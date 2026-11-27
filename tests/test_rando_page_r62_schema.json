@@ -1,0 +1,642 @@
+{
+ "format": 1,
+ "rows": [
+  {
+   "key": "randomizer",
+   "label": "Randomizer",
+   "kind": "onoff",
+   "default": false,
+   "all": true
+  },
+  {
+   "key": "seed",
+   "label": "Seed",
+   "kind": "seed",
+   "default": "",
+   "pattern": "[A-Za-z0-9][A-Za-z0-9_-]{0,31}"
+  },
+  {
+   "key": "recruit",
+   "label": "Who joins where (character shuffle: route = within the route, any = any route)",
+   "indent": false,
+   "default": "off",
+   "all": "route",
+   "flag": "--recruit",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "route",
+    "any"
+   ]
+  },
+  {
+   "key": "recruit_look",
+   "label": "Shuffled people look like the spot's person (the full swap comes with a later engine round)",
+   "indent": true,
+   "default": "keep",
+   "all": "keep",
+   "flag": "--recruit-look",
+   "kind": "choice",
+   "choices": [
+    "keep",
+    "full"
+   ],
+   "fixed": true
+  },
+  {
+   "key": "recruit_class",
+   "label": "Shuffled people's class (own = their own, slot = the spot's)",
+   "indent": true,
+   "default": "own",
+   "all": "own",
+   "flag": "--recruit-class",
+   "kind": "choice",
+   "choices": [
+    "own",
+    "slot"
+   ]
+  },
+  {
+   "key": "recruit_stats",
+   "label": "Shuffled people's level and stats (autolevel = fit the spot's level, slot = the spot's)",
+   "indent": true,
+   "default": "autolevel",
+   "all": "autolevel",
+   "flag": "--recruit-stats",
+   "kind": "choice",
+   "choices": [
+    "autolevel",
+    "slot"
+   ]
+  },
+  {
+   "key": "classes",
+   "label": "Classes",
+   "kind": "onoff",
+   "default": true,
+   "all": true,
+   "flag": "--classes"
+  },
+  {
+   "key": "trees",
+   "label": "Class trees (own side / any)",
+   "kind": "choice",
+   "choices": [
+    "own",
+    "any"
+   ],
+   "default": "own",
+   "all": "own",
+   "flag": "--trees"
+  },
+  {
+   "key": "keep_royals",
+   "label": "Royals keep their classes",
+   "kind": "onoff",
+   "default": true,
+   "all": true,
+   "flag": "--keep-royals"
+  },
+  {
+   "key": "assign_evenly",
+   "label": "Spread classes evenly (fewer repeats)",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--assign-evenly",
+   "kind": "onoff"
+  },
+  {
+   "key": "growths",
+   "label": "Growths",
+   "kind": "onoff",
+   "default": true,
+   "all": true,
+   "flag": "--growths"
+  },
+  {
+   "key": "growth_mode",
+   "label": "Growths mode (slice1 = the Growths switch above)",
+   "indent": false,
+   "default": "slice1",
+   "all": "redistribute",
+   "flag": "--growth-mode",
+   "kind": "choice",
+   "choices": [
+    "slice1",
+    "redistribute",
+    "delta",
+    "full"
+   ]
+  },
+  {
+   "key": "growth_variance",
+   "label": "Growth variance %",
+   "indent": true,
+   "default": 30,
+   "all": 30,
+   "flag": "--growth-variance",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "growth_min",
+   "label": "Growth min %",
+   "indent": true,
+   "default": 5,
+   "all": 5,
+   "flag": "--growth-min",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "growth_max",
+   "label": "Growth max %",
+   "indent": true,
+   "default": 80,
+   "all": 80,
+   "flag": "--growth-max",
+   "kind": "number",
+   "min": 0,
+   "max": 125
+  },
+  {
+   "key": "adjust_hp",
+   "label": "Adjust HP growths",
+   "indent": true,
+   "default": false,
+   "all": false,
+   "flag": "--adjust-hp",
+   "kind": "onoff"
+  },
+  {
+   "key": "join_stats",
+   "label": "Join stats",
+   "kind": "onoff",
+   "default": true,
+   "all": true,
+   "flag": "--join-stats"
+  },
+  {
+   "key": "bases_mode",
+   "label": "Bases mode (slice1 = the Join stats switch above)",
+   "indent": false,
+   "default": "slice1",
+   "all": "redistribute",
+   "flag": "--bases-mode",
+   "kind": "choice",
+   "choices": [
+    "slice1",
+    "redistribute",
+    "delta"
+   ]
+  },
+  {
+   "key": "base_variance",
+   "label": "Base variance",
+   "indent": true,
+   "default": 5,
+   "all": 5,
+   "flag": "--base-variance",
+   "kind": "number",
+   "min": 1,
+   "max": 10
+  },
+  {
+   "key": "scale_to_level",
+   "label": "Scale base variance to join level",
+   "indent": true,
+   "default": true,
+   "all": true,
+   "flag": "--scale-to-level",
+   "kind": "onoff"
+  },
+  {
+   "key": "personal_skills",
+   "label": "Personal skills (shuffle = swap the skills between characters)",
+   "indent": false,
+   "default": "keep",
+   "all": "shuffle",
+   "flag": "--personal-skills",
+   "kind": "choice",
+   "choices": [
+    "keep",
+    "shuffle",
+    "random"
+   ]
+  },
+  {
+   "key": "skill_slots",
+   "label": "Skill slots",
+   "indent": false,
+   "default": "keep",
+   "all": "class",
+   "flag": "--skill-slots",
+   "kind": "choice",
+   "choices": [
+    "keep",
+    "class",
+    "random"
+   ]
+  },
+  {
+   "key": "promotions",
+   "label": "Random promotions (Master Seal choices)",
+   "indent": false,
+   "default": "off",
+   "all": "on",
+   "flag": "--promotions",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "on"
+   ]
+  },
+  {
+   "key": "promotion_sides",
+   "label": "Promotions stay on own side (own) or any side",
+   "indent": true,
+   "default": "any",
+   "all": "any",
+   "flag": "--promotion-sides",
+   "kind": "choice",
+   "choices": [
+    "any",
+    "own"
+   ]
+  },
+  {
+   "key": "reclass",
+   "label": "Heart Seal classes",
+   "indent": false,
+   "default": "keep",
+   "all": "random",
+   "flag": "--reclass",
+   "kind": "choice",
+   "choices": [
+    "keep",
+    "random"
+   ]
+  },
+  {
+   "key": "children",
+   "label": "Children (class, growths, one skill; parents stay)",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--children",
+   "kind": "onoff",
+   "grey_for": {
+    "seal": "no child in Seal of Flames"
+   }
+  },
+  {
+   "key": "class_growths",
+   "label": "Class growth rates (delta = changed a little)",
+   "indent": false,
+   "default": "off",
+   "all": "delta",
+   "flag": "--class-growths",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "delta"
+   ]
+  },
+  {
+   "key": "class_growth_variance",
+   "label": "How much (in 5s)",
+   "indent": true,
+   "default": 10,
+   "all": 10,
+   "flag": "--class-growth-variance",
+   "kind": "number",
+   "min": 0,
+   "max": 50
+  },
+  {
+   "key": "class_bases",
+   "label": "Class base stats (delta = changed a little)",
+   "indent": false,
+   "default": "off",
+   "all": "delta",
+   "flag": "--class-bases",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "delta"
+   ]
+  },
+  {
+   "key": "class_base_variance",
+   "label": "How much",
+   "indent": true,
+   "default": 2,
+   "all": 2,
+   "flag": "--class-base-variance",
+   "kind": "number",
+   "min": 1,
+   "max": 5
+  },
+  {
+   "key": "class_move",
+   "label": "Class movement (small = 1, wide = 2; mostly farther, no enemy gets stuck)",
+   "indent": false,
+   "default": "off",
+   "all": "small",
+   "flag": "--class-move",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "small",
+    "wide"
+   ]
+  },
+  {
+   "key": "starting_items",
+   "label": "Starting items",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--starting-items",
+   "kind": "onoff"
+  },
+  {
+   "key": "shops",
+   "label": "Shops",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--shops",
+   "kind": "onoff"
+  },
+  {
+   "key": "shop_sides",
+   "label": "Shop sides (own = own side, mixed = both sides)",
+   "indent": true,
+   "default": "own",
+   "all": "own",
+   "flag": "--shop-sides",
+   "kind": "choice",
+   "choices": [
+    "own",
+    "mixed"
+   ]
+  },
+  {
+   "key": "rewards",
+   "label": "Castle rewards",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--rewards",
+   "kind": "onoff"
+  },
+  {
+   "key": "weapon_stats",
+   "label": "Weapon stats (might, hit, crit, avoid, staff uses)",
+   "indent": false,
+   "default": "off",
+   "all": "on",
+   "flag": "--weapon-stats",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "on"
+   ]
+  },
+  {
+   "key": "weapon_traits",
+   "label": "Weapon special powers (chance per weapon %)",
+   "indent": false,
+   "default": 0,
+   "all": 25,
+   "flag": "--weapon-traits",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "wild_traits",
+   "label": "Wild powers too (brave, double counter, heal)",
+   "indent": true,
+   "default": false,
+   "all": false,
+   "flag": "--wild-traits",
+   "kind": "onoff"
+  },
+  {
+   "key": "enemy_classes",
+   "label": "Enemy classes",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--enemy-classes",
+   "kind": "onoff"
+  },
+  {
+   "key": "boss_classes",
+   "label": "Boss classes (same rank of class; Garon, Anankos and bosses whose scenes are not proven keep theirs)",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--boss-classes",
+   "kind": "onoff"
+  },
+  {
+   "key": "enemy_trees",
+   "label": "Enemy class trees (own side / any)",
+   "indent": true,
+   "default": "own",
+   "all": "own",
+   "flag": "--enemy-trees",
+   "kind": "choice",
+   "choices": [
+    "own",
+    "any"
+   ]
+  },
+  {
+   "key": "enemy_weapons",
+   "label": "Enemy weapons (shuffled, same kind)",
+   "indent": false,
+   "default": false,
+   "all": true,
+   "flag": "--enemy-weapons",
+   "kind": "onoff"
+  },
+  {
+   "key": "enemy_upgrade",
+   "label": "Stronger enemy weapons (chance %)",
+   "indent": false,
+   "default": 0,
+   "all": 25,
+   "flag": "--enemy-upgrade",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "upgrade_rank",
+   "label": "Stronger weapons may be one rank higher (replaced by Difficulty)",
+   "indent": true,
+   "default": "same",
+   "all": "same",
+   "flag": "--upgrade-rank",
+   "kind": "choice",
+   "choices": [
+    "same",
+    "next"
+   ],
+   "fixed": true
+  },
+  {
+   "key": "enemy_growths",
+   "label": "Enemies grow faster (flat, or scaling = more for high growths)",
+   "indent": false,
+   "default": "off",
+   "all": "flat",
+   "flag": "--enemy-growths",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "flat",
+    "scaling"
+   ]
+  },
+  {
+   "key": "enemy_buff",
+   "label": "Extra growth %",
+   "indent": true,
+   "default": 10,
+   "all": 10,
+   "flag": "--enemy-buff",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "enemy_levels",
+   "label": "Enemy levels up",
+   "indent": false,
+   "default": 0,
+   "all": 0,
+   "flag": "--enemy-levels",
+   "kind": "number",
+   "min": 0,
+   "max": 5
+  },
+  {
+   "key": "boss_stats",
+   "label": "Tougher bosses (linear = steady, ease = more later in the story)",
+   "indent": false,
+   "default": "off",
+   "all": "linear",
+   "flag": "--boss-stats",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "linear",
+    "ease"
+   ]
+  },
+  {
+   "key": "boss_max_boost",
+   "label": "Most extra points per stat",
+   "indent": true,
+   "default": 5,
+   "all": 5,
+   "flag": "--boss-max-boost",
+   "kind": "number",
+   "min": 1,
+   "max": 20
+  },
+  {
+   "key": "boss_variance",
+   "label": "Random spread",
+   "indent": true,
+   "default": 0,
+   "all": 0,
+   "flag": "--boss-variance",
+   "kind": "number",
+   "min": 0,
+   "max": 5
+  },
+  {
+   "key": "enemy_drops",
+   "label": "Enemies drop items (chance per enemy %, steps of 5) (rounded to 5s)",
+   "indent": false,
+   "default": 0,
+   "all": 10,
+   "flag": "--enemy-drops",
+   "kind": "number",
+   "min": 0,
+   "max": 100
+  },
+  {
+   "key": "difficulty",
+   "label": "Difficulty (stronger enemy weapons and tougher bosses: easy, normal, hard)",
+   "indent": false,
+   "default": "normal",
+   "all": "normal",
+   "flag": "--difficulty",
+   "kind": "choice",
+   "choices": [
+    "easy",
+    "normal",
+    "hard"
+   ]
+  },
+  {
+   "key": "music",
+   "label": "Music (map themes; maps+battles = boss and named-unit battle themes too)",
+   "indent": false,
+   "default": "off",
+   "all": "maps+battles",
+   "flag": "--music",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "maps",
+    "maps+battles"
+   ]
+  },
+  {
+   "key": "nuzlocke",
+   "label": "Nuzlocke: a death stays dead after a reset (Classic is locked; a lost chapter can be restarted)",
+   "indent": false,
+   "default": false,
+   "all": false,
+   "flag": "--nuzlocke",
+   "kind": "onoff"
+  },
+  {
+   "key": "recruits",
+   "label": "Nuzlocke recruits: all who join (one per chapter is off: a story ally cannot be told from a recruit)",
+   "indent": true,
+   "default": "all",
+   "all": "all",
+   "kind": "choice",
+   "choices": [
+    "all",
+    "first"
+   ],
+   "fixed": true
+  },
+  {
+   "key": "rando_version",
+   "label": "Randomizer version",
+   "kind": "choice",
+   "choices": [
+    "2"
+   ],
+   "default": "2",
+   "all": "2",
+   "fixed": true,
+   "hidden": true
+  }
+ ],
+ "note": "The round-62 page's rows, frozen (tests/test_rando_page62b.py, tools/release/fingerprints.py). Round 75b (docs/SEED_GUARANTEES_PLAN.md section 5) added ONE row on purpose: the hidden, fixed version marker rando_version (last row), so this copy answers like today's page apart from the round-62b/71 changes; the test drops that row to get the round-62 answers (and run ids) of before round 75b."
+}

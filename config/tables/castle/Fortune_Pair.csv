@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,person_a,low,"A character name (data); no reader traced"
+0x4,4,str,person_b,low,"A character name (data); no reader traced"

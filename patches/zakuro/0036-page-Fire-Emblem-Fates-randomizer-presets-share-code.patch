@@ -1,0 +1,1492 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 05:45:00 -0500
+Subject: [PATCH] page: Fire Emblem Fates randomizer: presets, share code, the
+ Esc window fits
+
+Round 74 (docs/ROUND74_PLAN.md A6 and A9, docs/rando/FULL_BLOCK.md sections
+6, 7 and 9, owner OK "Yes, start round 74"; preset contents and help lines are
+the plan's calls 2 and 3, from Grok's proposal docs/collab/ROUND74_PRESETS_GROK.md).
+
+Presets: rando.py schema gains a top-level "presets" list (format stays 1;
+older pages ignore it). The page reads it (parse_presets, Found::presets) and
+draws one grid row "Presets" in Basics under Randomizer with a button per
+preset (targets btn:preset:<name>). A press (RandoForm::preset) puts every row
+at its default, page-only switches too, sets the preset's values through
+RandoForm::set (fixed and game-hidden rows keep their rule), keeps the seed box
+and writes the preset's one help line. Presets are buttons, not rows: they never
+enter the answer or the run id.
+
+Share code: a Share code row under the seed (field row:share, buttons
+btn:share:copy and btn:share:paste). The field shows the code of the form's
+values; an empty seed box gives the proposed seed Start game would use; a seed
+the randomizer does not take gives no code. Code: <head>-<body>-<check>-<seed>,
+head = "R1" + game letter (F Fates, S Seal of Flames) + 2-character layout hash
+of the share rows (every row not page-only and not the seed, sorted by key);
+body = each row's value index bit-packed (number rows as value minus min),
+Crockford base 32; check = fnv1a32(head-body-seed) & 0x3FF. The real schema
+today: 56 share rows, 127 bits, 26 body characters, 44 characters with an
+8-character seed, 68 with a 32-character one. share_encode / share_decode are
+the twins of tools/randomizer/sharecode.py and are tested against the same
+vectors (tests/rando_sharecode_vectors.json, found by walking up from the crate;
+not found = the test fails). A code pasted into the field (Ctrl+V, or the page
+robot's paste) is used at once; a typed one with Enter or Paste: the form is
+reset to its defaults, every row set through RandoForm::set, the seed box set,
+so the same code gives the same answer text and run id. A refused code changes
+nothing and the help line shows its one plain sentence (not a share code / a
+typo / another version of the randomizer / for the other game / damaged).
+Copy puts the code out through egui (ctx.copy_text). Paste with nothing typed
+empties the field and says to press Ctrl+V (the program reads no clipboard of
+its own). The share code is never part of the answer.
+
+The Esc window fits (A9): This run's list (changed rows and the core's
+notices) is in its own scroll area capped at 15% of the screen (54 to 160
+points), and the Next New Game rows take what is left after about 330 points
+(at least 80, at most round 71's 35%), so at 800 x 480 with "Randomize
+everything" listed (22 rows) Keep stays on the screen. The part's help line
+rests on "Keep keeps this seed. For a new seed, clear the seed box before
+Keep." (call 6). The presets and the Share code field show in the part too
+(targets next:...).
+
+Page robot hook: steps {"paste": text} (an egui paste event to the control
+with the focus), {"paste_copied": true} (the text the page's last Copy put out,
+logged as {"event": "copied"} from egui's copy command) and {"expect_target":
+target} (the control drawn wholly on the 800 x 480 screen); click events carry
+the field's code ("share"), expect events the help line's note.
+
+Off means original: nothing here writes guest memory or changes what Start game
+sends for the same values; without presets in the schema no preset row is drawn.
+Frontend only (rando_page.rs, pagebot.rs). New tests presets_are_read_from_the_schema,
+a_preset_resets_every_row_and_keeps_the_seed, share_codes_match_the_shared_vectors,
+the_same_code_gives_the_same_answer_on_a_fresh_page,
+preset_buttons_and_the_share_field_are_clicked_like_any_control,
+keep_stays_on_a_short_screen_with_this_run_full, pagebot
+the_robot_presses_presets_and_pastes_the_share_code and
+the_robot_finds_keep_on_the_screen_with_this_run_full (cargo tests run in the
+round's gate / B3, not by the track).
+---
+ crates/zakuro/src/pagebot.rs    | 206 +++++++-
+ crates/zakuro/src/rando_page.rs | 885 ++++++++++++++++++++++++++++++--
+ 2 files changed, 1046 insertions(+), 45 deletions(-)
+
+diff --git a/crates/zakuro/src/pagebot.rs b/crates/zakuro/src/pagebot.rs
+index 1788c0b..fef254f 100644
+--- a/crates/zakuro/src/pagebot.rs
++++ b/crates/zakuro/src/pagebot.rs
+@@ -14,6 +14,16 @@
+ //! `next:` targets. `{"wait": "next_open"}` waits for the part, `{"esc": "close"}` closes the
+ //! window, `{"expect_last": {key: value}}` checks `<data>/rando/last.json`.
+ //!
++//! Round 74 (docs/rando/FULL_BLOCK.md section 9): the preset buttons are clicked by their
++//! targets `btn:preset:<name>`, the Share code field by `row:share`, `btn:share:copy`,
++//! `btn:share:paste`. `{"paste": "<text>"}` sends an egui paste event with that text (to the
++//! control with the focus: click `row:share` first; a pasted code is used at once),
++//! `{"paste_copied": true}` pastes the text the page's last Copy put out (logged as
++//! `{"event": "copied", "text": ...}` from egui's own copy command), and
++//! `{"expect_target": "<target>"}` logs whether that control is drawn wholly on the 800 x 480
++//! screen (the Esc window's Keep with This run full). Click events carry the code the Share
++//! code field shows (`share`), expect events the help line's note too.
++//!
+ //! Nothing here runs without FEF_PAGEBOT: the program does exactly what it did before.
+ 
+ use std::io::Write;
+@@ -31,6 +41,9 @@ pub const PAGE_FRAMES_MAX: u64 = 60 * 600;
+ /// a new window in its first frames; the rectangles are final after that).
+ const SETTLE_FRAMES: u32 = 5;
+ 
++/// the screen the page is drawn into (half the default window: stacked, scale 2).
++pub const SCREEN: egui::Vec2 = egui::Vec2::new(800.0, 480.0);
++
+ pub struct PageBot {
+     steps: Vec<Value>,
+     next: usize,
+@@ -54,6 +67,8 @@ pub struct PageBot {
+     pub laid_at: Option<u64>,
+     /// the core's reply to the page's answer this frame (set by the program's rando())
+     pub answered: Option<Result<Option<String>, String>>,
++    /// round 74: the text the page's last Copy put out (egui's copy command)
++    copied: Option<String>,
+ }
+ 
+ impl PageBot {
+@@ -85,6 +100,7 @@ impl PageBot {
+             avatar_after: script["avatar_after"].as_u64(),
+             laid_at: None,
+             answered: None,
++            copied: None,
+         };
+         let n = bot.steps.len();
+         bot.event("hook", json!({"steps": n, "avatar_after": bot.avatar_after}));
+@@ -148,22 +164,28 @@ impl PageBot {
+             }
+         }
+         let input = egui::RawInput {
+-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 480.0))),
++            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+             time: Some(self.time),
+             focused: true,
+             events,
+             ..Default::default()
+         };
+         let mut actions = Vec::new();
+-        self.ctx
+-            .run_ui(input, |ui| {
+-                actions = page.draw_new_game(ui.ctx(), data);
+-                if page.this_run_open {
+-                    // round 71: the Esc Randomizer window, as the program draws it
+-                    actions.extend(page.draw_this_run(ui.ctx(), data));
+-                }
+-            })
+-            .drop_without_applying_deltas();
++        let output = self.ctx.run_ui(input, |ui| {
++            actions = page.draw_new_game(ui.ctx(), data);
++            if page.this_run_open {
++                // round 71: the Esc Randomizer window, as the program draws it
++                actions.extend(page.draw_this_run(ui.ctx(), data));
++            }
++        });
++        // round 74: what the page's Copy put on the (here missing) clipboard
++        for command in &output.platform_output.commands {
++            if let egui::OutputCommand::CopyText(text) = command {
++                self.copied = Some(text.clone());
++                self.event("copied", json!({"text": text}));
++            }
++        }
++        output.drop_without_applying_deltas();
+         actions
+     }
+ 
+@@ -232,6 +254,39 @@ impl PageBot {
+             }
+             return;
+         }
++        // round 74: paste a text (or the last copied one) into the control with the focus
++        let paste = match (step["paste"].as_str(), step.get("paste_copied")) {
++            (Some(text), _) => Some((text.to_owned(), false)),
++            (None, Some(_)) => Some((self.copied.clone().unwrap_or_default(), true)),
++            _ => None,
++        };
++        if let Some((text, copied)) = paste {
++            self.pending.push(egui::Event::Paste(text.clone()));
++            let mut extra = json!({"text": text, "copied": copied, "values": page.values_text()});
++            if let Some(mark) = step["mark"].as_str() {
++                extra["mark"] = Value::String(mark.to_owned());
++            }
++            self.event("paste", extra);
++            self.next += 1;
++            return;
++        }
++        if let Some(target) = step["expect_target"].as_str() {
++            // round 74 (A9): the control is drawn wholly on the screen (reachable by a click)
++            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
++            let rect = page.targets.iter().rev().find(|(k, _)| k == target).map(|(_, r)| *r);
++            let ok = rect.is_some_and(|r| screen.contains_rect(r));
++            let mut extra = json!({
++                "target": target, "ok": ok, "rect": rect.map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]),
++                "screen": [SCREEN.x, SCREEN.y], "this_run_lines": page.this_run.changed.len(),
++                "notices": page.this_run.notices.len(), "this_run_seed": page.this_run.seed.clone()
++            });
++            if let Some(mark) = step["mark"].as_str() {
++                extra["mark"] = Value::String(mark.to_owned());
++            }
++            self.event("expect_target", extra);
++            self.next += 1;
++            return;
++        }
+         if let (Some(mark), None) = (step["mark"].as_str(), step.get("click")) {
+             self.event("mark", json!({"name": mark}));
+             self.next += 1;
+@@ -254,7 +309,9 @@ impl PageBot {
+             self.pending.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+             self.release = Some(pos);
+             let values = page.values_text();
+-            let mut extra = json!({"target": target, "x": pos.x, "y": pos.y, "values": values});
++            // round 74: the code the Share code field shows (the Next New Game part's for next: targets)
++            let share = page.share_shown(target.starts_with("next:"));
++            let mut extra = json!({"target": target, "x": pos.x, "y": pos.y, "values": values, "share": share});
+             if let Some(mark) = step["mark"].as_str() {
+                 extra["mark"] = Value::String(mark.to_owned());
+             }
+@@ -271,7 +328,9 @@ impl PageBot {
+             let values = page.values_text();
+             let parsed: Value = serde_json::from_str(&values).unwrap_or(Value::Null);
+             let ok = step["expect"].as_object().is_some_and(|want| want.iter().all(|(k, v)| parsed.get(k) == Some(v)));
+-            self.event("expect", json!({"expect": step["expect"], "ok": ok, "values": values}));
++            // round 74: the help line's note (a preset's line, a share code's sentence) and the field's code
++            let next = page.this_run_open && !page.new_game;
++            self.event("expect", json!({"expect": step["expect"], "ok": ok, "values": values, "note": page.note_shown(next), "share": page.share_shown(next)}));
+             self.next += 1;
+             return;
+         }
+@@ -293,7 +352,7 @@ impl PageBot {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::rando_page::{last_path, parse_schema};
++    use crate::rando_page::{last_path, parse_presets, parse_schema};
+ 
+     const SCHEMA: &str = r#"{"format": 1, "rows": [
+         {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true, "section": "Basics", "help": "On uses the settings below."},
+@@ -318,6 +377,7 @@ mod tests {
+             avatar_after: None,
+             laid_at: None,
+             answered: None,
++            copied: None,
+         }
+     }
+ 
+@@ -363,4 +423,124 @@ mod tests {
+         assert!(named("unknown_step").is_empty());
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    /// round 74: the pagebot SCHEMA with two made-up presets.
++    const SCHEMA_74: &str = r#"{"format": 1, "rows": [
++        {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true, "section": "Basics", "help": "On uses the settings below."},
++        {"key": "seed", "label": "Seed", "kind": "seed", "default": "", "section": "Basics", "help": "The same seed makes the same game."},
++        {"key": "classes", "label": "Classes", "kind": "onoff", "default": true, "all": true, "flag": "--classes", "section": "Classes", "help": "On: people can start in another class."}
++    ], "presets": [
++        {"name": "light", "label": "Light", "help": "Light help.", "values": {"randomizer": true}},
++        {"name": "wild", "label": "Wild", "help": "Wild help.", "values": {"randomizer": true, "classes": false}}
++    ]}"#;
++
++    fn events_of(log: &Path) -> Vec<Value> {
++        std::fs::read_to_string(log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
++    }
++
++    /// round 74 (P4): the script presses Wild, copies the share code, presses Light and Random
++    /// (other values, another seed), pastes the copied code (every value and the seed come
++    /// back) and a code with a typo (nothing changes). No data folder: no background make.
++    #[test]
++    fn the_robot_presses_presets_and_pastes_the_share_code() {
++        let dir = std::env::temp_dir().join(format!("zakuro-r74-pagebot-share-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let log = dir.join("pagebot.jsonl");
++        let mut bot = bot(json!([
++            {"wait": "page_open"},
++            {"click": "btn:preset:wild"},
++            {"expect": {"randomizer": true, "classes": false}},
++            {"click": "btn:share:copy"},
++            {"click": "btn:preset:light"},
++            {"click": "btn:random"},
++            {"expect": {"randomizer": true, "classes": true}},
++            {"click": "row:share"},
++            {"paste_copied": true, "mark": "paste_copied"},
++            {"expect": {"randomizer": true, "classes": false}},
++            {"click": "row:share"},
++            {"paste": "R1FXX-00-00-typo"},
++            {"expect": {"randomizer": true, "classes": false}}
++        ]), &log);
++        let mut page = RandoPage::with_schema(parse_schema(SCHEMA_74).unwrap(), parse_presets(SCHEMA_74));
++        page.open_new_game();
++        for frame in 0..800 {
++            bot.frame(&mut page, None, frame);
++            if bot.finished() {
++                break;
++            }
++        }
++        assert!(bot.finished());
++        // one more frame: the last expect is logged, the page is left as it is
++        drop(bot);
++        let events = events_of(&log);
++        let named = |name: &str| events.iter().filter(|e| e["event"] == name).cloned().collect::<Vec<_>>();
++        assert!(named("unknown_step").is_empty(), "{events:?}");
++        let clicks = named("click");
++        assert!(clicks.iter().all(|c| c.get("share").is_some()), "a click carries the field's code");
++        let copy = clicks.iter().find(|c| c["target"] == "btn:share:copy").unwrap();
++        let copied = named("copied");
++        assert_eq!(copied.len(), 1, "{events:?}");
++        assert_eq!(copied[0]["text"], copy["share"], "Copy put out the code the field showed");
++        let pastes = named("paste");
++        assert_eq!(pastes.len(), 2);
++        assert_eq!(pastes[0]["text"], copied[0]["text"]);
++        assert_eq!(pastes[0]["copied"], json!(true));
++        assert_eq!(pastes[0]["mark"], json!("paste_copied"));
++        let expects = named("expect");
++        assert_eq!(expects.len(), 4);
++        assert!(expects.iter().all(|e| e["ok"] == json!(true)), "{expects:?}");
++        assert_eq!(expects[0]["note"], json!("Wild: Wild help."));
++        // the pasted code gave back exactly the values (and the seed) the copy was made from
++        assert_ne!(expects[1]["values"], copy["values"]);
++        assert_eq!(expects[2]["values"], copy["values"]);
++        assert_eq!(expects[2]["note"], json!(crate::rando_page::SHARE_USED));
++        // the typo changed nothing
++        assert_eq!(expects[3]["values"], copy["values"]);
++        assert_eq!(expects[3]["note"], json!(crate::rando_page::SHARE_TYPO));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// round 74 (A9): with This run full (22 rows changed, two notices) the Esc window's Keep is
++    /// drawn wholly on the 800 x 480 screen, and a click on it keeps.
++    #[test]
++    fn the_robot_finds_keep_on_the_screen_with_this_run_full() {
++        let dir = std::env::temp_dir().join(format!("zakuro-r74-pagebot-fit-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let log = dir.join("pagebot.jsonl");
++        let mut bot = bot(json!([
++            {"esc": "randomizer"},
++            {"wait": "next_open"},
++            {"expect_target": "next:btn:keep", "mark": "keep_reachable"},
++            {"click": "next:btn:keep"},
++            {"expect_last": {"randomizer": false}},
++            {"esc": "close"}
++        ]), &log);
++        let mut page = RandoPage::with_schema(parse_schema(SCHEMA_74).unwrap(), parse_presets(SCHEMA_74));
++        page.this_run = crate::rando_page::ThisRun {
++            seed: Some("fit74".into()),
++            changed: (0..22).map(|n| format!("A changed setting number {n}: On")).collect(),
++            spoiler: Some(dir.join("spoiler.txt")),
++            notices: vec!["A notice.".into(), "Another notice.".into()],
++        };
++        for frame in 0..400 {
++            bot.frame(&mut page, Some(&dir), frame);
++            if bot.finished() {
++                break;
++            }
++        }
++        assert!(bot.finished());
++        drop(bot);
++        let events = events_of(&log);
++        let named = |name: &str| events.iter().filter(|e| e["event"] == name).cloned().collect::<Vec<_>>();
++        let fit = named("expect_target");
++        assert_eq!(fit.len(), 1);
++        assert_eq!(fit[0]["ok"], json!(true), "{fit:?}");
++        assert_eq!(fit[0]["this_run_lines"], json!(22));
++        assert_eq!(fit[0]["mark"], json!("keep_reachable"));
++        assert!(named("expect_last")[0]["ok"].as_bool().unwrap(), "{events:?}");
++        assert!(last_path(&dir).is_file());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+index 8cb0f20..52d44bf 100644
+--- a/crates/zakuro/src/rando_page.rs
++++ b/crates/zakuro/src/rando_page.rs
+@@ -124,6 +124,8 @@ pub struct Found {
+     pub python: (String, Vec<String>),
+     pub tool: PathBuf,
+     pub rows: Vec<Row>,
++    /// round 74: the preset buttons (`rando.py schema`'s `presets`; none in an older schema).
++    pub presets: Vec<Preset>,
+ }
+ 
+ /// finds Python and asks the randomizer for its rows, each answer within 5 s, hidden.
+@@ -141,8 +143,8 @@ pub fn find() -> Result<Found, String> {
+         let mut args = prefix.clone();
+         args.push(tool.to_string_lossy().into_owned());
+         args.push("schema".to_owned());
+-        match run_hidden(&program, &args, ANSWER_WITHIN).and_then(|text| parse_schema(&text)) {
+-            Ok(rows) => return Ok(Found { python: (program, prefix), tool, rows }),
++        match run_hidden(&program, &args, ANSWER_WITHIN).and_then(|text| parse_schema(&text).map(|rows| (rows, parse_presets(&text)))) {
++            Ok((rows, presets)) => return Ok(Found { python: (program, prefix), tool, rows, presets }),
+             Err(error) => last = error,
+         }
+     }
+@@ -301,6 +303,230 @@ fn text_map(row: &Value, name: &str) -> std::collections::BTreeMap<String, Strin
+         .unwrap_or_default()
+ }
+ 
++/// round 74: one preset button of the page (`rando.py schema`'s `presets`, docs/rando/FULL_BLOCK.md
++/// section 6): a press puts every row at its default, then these values, and keeps the seed.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Preset {
++    /// the id (lowercase letters): the page robot's target `btn:preset:<name>`
++    pub name: String,
++    /// the button's text
++    pub label: String,
++    /// the one help line a press writes
++    pub help: String,
++    /// row key -> value
++    pub values: Map<String, Value>,
++}
++
++/// round 74: `rando.py schema`'s `presets` (none in an older schema or in text that is not
++/// JSON; an entry without a lowercase name or without values is left out).
++pub fn parse_presets(text: &str) -> Vec<Preset> {
++    let Ok(root) = serde_json::from_str::<Value>(text.trim()) else { return Vec::new() };
++    let Some(list) = root.get("presets").and_then(Value::as_array) else { return Vec::new() };
++    list.iter()
++        .filter_map(|p| {
++            let name = p.get("name")?.as_str()?.to_owned();
++            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase()) {
++                return None;
++            }
++            let values = p.get("values")?.as_object()?.clone();
++            let label = p.get("label").and_then(Value::as_str).unwrap_or(name.as_str()).to_owned();
++            let help = p.get("help").and_then(Value::as_str).unwrap_or("").to_owned();
++            Some(Preset { name, label, help, values })
++        })
++        .collect()
++}
++
++// ---------------------------------------------------------------------------- the share code
++//
++// Round 74 (A6, docs/rando/FULL_BLOCK.md section 7; tools/randomizer/sharecode.py is the twin,
++// both tested against tests/rando_sharecode_vectors.json): one short text with every setting
++// and the seed, `<head>-<body>-<check>-<seed>`, e.g. `R1FXX-B1-DC-demo-7`.
++// head  = "R1" + the game ("F" Fates, "S" Seal of Flames) + the layout (2 characters);
++// body  = every share row's value index, bit-packed, 5 bits a character;
++// check = fnv1a32(head-body-seed) & 0x3FF in 2 characters.
++
++/// Crockford base 32: the share code's characters.
++pub const SHARE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
++pub const SHARE_NOT_A_CODE: &str = "This is not a share code.";
++pub const SHARE_TYPO: &str = "This code has a typo.";
++pub const SHARE_OTHER_VERSION: &str = "This code was made by another version of the randomizer.";
++pub const SHARE_DAMAGED: &str = "This code is damaged.";
++/// call 3: the Share code row's help line
++pub const SHARE_HELP: &str = "Copy or paste this. The same code makes the same game.";
++pub const SHARE_COPIED: &str = "Share code copied. The same code makes the same game.";
++pub const SHARE_USED: &str = "Share code used: every setting and the seed come from it.";
++pub const SHARE_PASTE_HOW: &str = "Press Ctrl+V to paste a share code into the box; it is used at once.";
++
++/// why a share code is refused: `kind` is format, check, layout, game or damaged; `message`
++/// its one plain sentence.
++#[derive(Debug, Clone, PartialEq)]
++pub struct ShareError {
++    pub kind: &'static str,
++    pub message: String,
++}
++
++/// FNV-1a 32 over the text's UTF-8 bytes (the constants run ids use).
++pub fn fnv1a32(text: &str) -> u32 {
++    text.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
++}
++
++/// value & 0x3FF as 2 characters, the high 5 bits first.
++fn ten_bits(value: u32) -> String {
++    let v = (value & 0x3FF) as usize;
++    [SHARE_ALPHABET[v >> 5] as char, SHARE_ALPHABET[v & 31] as char].iter().collect()
++}
++
++/// the rows a code carries: not page-only, not the seed, sorted by key (byte order). Hidden,
++/// fixed and game-hidden rows are in it, so the same code gives the same answer.
++pub fn share_rows(rows: &[Row]) -> Vec<&Row> {
++    let mut out: Vec<&Row> = rows.iter().filter(|row| !row.page_only && row.kind != Kind::Seed && row.key != "seed").collect();
++    out.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
++    out
++}
++
++fn share_radix(row: &Row) -> u64 {
++    match &row.kind {
++        Kind::OnOff => 2,
++        Kind::Choice(choices) => (choices.len() as u64).max(1),
++        Kind::Number(min, max) => ((max - min + 1).max(1)) as u64,
++        Kind::Seed => 1,
++    }
++}
++
++/// bits a row takes: the bit length of (radix - 1).
++fn share_width(row: &Row) -> u32 {
++    64 - (share_radix(row) - 1).leading_zeros()
++}
++
++/// a value's index in its row; a value that does not fit counts as the row's default (the
++/// form never holds one), and a default that does not fit either as 0 (as sharecode.py).
++fn share_index(row: &Row, value: &Value) -> u64 {
++    let of = |value: &Value| -> Option<u64> {
++        match (&row.kind, value) {
++            (Kind::OnOff, Value::Bool(on)) => Some(u64::from(*on)),
++            (Kind::Choice(choices), Value::String(choice)) => choices.iter().position(|c| c == choice).map(|i| i as u64),
++            (Kind::Number(min, max), Value::Number(n)) => n.as_i64().filter(|n| (*min..=*max).contains(n)).map(|n| (n - min) as u64),
++            _ => None,
++        }
++    };
++    of(value).or_else(|| of(&row.default)).unwrap_or(0)
++}
++
++/// the value at an index below the row's radix.
++fn share_value(row: &Row, index: u64) -> Value {
++    match &row.kind {
++        Kind::OnOff => Value::Bool(index != 0),
++        Kind::Choice(choices) => choices.get(index as usize).map_or(Value::Null, |c| Value::String(c.clone())),
++        Kind::Number(min, _) => json!(min + index as i64),
++        Kind::Seed => Value::Null,
++    }
++}
++
++/// the text the layout is the hash of: one item per share row, joined with ";".
++pub fn share_layout_text(rows: &[Row]) -> String {
++    share_rows(rows)
++        .iter()
++        .map(|row| match &row.kind {
++            Kind::OnOff => format!("{}:onoff:2", row.key),
++            Kind::Choice(choices) => format!("{}:choice:{}", row.key, choices.join(",")),
++            Kind::Number(min, max) => format!("{}:number:{min},{max}", row.key),
++            Kind::Seed => format!("{}:seed", row.key),
++        })
++        .collect::<Vec<_>>()
++        .join(";")
++}
++
++/// the layout's 2 characters: a code made for other rows is refused.
++pub fn share_layout(rows: &[Row]) -> String {
++    ten_bits(fnv1a32(&share_layout_text(rows)))
++}
++
++/// the body's length in characters for these rows.
++pub fn share_body_length(rows: &[Row]) -> usize {
++    let bits: u32 = share_rows(rows).iter().map(|row| share_width(row)).sum();
++    (bits as usize + 4) / 5
++}
++
++fn share_game_letter(game: Option<&str>) -> char {
++    if game == Some("seal") { 'S' } else { 'F' }
++}
++
++/// the share code of these values (a row missing from `values` counts as its default) and
++/// `seed` for `game` (None = Fire Emblem Fates); None when the seed is not one the randomizer
++/// takes.
++pub fn share_encode(rows: &[Row], values: &Map<String, Value>, seed: &str, game: Option<&str>) -> Option<String> {
++    if !seed_ok(seed) {
++        return None;
++    }
++    let mut bits: Vec<usize> = Vec::new();
++    for row in share_rows(rows) {
++        let index = share_index(row, values.get(&row.key).unwrap_or(&row.default));
++        for b in 0..share_width(row) {
++            bits.push(((index >> b) & 1) as usize);
++        }
++    }
++    while bits.len() % 5 != 0 {
++        bits.push(0);
++    }
++    let body: String = bits
++        .chunks(5)
++        .map(|group| SHARE_ALPHABET[group.iter().enumerate().map(|(j, bit)| bit << j).sum::<usize>()] as char)
++        .collect();
++    let head = format!("R1{}{}", share_game_letter(game), share_layout(rows));
++    let check = ten_bits(fnv1a32(&format!("{head}-{body}-{seed}")));
++    Some(format!("{head}-{body}-{check}-{seed}"))
++}
++
++/// a share code's values (every share row) and seed, or why it is refused, in this order:
++/// format, check (a typo), layout (another version), game, damaged. Head, body and check are
++/// read case-blind (ASCII letters only); the seed is kept exactly; space around the code is
++/// ignored.
++pub fn share_decode(rows: &[Row], code: &str, game: Option<&str>) -> Result<(Map<String, Value>, String), ShareError> {
++    let refuse = |kind: &'static str, message: &str| ShareError { kind, message: message.to_owned() };
++    let parts: Vec<&str> = code.trim().splitn(4, '-').collect();
++    if parts.len() != 4 {
++        return Err(refuse("format", SHARE_NOT_A_CODE));
++    }
++    let (head, body, check, seed) = (parts[0].to_ascii_uppercase(), parts[1].to_ascii_uppercase(), parts[2].to_ascii_uppercase(), parts[3]);
++    if !head.is_ascii() || head.len() != 5 || !head.starts_with("R1") || !matches!(head.as_bytes()[2], b'F' | b'S') {
++        return Err(refuse("format", SHARE_NOT_A_CODE));
++    }
++    if check.len() != 2 || check != ten_bits(fnv1a32(&format!("{head}-{body}-{seed}"))) {
++        return Err(refuse("check", SHARE_TYPO));
++    }
++    if &head[3..5] != share_layout(rows).as_str() {
++        return Err(refuse("layout", SHARE_OTHER_VERSION));
++    }
++    let letter = head.as_bytes()[2] as char;
++    if letter != share_game_letter(game) {
++        let name = if letter == 'S' { "Seal of Flames" } else { "Fire Emblem Fates" };
++        return Err(refuse("game", &format!("This code is for {name}.")));
++    }
++    let digit = |c: u8| SHARE_ALPHABET.iter().position(|a| *a == c);
++    if body.len() != share_body_length(rows) || !body.bytes().all(|c| digit(c).is_some()) || !seed_ok(seed) {
++        return Err(refuse("damaged", SHARE_DAMAGED));
++    }
++    let bits: Vec<u64> = body.bytes().flat_map(|c| {
++        let d = digit(c).unwrap_or(0) as u64;
++        (0..5).map(move |j| (d >> j) & 1)
++    }).collect();
++    let mut at = 0usize;
++    let mut values = Map::new();
++    for row in share_rows(rows) {
++        let width = share_width(row) as usize;
++        let index = (0..width).map(|b| bits[at + b] << b).sum::<u64>();
++        at += width;
++        if index >= share_radix(row) {
++            return Err(refuse("damaged", SHARE_DAMAGED));
++        }
++        values.insert(row.key.clone(), share_value(row, index));
++    }
++    if bits[at..].iter().any(|bit| *bit != 0) {
++        return Err(refuse("damaged", SHARE_DAMAGED));
++    }
++    Ok((values, seed.to_owned()))
++}
++
+ /// a seed the randomizer takes: 1 to 32 letters, digits, '-' and '_', starting with a
+ /// letter or digit (PLAY RANDOMIZED's SEED_RX).
+ pub fn seed_ok(seed: &str) -> bool {
+@@ -498,6 +724,44 @@ impl RandoForm {
+             self.set(&key, value);
+         }
+     }
++
++    /// round 74, a preset button: every row to its default (page-only switches too), then the
++    /// preset's values through `set` (a fixed or game-hidden row keeps its rule), the seed box
++    /// as it was. Returns the keys it could not set (none for the schema's own presets).
++    pub fn preset(&mut self, preset: &Preset) -> Vec<String> {
++        let seed = self.get("seed").clone();
++        self.defaults();
++        let mut refused = Vec::new();
++        for (key, value) in &preset.values {
++            if key.as_str() == "seed" || !self.set(key.as_str(), value.clone()) {
++                refused.push(key.clone());
++            }
++        }
++        if !seed.is_null() {
++            self.values.insert("seed".into(), seed);
++        }
++        refused
++    }
++
++    /// round 74: the form's share code (an empty seed box gives `proposed`, the seed Start
++    /// game would use); None while the typed seed is not one the randomizer takes.
++    pub fn share_code(&self, proposed: &str, game: Option<&str>) -> Option<String> {
++        let seed = if self.seed().is_empty() { proposed } else { self.seed() };
++        share_encode(&self.rows, &self.values, seed, game)
++    }
++
++    /// round 74: a pasted share code: the form reset to its defaults, every row set through
++    /// `set` (fixed and game-hidden rows keep their rule), the seed box set. A refused code
++    /// changes nothing.
++    pub fn use_share_code(&mut self, code: &str, game: Option<&str>) -> Result<(), ShareError> {
++        let (values, seed) = share_decode(&self.rows, code, game)?;
++        self.defaults();
++        for (key, value) in values {
++            self.set(&key, value);
++        }
++        self.values.insert("seed".into(), Value::String(seed));
++        Ok(())
++    }
+ }
+ 
+ /// removes every file called `name` under `dir` (`depth` folders down).
+@@ -551,14 +815,30 @@ pub fn everything_note(turned: &[String]) -> String {
+ /// round 71: the help line while no setting is pointed at.
+ pub const HELP_REST: &str = "Point at a setting to see what it changes.";
+ 
+-/// the help line's text: the note, else the pointed row's one sentence, else the resting line.
++/// round 74 (A9, call 6): the Esc window's Next New Game part rests on this line: Keep keeps
++/// the seed in the box (the game being played's), so a new seed needs an empty box.
++pub const NEXT_HELP_REST: &str = "Keep keeps this seed. For a new seed, clear the seed box before Keep.";
++
++/// the help line's text: the note, else the pointed row's one sentence, else the resting line
++/// (round 74: the page draws with `help_for`; this stays for the tests).
++#[cfg(test)]
+ fn help_text(form: &RandoForm, key: Option<&String>, note: Option<&String>) -> String {
++    help_for(form, &[], key, note, HELP_REST)
++}
++
++/// round 74: `help_text` that also knows the preset buttons ("preset:<name>": its help line)
++/// and the Share code row ("share"), with the part's own resting line.
++fn help_for(form: &RandoForm, presets: &[Preset], key: Option<&String>, note: Option<&String>, rest: &str) -> String {
+     note.cloned()
+-        .or_else(|| key
+-            .and_then(|key| form.rows.iter().find(|row| &row.key == key))
+-            .filter(|row| !row.help.is_empty())
+-            .map(|row| format!("{}: {}", row.label, row.help)))
+-        .unwrap_or_else(|| HELP_REST.to_owned())
++        .or_else(|| key.and_then(|key| match key.strip_prefix("preset:") {
++            Some(name) => presets.iter().find(|p| p.name == name).filter(|p| !p.help.is_empty()).map(|p| format!("{}: {}", p.label, p.help)),
++            None if key == "share" => Some(format!("Share code: {SHARE_HELP}")),
++            None => form.rows.iter()
++                .find(|row| &row.key == key)
++                .filter(|row| !row.help.is_empty())
++                .map(|row| format!("{}: {}", row.label, row.help)),
++        }))
++        .unwrap_or_else(|| rest.to_owned())
+ }
+ 
+ /// round 71: the help line, always exactly two text rows high: wrapped at word breaks, cut
+@@ -677,6 +957,30 @@ impl Prebuild {
+     }
+ }
+ 
++/// round 74: the Share code field of one part (the New Game page, the Esc window's Next New
++/// Game part).
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct ShareField {
++    /// what the field shows: the form's code, or what was typed or pasted and not used yet
++    pub text: String,
++    /// typed or pasted and not used yet: the field keeps it instead of the form's code (until
++    /// it is used, emptied, Copy is pressed or the values are reset)
++    pub edited: bool,
++}
++
++/// round 74: what `rows` draws besides the schema's rows: the preset buttons (in Basics, under
++/// Randomizer) and the Share code field (under the seed).
++struct Extras<'a> {
++    presets: &'a [Preset],
++    share: &'a mut ShareField,
++    /// the game the codes are for (None = Fire Emblem Fates)
++    game: Option<&'a str>,
++    /// the seed Start game uses while the box is empty
++    proposed: &'a str,
++    /// a preset, Copy, Paste or a pasted code wrote a line for the help line this frame
++    note: Option<String>,
++}
++
+ pub struct RandoPage {
+     rows: Rows,
+     form: Option<RandoForm>,
+@@ -733,6 +1037,10 @@ pub struct RandoPage {
+     pub next_note: Option<String>,
+     /// round 71: Keep wrote last.json since the window opened (Err: why it could not).
+     pub next_kept: Option<Result<(), String>>,
++    /// round 74: the New Game page's Share code field.
++    pub share: ShareField,
++    /// round 74: the Next New Game part's Share code field (reset with its draft).
++    pub next_share: ShareField,
+ }
+ 
+ impl Default for RandoPage {
+@@ -763,6 +1071,8 @@ impl Default for RandoPage {
+             next_help_key: None,
+             next_note: None,
+             next_kept: None,
++            share: ShareField::default(),
++            next_share: ShareField::default(),
+         }
+     }
+ }
+@@ -962,12 +1272,30 @@ impl RandoPage {
+     /// tests (here and in pagebot.rs): a page whose rows are read, its form at their defaults.
+     #[cfg(test)]
+     pub(crate) fn with_rows(rows: Vec<Row>) -> RandoPage {
++        RandoPage::with_schema(rows, Vec::new())
++    }
++
++    /// tests: a page whose rows and presets are read (round 74).
++    #[cfg(test)]
++    pub(crate) fn with_schema(rows: Vec<Row>, presets: Vec<Preset>) -> RandoPage {
+         let mut page = RandoPage::default();
+         page.form = Some(RandoForm::new(rows.clone()));
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows, presets });
+         page
+     }
+ 
++    /// round 74 (page robot hook): the code the Share code field shows now (the Next New Game
++    /// part's when `next`).
++    pub fn share_shown(&self, next: bool) -> String {
++        if next { self.next_share.text.clone() } else { self.share.text.clone() }
++    }
++
++    /// round 74 (page robot hook): the help line's note now (a preset's line, a share code's
++    /// sentence), the Next New Game part's when `next`.
++    pub fn note_shown(&self, next: bool) -> Option<String> {
++        if next { self.next_note.clone() } else { self.note.clone() }
++    }
++
+     /// round 61 (page robot hook): the exact text Start game sends with the page's values
+     /// now (the proposed seed when none is typed, as Start game puts it in).
+     pub fn values_text(&self) -> String {
+@@ -1131,17 +1459,22 @@ impl RandoPage {
+                     ui.separator();
+                 }
+                 match (&self.rows, &mut self.form) {
+-                    (Rows::Ready(_), Some(form)) => {
+-                        let pointed = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form, targets, "")).inner;
++                    (Rows::Ready(found), Some(form)) => {
++                        // round 74: the preset buttons and the Share code field are drawn with the rows
++                        let mut extras = Extras { presets: &found.presets, share: &mut self.share, game: self.game.as_deref(), proposed: &self.proposed_seed, note: None };
++                        let pointed = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form, targets, "", &mut extras)).inner;
+                         if let Some(key) = pointed {
+                             if self.help_key.as_deref() != Some(key.as_str()) {
+                                 self.note = None;
+                             }
+                             self.help_key = Some(key);
+                         }
++                        if let Some(note) = extras.note.take() {
++                            self.note = Some(note);
++                        }
+                         // round 62b: the help line, the pointed (or focused) row's one sentence;
+                         // round 71: always two rows high
+-                        let help = help_text(form, self.help_key.as_ref(), self.note.as_ref());
++                        let help = help_for(form, &found.presets, self.help_key.as_ref(), self.note.as_ref(), HELP_REST);
+                         ui.separator();
+                         let line = help_line(ui, &help);
+                         targets.push(("help:line".into(), line.rect));
+@@ -1152,12 +1485,14 @@ impl RandoPage {
+                             if all.clicked() {
+                                 // round 71: one line (This run lists the rows after Start)
+                                 self.note = Some(everything_note(&form.everything_on()));
++                                self.share.edited = false;
+                             }
+                             let defaults = ui.button("Defaults");
+                             targets.push(("btn:defaults".into(), defaults.rect));
+                             if defaults.clicked() {
+                                 form.defaults();
+                                 self.note = None;
++                                self.share.edited = false;
+                             }
+                             let problem = form.problem();
+                             let start = ui.add_enabled(problem.is_none() && !self.failed, egui::Button::new(RichText::new("Start game").strong()));
+@@ -1217,6 +1552,7 @@ impl RandoPage {
+         self.next_form = None;
+         self.next_note = None;
+         self.next_kept = None;
++        self.next_share = ShareField::default();
+         self.targets.retain(|(key, _)| !key.starts_with("next:"));
+     }
+ 
+@@ -1269,8 +1605,9 @@ impl RandoPage {
+             self.next_form = self.form.clone();
+             self.next_kept = None;
+             self.next_note = None;
++            self.next_share = ShareField::default();
+         }
+-        let rows_height = (ctx.content_rect().height() * 0.35).max(100.0);
++        let (list_height, rows_height) = this_run_heights(ctx.content_rect().height(), this_run_lines(&self.this_run));
+         let mut keep = false;
+         let targets = &mut self.targets;
+         egui::Window::new("Randomizer").id(egui::Id::new("rando this run")).open(&mut open).default_width(360.0).show(ctx, |ui| {
+@@ -1279,22 +1616,30 @@ impl RandoPage {
+                 None => ui.label("Randomizer: Off (the original game)"),
+                 Some(seed) => ui.label(format!("Randomizer: On, seed {seed}")),
+             };
++            if self.this_run.seed.is_some() || !self.this_run.notices.is_empty() {
++                // round 74 (A9): the list in its own capped scroll area, so Keep below never
++                // falls off a short window ("Randomize everything" lists 22 rows)
++                egui::ScrollArea::vertical().id_salt("this run list").max_height(list_height).show(ui, |ui| {
++                    if self.this_run.seed.is_some() {
++                        if self.this_run.changed.is_empty() {
++                            ui.label(RichText::new("Every setting at its default").weak());
++                        }
++                        for line in &self.this_run.changed {
++                            ui.label(line);
++                        }
++                    }
++                    for notice in &self.this_run.notices {
++                        ui.label(RichText::new(notice).color(Color32::LIGHT_RED));
++                    }
++                });
++            }
+             if self.this_run.seed.is_some() {
+-                if self.this_run.changed.is_empty() {
+-                    ui.label(RichText::new("Every setting at its default").weak());
+-                }
+-                for line in &self.this_run.changed {
+-                    ui.label(line);
+-                }
+                 if let Some(spoiler) = &self.this_run.spoiler {
+                     if ui.button("Open spoiler log").clicked() {
+                         actions.push(PageAction::Spoiler(spoiler.clone()));
+                     }
+                 }
+             }
+-            for notice in &self.this_run.notices {
+-                ui.label(RichText::new(notice).color(Color32::LIGHT_RED));
+-            }
+             ui.separator();
+             let Some(draft) = self.next_form.as_mut().filter(|_| show_next) else {
+                 // round 71: only when the Next New Game part cannot show (its own line says it)
+@@ -1308,11 +1653,17 @@ impl RandoPage {
+             let header = ui.label(RichText::new("Next New Game").strong());
+             targets.push(("next:header".into(), header.rect));
+             ui.label(RichText::new("These never change the game you are playing.").weak().small());
++            let presets: &[Preset] = match &self.rows {
++                Rows::Ready(found) => &found.presets,
++                _ => &[],
++            };
+             ui.push_id("next", |ui| {
++                // round 74: the preset buttons and the Share code field, as on the New Game page
++                let mut extras = Extras { presets, share: &mut self.next_share, game: self.game.as_deref(), proposed: &self.proposed_seed, note: None };
+                 let pointed = egui::ScrollArea::vertical()
+                     .id_salt("next rows")
+                     .max_height(rows_height)
+-                    .show(ui, |ui| rows(ui, draft, targets, "next:"))
++                    .show(ui, |ui| rows(ui, draft, targets, "next:", &mut extras))
+                     .inner;
+                 if let Some(key) = pointed {
+                     if self.next_help_key.as_deref() != Some(key.as_str()) {
+@@ -1320,8 +1671,12 @@ impl RandoPage {
+                     }
+                     self.next_help_key = Some(key);
+                 }
++                if let Some(note) = extras.note.take() {
++                    self.next_note = Some(note);
++                }
+                 ui.separator();
+-                let line = help_line(ui, &help_text(draft, self.next_help_key.as_ref(), self.next_note.as_ref()));
++                // round 74 (A9, call 6): at rest the line says Keep keeps the seed in the box
++                let line = help_line(ui, &help_for(draft, presets, self.next_help_key.as_ref(), self.next_note.as_ref(), NEXT_HELP_REST));
+                 targets.push(("next:help:line".into(), line.rect));
+                 ui.separator();
+                 ui.horizontal(|ui| {
+@@ -1333,11 +1688,13 @@ impl RandoPage {
+                     if defaults.clicked() {
+                         draft.defaults();
+                         self.next_note = None;
++                        self.next_share.edited = false;
+                     }
+                     let all = ui.button("Randomize everything");
+                     targets.push(("next:btn:everything_on".into(), all.rect));
+                     if all.clicked() {
+                         self.next_note = Some(everything_note(&draft.everything_on()));
++                        self.next_share.edited = false;
+                     }
+                 });
+                 if let Some((text, colour)) = next_status(self.form.as_ref(), draft, self.next_kept.as_ref(), data.is_some()) {
+@@ -1363,6 +1720,24 @@ impl RandoPage {
+     }
+ }
+ 
++/// round 74 (A9): the lines This run lists (every changed row, or the one "every setting at
++/// its default" line, and the core's notices).
++fn this_run_lines(run: &ThisRun) -> usize {
++    let rows = if run.seed.is_some() { run.changed.len().max(1) } else { 0 };
++    rows + run.notices.len()
++}
++
++/// round 74 (A9): the heights of This run's list and of the Next New Game rows for a screen
++/// `height` points high: the list takes what its lines need, at most 15% of the screen (54 to
++/// 160 points); the rows take what is left after about 330 points for the rest of the window
++/// (title, labels, help line, buttons), at least 80 and at most the round-71 35% (100 or
++/// more). At 800 x 480 with 22 changed rows: list 72, rows 80, so Keep stays on the screen.
++pub fn this_run_heights(height: f32, lines: usize) -> (f32, f32) {
++    let list = (lines as f32 * 20.0).min((height * 0.15).clamp(54.0, 160.0));
++    let rows = (height - 330.0 - list).clamp(80.0, (height * 0.35).max(100.0));
++    (list, rows)
++}
++
+ /// round 71: the Next New Game part's note (Grok's words, docs/collab/PAGE_R71_GROK.md): no
+ /// data folder; the draft differs from the kept form; Keep wrote it (or why not); else none.
+ fn next_status(form: Option<&RandoForm>, draft: &RandoForm, kept: Option<&Result<(), String>>, has_data: bool) -> Option<(String, Color32)> {
+@@ -1381,7 +1756,9 @@ fn next_status(form: Option<&RandoForm>, draft: &RandoForm, kept: Option<&Result
+ /// (the full swap look) is grey and cannot be changed. Returns the row pointed at or
+ /// focused this frame (its help goes in the help line). Round 71: every target name starts
+ /// with `prefix` ("" on the New Game page, "next:" in the Esc window's Next New Game part).
+-fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>, prefix: &str) -> Option<String> {
++/// Round 74: the preset buttons under Randomizer and the Share code field under the seed
++/// (`extras`; their pointed keys are "preset:<name>" and "share").
++fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>, prefix: &str, extras: &mut Extras) -> Option<String> {
+     let on = form.on();
+     let rows = form.rows.clone();
+     let mut pointed = None;
+@@ -1484,11 +1861,124 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui
+                 pointed = Some(row.key.clone());
+             }
+             ui.end_row();
++            if row.key == "randomizer" && !extras.presets.is_empty() {
++                preset_row(ui, form, targets, prefix, extras, &mut pointed);
++            }
++            if row.kind == Kind::Seed {
++                share_row(ui, form, targets, prefix, extras, &mut pointed);
++            }
+         }
+     });
+     pointed
+ }
+ 
++/// round 74 (A6): the preset buttons, one grid row in Basics. A press: every row to its
++/// default, the preset's values, the seed kept (`RandoForm::preset`); the help line shows the
++/// preset's one line; the Share code field shows the new code.
++fn preset_row(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>, prefix: &str, extras: &mut Extras, pointed: &mut Option<String>) {
++    let presets = extras.presets;
++    ui.label("Presets");
++    ui.horizontal(|ui| {
++        for preset in presets {
++            let button = ui.button(preset.label.as_str());
++            targets.push((format!("{prefix}btn:preset:{}", preset.name), button.rect));
++            if button.hovered() || button.has_focus() {
++                *pointed = Some(format!("preset:{}", preset.name));
++            }
++            if button.clicked() {
++                let refused = form.preset(preset);
++                if !refused.is_empty() {
++                    log::warn!(target: "zakuro::rando", "preset {}: not set {refused:?}", preset.name);
++                }
++                extras.share.edited = false;
++                extras.note = Some(format!("{}: {}", preset.label, preset.help));
++            }
++        }
++    });
++    ui.end_row();
++}
++
++/// round 74 (A6): the Share code row under the seed: the field (the form's code, or what was
++/// typed or pasted), Copy and Paste. A code pasted into the field (Ctrl+V, or the page robot's
++/// paste) is used at once; a typed one with Enter or Paste. Used: the form takes every value
++/// and the seed from it; refused: its one plain sentence in the help line and nothing changes.
++/// Paste with nothing typed empties the field and says to press Ctrl+V (the program has no
++/// clipboard read of its own). An invalid typed seed has no code (the field says so).
++fn share_row(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>, prefix: &str, extras: &mut Extras, pointed: &mut Option<String>) {
++    let code = form.share_code(extras.proposed, extras.game);
++    if !extras.share.edited {
++        extras.share.text = code.clone().unwrap_or_default();
++    }
++    let label = RichText::new("Share code");
++    let name = ui.label(if form.on() { label } else { label.weak() });
++    if name.hovered() {
++        *pointed = Some("share".into());
++    }
++    ui.horizontal(|ui| {
++        let mut text = extras.share.text.clone();
++        let hint = if code.is_some() { "paste a code here" } else { "a valid seed first" };
++        let out = egui::TextEdit::singleline(&mut text).id_salt("rando share code").char_limit(80).desired_width(160.0).hint_text(hint).show(ui);
++        let edit = out.response.response.clone();
++        targets.push((format!("{prefix}row:share"), edit.rect));
++        if edit.hovered() || edit.has_focus() {
++            *pointed = Some("share".into());
++        }
++        let pasted = edit.has_focus() && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
++        let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
++        if edit.changed() {
++            extras.share.text = text.clone();
++            extras.share.edited = true;
++        }
++        if edit.has_focus() && !extras.share.edited {
++            // the whole code is selected while the field has the focus, so a paste or a typed
++            // code replaces it
++            let mut state = out.state.clone();
++            let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()));
++            state.cursor.set_char_range(Some(all));
++            state.store(ui.ctx(), edit.id);
++        }
++        if !edit.has_focus() && extras.share.edited && extras.share.text.trim().is_empty() {
++            extras.share.edited = false;
++        }
++        let copy = ui.add_enabled(code.is_some(), egui::Button::new("Copy"));
++        targets.push((format!("{prefix}btn:share:copy"), copy.rect));
++        if copy.hovered() {
++            *pointed = Some("share".into());
++        }
++        if copy.clicked() {
++            if let Some(code) = &code {
++                ui.ctx().copy_text(code.clone());
++                extras.share.edited = false;
++                extras.note = Some(SHARE_COPIED.to_owned());
++            }
++        }
++        let paste = ui.button("Paste");
++        targets.push((format!("{prefix}btn:share:paste"), paste.rect));
++        if paste.hovered() {
++            *pointed = Some("share".into());
++        }
++        if (pasted && edit.changed()) || (entered && extras.share.edited) || (paste.clicked() && extras.share.edited) {
++            match form.use_share_code(&extras.share.text, extras.game) {
++                Ok(()) => {
++                    log::info!(target: "zakuro::rando", "share code used: {}", extras.share.text.trim());
++                    extras.share.edited = false;
++                    extras.note = Some(SHARE_USED.to_owned());
++                }
++                Err(error) => {
++                    // the text stays in the field, to be fixed
++                    extras.note = Some(error.message);
++                }
++            }
++        } else if paste.clicked() {
++            extras.share.text.clear();
++            extras.share.edited = true;
++            ui.memory_mut(|memory| memory.request_focus(edit.id));
++            extras.note = Some(SHARE_PASTE_HOW.to_owned());
++        }
++    });
++    ui.end_row();
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1673,7 +2163,7 @@ mod tests {
+     #[test]
+     fn this_run_lists_what_is_not_default() {
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap(), presets: Vec::new() });
+         let run = page.run_from(&json!({"randomizer": true, "seed": "s1", "classes": false, "trees": "own"}), None, vec![]);
+         assert_eq!(run.seed.as_deref(), Some("s1"));
+         assert_eq!(run.changed, vec!["Classes: Off"]);
+@@ -1684,7 +2174,7 @@ mod tests {
+     fn the_page_draws_without_a_window() {
+         let ctx = egui::Context::default();
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap(), presets: Vec::new() });
+         page.form = Some(form());
+         page.open_new_game();
+         page.this_run_open = true;
+@@ -1706,7 +2196,7 @@ mod tests {
+         // round 61: the page robot hook (pagebot.rs) clicks where the page says its controls are
+         let ctx = egui::Context::default();
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap(), presets: Vec::new() });
+         page.form = Some(form());
+         page.open_new_game();
+         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
+@@ -1771,7 +2261,7 @@ mod tests {
+         assert_eq!(form.get("children"), &json!(true));
+         // the page remakes the form when the game changes, keeping what the new rows allow
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: (String::new(), Vec::new()), tool: PathBuf::new(), rows: rows.clone() });
++        page.rows = Rows::Ready(Found { python: (String::new(), Vec::new()), tool: PathBuf::new(), rows: rows.clone(), presets: Vec::new() });
+         page.form = Some(form);
+         page.game = Some("seal".into());
+         page.fit_game();
+@@ -1965,7 +2455,7 @@ mod tests {
+         let drawn = |game: Option<&str>| {
+             let ctx = egui::Context::default();
+             let mut page = RandoPage::default();
+-            page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap() });
++            page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap(), presets: Vec::new() });
+             page.game = game.map(str::to_owned);
+             page.form = Some(form_for(SCHEMA_62B, game));
+             page.form_game = page.game.clone();
+@@ -2010,7 +2500,7 @@ mod tests {
+     fn the_page_shows_sections_and_a_help_line_without_hidden_rows() {
+         let ctx = egui::Context::default();
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap() });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap(), presets: Vec::new() });
+         page.form = Some(form_for(SCHEMA_62B, None));
+         page.open_new_game();
+         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
+@@ -2044,7 +2534,7 @@ mod tests {
+         let spoiler = run.join("spoiler.txt");
+         std::fs::write(&spoiler, "x").unwrap();
+         let mut page = RandoPage::default();
+-        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap() });
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA_62B).unwrap(), presets: Vec::new() });
+         page.form = Some(form_for(SCHEMA_62B, None));
+         page.open_new_game();
+         let answers = json!({"randomizer": true, "seed": "s"});
+@@ -2335,4 +2825,335 @@ mod tests {
+         assert_eq!(last_path(data), Path::new("D:/x/rando/last.json"));
+         assert_eq!(run_dir(data, "s-1"), Path::new("D:/x/rando/0004000000179800/runs/s-1"));
+     }
++
++    // ------------------------------------------- round 74: presets, the share code, the Esc fit
++
++    /// SCHEMA_62B plus made-up presets in the schema's form (and two entries the page leaves out).
++    fn schema_74() -> String {
++        let rows = SCHEMA_62B.trim_end().strip_suffix('}').unwrap();
++        format!(r#"{rows}, "presets": [
++            {{"name": "light", "label": "Light", "help": "Light help.", "values": {{"randomizer": true}}}},
++            {{"name": "wild", "label": "Wild", "help": "Wild help.", "values": {{"randomizer": true, "promotions": "on", "growth_mode": "delta"}}}},
++            {{"name": "Bad Name", "label": "x", "values": {{"randomizer": true}}}},
++            {{"name": "novalues", "label": "y"}}
++        ]}}"#)
++    }
++
++    fn page_74() -> RandoPage {
++        let text = schema_74();
++        RandoPage::with_schema(parse_schema(&text).unwrap(), parse_presets(&text))
++    }
++
++    /// tests/rando_sharecode_vectors.json, found by walking up from the crate (never skipped).
++    fn vectors() -> Value {
++        let start = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++        let file = start.ancestors()
++            .map(|dir| dir.join("tests").join("rando_sharecode_vectors.json"))
++            .find(|file| file.is_file())
++            .unwrap_or_else(|| panic!("tests/rando_sharecode_vectors.json was not found above {}: the share code test needs it", start.display()));
++        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap()
++    }
++
++    fn vector_game(game: &Value) -> Option<&str> {
++        match game.as_str() {
++            Some("seal") => Some("seal"),
++            _ => None,
++        }
++    }
++
++    #[test]
++    fn presets_are_read_from_the_schema() {
++        let presets = parse_presets(&schema_74());
++        assert_eq!(presets.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["light", "wild"]);
++        assert_eq!(presets[1].label, "Wild");
++        assert_eq!(presets[1].help, "Wild help.");
++        assert_eq!(presets[1].values.get("growth_mode"), Some(&json!("delta")));
++        // an older schema (no presets) and text that is not JSON: no buttons
++        assert!(parse_presets(SCHEMA_62B).is_empty());
++        assert!(parse_presets("not json").is_empty());
++        // the rows are read as before
++        assert_eq!(parse_schema(&schema_74()).unwrap(), parse_schema(SCHEMA_62B).unwrap());
++    }
++
++    #[test]
++    fn a_preset_resets_every_row_and_keeps_the_seed() {
++        let presets = parse_presets(&schema_74());
++        let mut form = form_for(SCHEMA_62B, None);
++        form.set("seed", json!("keepme"));
++        form.set("classes", json!(false));
++        form.set("spoiler_log", json!(false));
++        form.set("growth_min", json!(40));
++        assert!(form.preset(&presets[1]).is_empty());
++        assert!(form.on());
++        assert_eq!(form.seed(), "keepme");
++        assert_eq!(form.get("classes"), &json!(true), "back to its default");
++        assert!(form.spoiler_on(), "page-only switches go to their default too");
++        assert_eq!(form.get("growth_min"), &json!(5), "hidden rows too");
++        assert_eq!(form.get("promotions"), &json!("on"));
++        assert_eq!(form.get("growth_mode"), &json!("delta"));
++        // Light after Wild is exactly Light
++        form.preset(&presets[0]);
++        let mut light = form_for(SCHEMA_62B, None);
++        light.set("seed", json!("keepme"));
++        light.preset(&presets[0]);
++        assert_eq!(form, light);
++        let mut fresh = form_for(SCHEMA_62B, None);
++        fresh.set("randomizer", json!(true));
++        fresh.set("seed", json!("keepme"));
++        assert_eq!(light, fresh, "Light = Randomizer on, every other row at its default");
++        // a preset never puts a key of its own into the answer
++        let keys: Vec<String> = form.rows.iter().map(|row| row.key.clone()).collect();
++        assert!(form.answers_preview("p").as_object().unwrap().keys().all(|k| keys.contains(k)));
++        // a fixed or game-hidden row keeps its rule (refused, at its default)
++        let odd = Preset { name: "odd".into(), label: "Odd".into(), help: String::new(), values: json!({"children": true, "nothing": 1, "seed": "x"}).as_object().unwrap().clone() };
++        let mut seal = form_for(SCHEMA_62B, Some("seal"));
++        let mut refused = seal.preset(&odd);
++        refused.sort();
++        assert_eq!(refused, ["children", "nothing", "seed"]);
++        assert_eq!(seal.get("children"), &json!(false));
++        assert_eq!(seal.seed(), "");
++    }
++
++    #[test]
++    fn share_codes_match_the_shared_vectors() {
++        let v = vectors();
++        assert_eq!(v["alphabet"].as_str().unwrap().as_bytes(), SHARE_ALPHABET);
++        let rows = parse_schema(&json!({"format": 1, "rows": v["rows"]}).to_string()).unwrap();
++        assert_eq!(share_layout_text(&rows), v["layout_text"].as_str().unwrap());
++        assert_eq!(share_layout(&rows), v["layout"].as_str().unwrap());
++        let good = v["good"].as_array().unwrap();
++        assert!(!good.is_empty());
++        for g in good {
++            let game = vector_game(&g["game"]);
++            let values = g["values"].as_object().unwrap().clone();
++            let seed = g["seed"].as_str().unwrap();
++            assert_eq!(share_encode(&rows, &values, seed, game).as_deref(), g["code"].as_str(), "{}", g["note"]);
++            let mut spellings = vec![g["code"].clone()];
++            spellings.extend(g["also"].as_array().cloned().unwrap_or_default());
++            for spelling in spellings {
++                let (got, got_seed) = share_decode(&rows, spelling.as_str().unwrap(), game).unwrap_or_else(|e| panic!("{spelling}: {e:?}"));
++                assert_eq!(got_seed, seed);
++                for row in share_rows(&rows) {
++                    let want = values.get(&row.key).unwrap_or(&row.default);
++                    assert_eq!(got.get(&row.key), Some(want), "{} in {spelling}", row.key);
++                }
++                assert_eq!(got.len(), share_rows(&rows).len());
++            }
++        }
++        let bad = v["bad"].as_array().unwrap();
++        let mut kinds = std::collections::BTreeSet::new();
++        for b in bad {
++            let error = share_decode(&rows, b["code"].as_str().unwrap(), vector_game(&b["game"])).unwrap_err();
++            assert_eq!(error.kind, b["error"].as_str().unwrap(), "{}", b["note"]);
++            assert_eq!(error.message, b["message"].as_str().unwrap(), "{}", b["note"]);
++            kinds.insert(error.kind);
++        }
++        assert_eq!(kinds.into_iter().collect::<Vec<_>>(), ["check", "damaged", "format", "game", "layout"]);
++        // a seed the randomizer does not take has no code
++        assert_eq!(share_encode(&rows, &Map::new(), "", None), None);
++        assert_eq!(share_encode(&rows, &Map::new(), "bad seed", None), None);
++    }
++
++    #[test]
++    fn the_same_code_gives_the_same_answer_on_a_fresh_page() {
++        for game in [None, Some("seal")] {
++            let mut form = form_for(&schema_71(), game);
++            form.set("randomizer", json!(true));
++            form.set("promotions", json!("on"));
++            form.set("growth_mode", json!("full"));
++            form.set("stronger_weapons", json!(true));
++            form.set("growth_min", json!(17));
++            form.set("chests", json!(true));
++            form.set("recolour", json!("clear"));
++            form.set("children", json!(true));
++            let code = form.share_code("prop1234", game).unwrap();
++            assert!(code.ends_with("-prop1234"), "an empty seed box gives the proposed seed: {code}");
++            assert!(code.starts_with(if game.is_some() { "R1S" } else { "R1F" }));
++            let mut fresh = form_for(&schema_71(), game);
++            fresh.set("seed", json!("other"));
++            fresh.set("classes", json!(false));
++            fresh.use_share_code(&code, game).unwrap();
++            assert_eq!(fresh.seed(), "prop1234");
++            let a = form.answers_preview("prop1234").to_string();
++            assert_eq!(fresh.answers_preview("zzz").to_string(), a, "{game:?}");
++            let id = |text: &str| zakuro_core::fates_rando_session::run_id_for(text, game).unwrap();
++            assert_eq!(id(&fresh.answers_preview("zzz").to_string()), id(&a));
++            assert_eq!(fresh.share_code("zzz", game).as_deref(), Some(code.as_str()), "the field shows the same code again");
++            // a code for the other game, or with a typo, changes nothing
++            let other = form.share_code("prop1234", if game.is_some() { None } else { Some("seal") }).unwrap();
++            let before = fresh.clone();
++            let error = fresh.use_share_code(&other, game).unwrap_err();
++            assert_eq!(error.kind, "game");
++            assert_eq!(error.message, if game.is_some() { "This code is for Fire Emblem Fates." } else { "This code is for Seal of Flames." });
++            let typo = code.replace("-prop1234", "-prop1235");
++            assert_eq!(fresh.use_share_code(&typo, game).unwrap_err().message, SHARE_TYPO);
++            assert_eq!(fresh, before);
++        }
++        // Seal of Flames keeps Children off whatever the code says
++        let mut fates = form_for(&schema_71(), None);
++        fates.set("randomizer", json!(true));
++        fates.set("children", json!(true));
++        assert_eq!(fates.get("children"), &json!(true));
++        let mut seal = form_for(&schema_71(), Some("seal"));
++        seal.set("randomizer", json!(true));
++        let seal_code = seal.share_code("s1", Some("seal")).unwrap();
++        let mut again = form_for(&schema_71(), Some("seal"));
++        again.use_share_code(&seal_code, Some("seal")).unwrap();
++        assert_eq!(again.answers_preview("x")["children"], json!(false));
++    }
++
++    /// one page frame with these events, both windows drawn (no data folder); the texts the
++    /// frame's Copy put out through egui.
++    fn frame_with(ctx: &egui::Context, page: &mut RandoPage, size: Vec2, time: &mut f64, events: Vec<egui::Event>) -> Vec<String> {
++        *time += 1.0 / 60.0;
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
++        let input = egui::RawInput { screen_rect: Some(screen), time: Some(*time), focused: true, events, ..Default::default() };
++        let output = ctx.run_ui(input, |ui| {
++            page.draw_new_game(ui.ctx(), None);
++            if page.this_run_open {
++                page.draw_this_run(ui.ctx(), None);
++            }
++        });
++        let copied = output.platform_output.commands.iter().filter_map(|command| match command {
++            egui::OutputCommand::CopyText(text) => Some(text.clone()),
++            _ => None,
++        }).collect();
++        output.drop_without_applying_deltas();
++        copied
++    }
++
++    /// a click at the control's reported rectangle (press, release, one more frame).
++    fn click_at(ctx: &egui::Context, page: &mut RandoPage, size: Vec2, time: &mut f64, key: &str) -> Vec<String> {
++        let at = target(page, key).center();
++        let press = vec![
++            egui::Event::PointerMoved(at),
++            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
++        ];
++        let release = vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }];
++        let mut copied = frame_with(ctx, page, size, time, press);
++        copied.extend(frame_with(ctx, page, size, time, release));
++        copied.extend(frame_with(ctx, page, size, time, vec![]));
++        copied
++    }
++
++    fn close(a: (f32, f32), b: (f32, f32)) -> bool {
++        (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01
++    }
++
++    #[test]
++    fn preset_buttons_and_the_share_field_are_clicked_like_any_control() {
++        // real pointer and paste events on the reported rectangles, as the page robot sends them
++        // (no data folder: no background make starts in a test)
++        let ctx = egui::Context::default();
++        let size = Vec2::new(800.0, 480.0);
++        let mut time = 0.0;
++        let mut page = page_74();
++        page.open_new_game();
++        for _ in 0..4 {
++            frame_with(&ctx, &mut page, size, &mut time, vec![]);
++        }
++        let k = keys(&page);
++        for key in ["btn:preset:light", "btn:preset:wild", "row:share", "btn:share:copy", "btn:share:paste"] {
++            assert!(k.iter().any(|k| k == key), "{key} missing from {k:?}");
++            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(target(&page, key)), "{key} off the screen");
++        }
++        assert!(!k.iter().any(|k| k.contains("Bad Name") || k.contains("novalues")));
++        // the field shows the form's code, with the proposed seed
++        assert_eq!(page.share_shown(false), page.form.as_ref().unwrap().share_code(&page.proposed_seed, None).unwrap());
++        click_at(&ctx, &mut page, size, &mut time, "btn:preset:wild");
++        assert!(page.form.as_ref().unwrap().on());
++        assert_eq!(page.form.as_ref().unwrap().get("promotions"), &json!("on"));
++        assert_eq!(page.note_shown(false).as_deref(), Some("Wild: Wild help."));
++        let wild_values = page.values_text();
++        let wild_code = page.share_shown(false);
++        assert!(wild_code.ends_with(&format!("-{}", page.proposed_seed)));
++        // Copy puts the field's code out through egui
++        let out = click_at(&ctx, &mut page, size, &mut time, "btn:share:copy");
++        assert_eq!(out, [wild_code.clone()]);
++        assert_eq!(page.note_shown(false).as_deref(), Some(SHARE_COPIED));
++        // other values and another seed, then the copied code pasted into the field
++        click_at(&ctx, &mut page, size, &mut time, "btn:preset:light");
++        click_at(&ctx, &mut page, size, &mut time, "btn:random");
++        assert_ne!(page.values_text(), wild_values);
++        click_at(&ctx, &mut page, size, &mut time, "row:share");
++        frame_with(&ctx, &mut page, size, &mut time, vec![egui::Event::Paste(wild_code.clone())]);
++        frame_with(&ctx, &mut page, size, &mut time, vec![]);
++        assert_eq!(page.values_text(), wild_values, "every value and the seed from the code");
++        assert_eq!(page.note_shown(false).as_deref(), Some(SHARE_USED));
++        assert_eq!(page.share_shown(false), wild_code);
++        assert!(!page.share.edited);
++        // a code with a typo: one plain sentence, nothing changes
++        let typo = format!("{}X", &wild_code[..wild_code.len() - 1]);
++        click_at(&ctx, &mut page, size, &mut time, "row:share");
++        frame_with(&ctx, &mut page, size, &mut time, vec![egui::Event::Paste(typo.clone())]);
++        frame_with(&ctx, &mut page, size, &mut time, vec![]);
++        assert_eq!(page.values_text(), wild_values);
++        assert_eq!(page.note_shown(false).as_deref(), Some(SHARE_TYPO));
++        assert!(page.share.edited && page.share.text == typo, "the bad text stays to be fixed");
++        // Paste with the bad text in the field tries it again; Defaults shows the form's code again
++        click_at(&ctx, &mut page, size, &mut time, "btn:share:paste");
++        assert_eq!(page.note_shown(false).as_deref(), Some(SHARE_TYPO));
++        click_at(&ctx, &mut page, size, &mut time, "btn:defaults");
++        assert!(!page.share.edited);
++        assert_eq!(page.share_shown(false), page.form.as_ref().unwrap().share_code(&page.proposed_seed, None).unwrap());
++        // Paste with nothing typed: the line says to press Ctrl+V
++        click_at(&ctx, &mut page, size, &mut time, "btn:share:paste");
++        assert_eq!(page.note_shown(false).as_deref(), Some(SHARE_PASTE_HOW));
++        // the help line names the share row and the preset buttons
++        let form = page.form.as_ref().unwrap();
++        let presets = parse_presets(&schema_74());
++        assert_eq!(help_for(form, &presets, Some(&"share".to_owned()), None, HELP_REST), format!("Share code: {SHARE_HELP}"));
++        assert_eq!(help_for(form, &presets, Some(&"preset:light".to_owned()), None, HELP_REST), "Light: Light help.");
++        assert_eq!(SHARE_HELP, "Copy or paste this. The same code makes the same game.");
++    }
++
++    #[test]
++    fn keep_stays_on_a_short_screen_with_this_run_full() {
++        // round 74 (A9): "Randomize everything" lists 22 rows; at 800 x 480 Keep stays reachable
++        assert!(close(this_run_heights(480.0, 24), (72.0, 80.0)), "{:?}", this_run_heights(480.0, 24));
++        assert!(close(this_run_heights(480.0, 0), (0.0, 150.0)));
++        assert!(close(this_run_heights(960.0, 0), (0.0, 336.0)), "round 71's rows height on a tall screen");
++        assert!(close(this_run_heights(960.0, 24), (144.0, 336.0)));
++        let data = temp_data("fit");
++        let size = Vec2::new(800.0, 480.0);
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
++        let mut page = page_74();
++        page.this_run = ThisRun {
++            seed: Some("fit74".into()),
++            changed: (0..22).map(|n| format!("A changed setting number {n}: On")).collect(),
++            spoiler: Some(data.join("spoiler.txt")),
++            notices: vec!["A notice from the core.".into(), "Another notice from the core.".into()],
++        };
++        page.this_run_open = true;
++        let ctx = egui::Context::default();
++        let mut time = 0.0;
++        let mut frame = |page: &mut RandoPage, events: Vec<egui::Event>| {
++            time += 1.0 / 60.0;
++            let input = egui::RawInput { screen_rect: Some(screen), time: Some(time), focused: true, events, ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                page.draw_new_game(ui.ctx(), Some(&data));
++                page.draw_this_run(ui.ctx(), Some(&data));
++            })
++            .drop_without_applying_deltas();
++        };
++        for _ in 0..4 {
++            frame(&mut page, vec![]);
++        }
++        for key in ["next:btn:keep", "next:btn:defaults", "next:btn:everything_on", "next:help:line", "next:btn:preset:wild"] {
++            assert!(screen.contains_rect(target(&page, key)), "{key} {:?} off {screen:?}", target(&page, key));
++        }
++        let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("rando this run"))).unwrap();
++        assert!(window.max.y <= screen.max.y + 0.5, "{window:?}");
++        // a real click on Keep lands (last.json written)
++        let at = target(&page, "next:btn:keep").center();
++        frame(&mut page, vec![egui::Event::PointerMoved(at), egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]);
++        frame(&mut page, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
++        frame(&mut page, vec![]);
++        assert!(last_path(&data).is_file(), "Keep was reachable and kept");
++        // at rest, the part's help line says Keep keeps the seed (call 6)
++        let draft = page.next_form.as_ref().unwrap();
++        assert_eq!(help_for(draft, &[], None, None, NEXT_HELP_REST), NEXT_HELP_REST);
++        assert!(NEXT_HELP_REST.len() < 90 && !NEXT_HELP_REST.contains('\n'));
++        let _ = std::fs::remove_dir_all(&data);
++    }
+ }
+-- 
+2.55.0.windows.5
+

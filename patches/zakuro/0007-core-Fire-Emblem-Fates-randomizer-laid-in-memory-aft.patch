@@ -1,0 +1,843 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Fri, 20 Nov 2026 02:02:48 -0500
+Subject: [PATCH 07/21] core: Fire Emblem Fates' randomizer laid in memory
+ after the mode pick
+
+The Fates port's owner asked (its docs/DECISIONS.md F-044 and addendum,
+engine build OK 2026-11-20) to set every randomizer setting inside the
+game, right after picking Casual or Classic for a new game, instead of
+in a separate PLAY RANDOMIZED profile that needs its own game folder and
+a restart. Zakuro's mods layer is laid once at boot, so this cannot use
+it. New module zakuro-core fates_rando (not wired into a frame yet;
+nothing calls it, so every run is unchanged):
+
+- Patch::parse reads the patch the port's Python randomizer writes
+  (tools/randomizer/rando.py make --patch-out): per file (GameData.bin.lz
+  or a chapter placement file GameData/Dispos/**), value cells with
+  their original and new bytes, and label pointer cells with the
+  original and new label text, where the new label lives (GameData's or
+  the file's own string pool) and the original pointer's file value.
+- gamedata_start / dispos_now find the game's copies the way the game
+  does: GameData::Initialize 0x004E6954 keeps its ArchiveFile at
+  *0x006D3868 and table pointers count from [[archive + 4] + 112] + 32;
+  map::Dispos::Load 0x0039ED9C keeps the current placement file at
+  *0x006D6DC8 (name at +0, ArchiveFile at +16). The port's robot read
+  both from real memory (round 50): every byte equals the original file.
+- apply_file checks every cell of a file against its original value
+  (the label text, for pointers, and that each new label is where the
+  patch says) and then writes all of them, or writes nothing. revert
+  writes the original values back. Run keeps what is laid: GameData
+  once, each placement file once per load.
+- NewGameWatch: the frame of the mode pick, from GameConfigData
+  (*0x006DA0F8) word +4 changing while byte +0xB stays 1 (robot: frame
+  4019 of the new-game route; a save load changes the word with +0xB
+  going to 0).
+- slot_written / slot_run: a side file per save file
+  (<data>/rando/0004000000179800/slots/Chapter0.json ...) naming the run
+  a randomized save belongs to.
+
+Our own code and words; no game data. Unit tests use a fake memory.
+---
+ crates/zakuro-core/src/fates_rando.rs | 779 ++++++++++++++++++++++++++
+ crates/zakuro-core/src/lib.rs         |   1 +
+ 2 files changed, 780 insertions(+)
+ create mode 100644 crates/zakuro-core/src/fates_rando.rs
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+new file mode 100644
+index 0000000..7572e00
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -0,0 +1,779 @@
++//! Fire Emblem Fates: the randomizer laid in memory right after the New Game mode pick
++//! (Casual / Classic / Phoenix), so the randomizer's settings are chosen inside the game
++//! instead of in a separate PLAY RANDOMIZED profile.
++//!
++//! The randomizer itself stays the port's Python tool (`tools/randomizer/rando.py make
++//! --patch-out FILE`); this module only reads its patch file and writes the cells it
++//! names into the game's own copies of its files:
++//!
++//! - `GameData/GameData.bin.lz`, loaded whole once at boot (`GameData::Initialize`
++//!   0x004E6954: `*0x006D3868` is its ArchiveFile; `[[+4] + 112] + 32` is the data start
++//!   every table pointer counts from);
++//! - the chapter placement files `GameData/Dispos/**`, loaded one at a time into the
++//!   object at `*0x006D6DC8` (`map::Dispos::Load` 0x0039ED9C: name at +0, ArchiveFile at
++//!   +16).
++//!
++//! Every cell carries its original value. Before anything is written, every cell of the
++//! file is checked against it (all or nothing), so another mod, a PLAY RANDOMIZED
++//! profile or another game version means nothing is written. With no active run this
++//! module reads nothing and writes nothing: Randomizer off is the original game.
++//!
++//! Patch format (text, written by tools/randomizer/ingame.py; offsets from the file's
++//! data start, hex):
++//!
++//! ```text
++//! fates-rando-patch 1
++//! seed <seed>
++//! options <json, not read here>
++//! gamedata-sha256 <hex>
++//! file gamedata|dispos <romfs path>
++//! v <offset> <original bytes> <new bytes>
++//! p <offset> <original label|-> <new label|-> <g|s|-> <new label offset|-> <original value|->
++//! end <number of v and p lines>
++//! ```
++//!
++//! `p` cells are pointers to label text (a placement's class or item, for example). In
++//! memory a pointer is "data start + offset", so the new value is GameData's data start
++//! (`g`) or this file's data start (`s`) plus the label's offset, and the guard compares
++//! the label TEXT the pointer currently shows. The original value lets a revert write
++//! the file's own pointer back.
++//!
++//! Side files: a randomized game's save files get a small file beside them in the data
++//! folder (`rando/<title>/slots/<save file>.json`) naming the run they belong to, so a
++//! later load lays the same run again; `slot_*` below. Wiring into the file service, the
++//! New Game page and the frame hook are separate steps (docs/RANDOMIZER_INGAME.md).
++
++use std::collections::HashSet;
++use std::fs;
++use std::io;
++use std::path::{Path, PathBuf};
++
++use crate::memory::Memory;
++
++/// Fire Emblem Fates (USA).
++pub const TITLE: u64 = 0x0004_0000_0017_9800;
++/// GameData's ArchiveFile pointer (`GameData::Initialize`).
++pub const GAMEDATA_ARCHIVE: u32 = 0x006D_3868;
++/// The placement object pointer (`map::Dispos::Load`).
++pub const DISPOS_OBJECT: u32 = 0x006D_6DC8;
++pub const FORMAT: u32 = 1;
++
++/// The few memory calls this module needs (real memory, or a fake one in the tests).
++pub trait Guest {
++    fn readable(&self, addr: u32, len: u32) -> bool;
++    fn read(&mut self, addr: u32, out: &mut [u8]);
++    fn write(&mut self, addr: u32, data: &[u8]);
++
++    fn r32(&mut self, addr: u32) -> Option<u32> {
++        if !self.readable(addr, 4) {
++            return None;
++        }
++        let mut b = [0u8; 4];
++        self.read(addr, &mut b);
++        Some(u32::from_le_bytes(b))
++    }
++
++    /// the NUL-terminated bytes at addr (at most max), None when unreadable or too long.
++    fn cstr(&mut self, addr: u32, max: u32) -> Option<Vec<u8>> {
++        let mut out = Vec::new();
++        for i in 0..max {
++            let a = addr.wrapping_add(i);
++            if !self.readable(a, 1) {
++                return None;
++            }
++            let mut b = [0u8; 1];
++            self.read(a, &mut b);
++            if b[0] == 0 {
++                return Some(out);
++            }
++            out.push(b[0]);
++        }
++        None
++    }
++}
++
++impl Guest for Memory {
++    fn readable(&self, addr: u32, len: u32) -> bool {
++        self.is_readable(addr, len)
++    }
++    fn read(&mut self, addr: u32, out: &mut [u8]) {
++        self.read_bytes(addr, out)
++    }
++    fn write(&mut self, addr: u32, data: &[u8]) {
++        self.write_bytes(addr, data)
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Kind {
++    GameData,
++    Dispos,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Where {
++    GameData,
++    Own,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Value {
++    pub off: u32,
++    pub old: Vec<u8>,
++    pub new: Vec<u8>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Ptr {
++    pub off: u32,
++    pub old: Option<Vec<u8>>,
++    pub new: Option<Vec<u8>>,
++    /// where the new label lives and its offset from that file's data start
++    pub target: Option<(Where, u32)>,
++    /// the original pointer's file value (from this file's data start)
++    pub old_value: Option<u32>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct FilePatch {
++    pub kind: Kind,
++    pub rel: String,
++    pub values: Vec<Value>,
++    pub ptrs: Vec<Ptr>,
++}
++
++#[derive(Clone, Debug, Default, PartialEq, Eq)]
++pub struct Patch {
++    pub seed: String,
++    pub gamedata_sha256: String,
++    pub files: Vec<FilePatch>,
++}
++
++fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
++    if s.len() % 2 != 0 {
++        return Err(format!("odd hex length: {s}"));
++    }
++    (0..s.len())
++        .step_by(2)
++        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("{s}: {e}")))
++        .collect()
++}
++
++fn hex_u32(s: &str) -> Result<u32, String> {
++    u32::from_str_radix(s, 16).map_err(|e| format!("{s}: {e}"))
++}
++
++fn opt<T>(s: &str, f: impl Fn(&str) -> Result<T, String>) -> Result<Option<T>, String> {
++    if s == "-" { Ok(None) } else { f(s).map(Some) }
++}
++
++impl Patch {
++    pub fn parse(text: &str) -> Result<Patch, String> {
++        let mut lines = text.lines();
++        if lines.next() != Some(&format!("fates-rando-patch {FORMAT}")) {
++            return Err("not a fates-rando-patch file of this format".into());
++        }
++        let mut p = Patch::default();
++        let mut count = 0usize;
++        let mut ended = false;
++        for (n, line) in lines.enumerate() {
++            let at = |e: String| format!("line {}: {e}", n + 2);
++            let w: Vec<&str> = line.split(' ').collect();
++            if ended {
++                return Err(at("text after the end line".into()));
++            }
++            match w[0] {
++                "seed" => p.seed = w.get(1).copied().unwrap_or("").to_string(),
++                "options" => {}
++                "gamedata-sha256" => p.gamedata_sha256 = w.get(1).copied().unwrap_or("").to_string(),
++                "file" if w.len() == 3 => {
++                    let kind = match w[1] {
++                        "gamedata" => Kind::GameData,
++                        "dispos" => Kind::Dispos,
++                        k => return Err(at(format!("unknown file kind {k}"))),
++                    };
++                    p.files.push(FilePatch { kind, rel: w[2].to_string(), values: vec![], ptrs: vec![] });
++                }
++                "v" if w.len() == 4 => {
++                    let f = p.files.last_mut().ok_or_else(|| at("cell before any file line".into()))?;
++                    let v = Value { off: hex_u32(w[1]).map_err(at)?, old: hex_bytes(w[2]).map_err(at)?,
++                                    new: hex_bytes(w[3]).map_err(at)? };
++                    if v.old.len() != v.new.len() || v.old.is_empty() {
++                        return Err(at("original and new bytes differ in size".into()));
++                    }
++                    f.values.push(v);
++                    count += 1;
++                }
++                "p" if w.len() == 7 => {
++                    let f = p.files.last_mut().ok_or_else(|| at("cell before any file line".into()))?;
++                    let target = match (w[4], opt(w[5], hex_u32).map_err(at)?) {
++                        ("g", Some(o)) => Some((Where::GameData, o)),
++                        ("s", Some(o)) => Some((Where::Own, o)),
++                        ("-", None) => None,
++                        _ => return Err(at("bad label place".into())),
++                    };
++                    let ptr = Ptr { off: hex_u32(w[1]).map_err(at)?, old: opt(w[2], hex_bytes).map_err(at)?,
++                                    new: opt(w[3], hex_bytes).map_err(at)?, target,
++                                    old_value: opt(w[6], hex_u32).map_err(at)? };
++                    if ptr.off % 4 != 0 || ptr.new.is_some() != ptr.target.is_some()
++                        || ptr.old.is_some() != ptr.old_value.is_some()
++                    {
++                        return Err(at("inconsistent pointer cell".into()));
++                    }
++                    f.ptrs.push(ptr);
++                    count += 1;
++                }
++                "end" if w.len() == 2 => {
++                    if w[1].parse::<usize>().ok() != Some(count) {
++                        return Err(at("the cell count does not match the end line".into()));
++                    }
++                    ended = true;
++                }
++                "" => {}
++                _ => return Err(at(format!("unknown line {line:?}"))),
++            }
++        }
++        if !ended {
++            return Err("the patch has no end line (cut short?)".into());
++        }
++        Ok(p)
++    }
++
++    pub fn gamedata(&self) -> Option<&FilePatch> {
++        self.files.iter().find(|f| f.kind == Kind::GameData)
++    }
++
++    /// the placement file whose name (as the game keeps it, e.g. "A005" or "A/A005.bin")
++    /// is `name`.
++    pub fn dispos(&self, name: &str) -> Option<&FilePatch> {
++        let want = stem(name);
++        if want.is_empty() {
++            return None;
++        }
++        self.files.iter().find(|f| f.kind == Kind::Dispos && stem(&f.rel).eq_ignore_ascii_case(want))
++    }
++}
++
++/// "GameData/Dispos/A/A005.bin.lz" -> "A005"
++pub fn stem(path: &str) -> &str {
++    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
++    last.split('.').next().unwrap_or(last)
++}
++
++/// an ArchiveFile's data start (`[[archive + 4] + 112] + 32`, as GameData::Initialize walks it).
++pub fn archive_data_start(g: &mut dyn Guest, archive: u32) -> Option<u32> {
++    if archive == 0 {
++        return None;
++    }
++    let a = g.r32(archive.wrapping_add(4))?;
++    if a == 0 {
++        return None;
++    }
++    let b = g.r32(a.wrapping_add(112))?;
++    if b == 0 {
++        return None;
++    }
++    Some(b.wrapping_add(32))
++}
++
++pub fn gamedata_start(g: &mut dyn Guest) -> Option<u32> {
++    let arch = g.r32(GAMEDATA_ARCHIVE)?;
++    archive_data_start(g, arch)
++}
++
++/// the placement file in memory now: (its name, its data start).
++pub fn dispos_now(g: &mut dyn Guest) -> Option<(String, u32)> {
++    let obj = g.r32(DISPOS_OBJECT)?;
++    if obj == 0 {
++        return None;
++    }
++    let mut name = [0u8; 16];
++    if !g.readable(obj, 16) {
++        return None;
++    }
++    g.read(obj, &mut name);
++    let end = name.iter().position(|&b| b == 0).unwrap_or(16);
++    let name = String::from_utf8_lossy(&name[..end]).into_owned();
++    let arch = g.r32(obj.wrapping_add(16))?;
++    Some((name, archive_data_start(g, arch)?))
++}
++
++/// `GameConfigData` (`*0x006DA0F8`), whose word at +4 `StartFromBeginning` changes.
++pub const GAME_CONFIG: u32 = 0x006D_A0F8;
++
++/// Watches for the New Game mode pick: the frame in which `GameConfigData`'s word at +4
++/// changes while its byte at +0xB stays 1. Robot runs of round 50 (docs/RANDOMIZER_INGAME.md,
++/// T1): a new game (Casual) changes the word at frame 4019 of the recorded route with +0xB
++/// still 1; loading a save changes the same word in the same frame as +0xB goes to 0.
++#[derive(Debug, Default)]
++pub struct NewGameWatch {
++    last: Option<(u32, u8)>,
++}
++
++impl NewGameWatch {
++    /// call once after every frame; true in the frame the mode was picked.
++    pub fn after_frame(&mut self, g: &mut dyn Guest) -> bool {
++        let now = g.r32(GAME_CONFIG).filter(|&c| c != 0).and_then(|c| {
++            let w = g.r32(c.wrapping_add(4))?;
++            let mut b = [0u8; 1];
++            if !g.readable(c.wrapping_add(0xB), 1) {
++                return None;
++            }
++            g.read(c.wrapping_add(0xB), &mut b);
++            Some((w, b[0]))
++        });
++        let fired = matches!((self.last, now), (Some((w0, _)), Some((w1, 1))) if w0 != w1);
++        self.last = now;
++        fired
++    }
++}
++
++/// Checks every cell of one file (all or nothing) and writes them. `revert` writes the
++/// original values back (the guard then expects the new ones). Returns the cells written,
++/// or the cells that did not match (nothing written).
++pub fn apply_file(g: &mut dyn Guest, f: &FilePatch, base: u32, gd_base: u32, revert: bool)
++    -> Result<usize, Vec<String>>
++{
++    let mut bad = Vec::new();
++    for v in &f.values {
++        let want = if revert { &v.new } else { &v.old };
++        let addr = base.wrapping_add(v.off);
++        let mut cur = vec![0u8; want.len()];
++        if !g.readable(addr, want.len() as u32) {
++            bad.push(format!("{}: v {:#x} unreadable", f.rel, v.off));
++            continue;
++        }
++        g.read(addr, &mut cur);
++        if &cur != want {
++            bad.push(format!("{}: v {:#x} holds {:02x?}, expected {:02x?}", f.rel, v.off, cur, want));
++        }
++    }
++    for p in &f.ptrs {
++        let want = if revert { &p.new } else { &p.old };
++        let Some(cur) = g.r32(base.wrapping_add(p.off)) else {
++            bad.push(format!("{}: p {:#x} unreadable", f.rel, p.off));
++            continue;
++        };
++        let ok = match want {
++            None => cur == 0,
++            Some(label) => cur != 0 && g.cstr(cur, 256).as_ref() == Some(label),
++        };
++        if !ok {
++            bad.push(format!("{}: p {:#x} does not show the expected label", f.rel, p.off));
++        }
++    }
++    // the new labels must be where the patch says, before any pointer is aimed at them
++    for p in &f.ptrs {
++        let (label, value) = if revert {
++            (&p.old, p.old_value.map(|o| base.wrapping_add(o)))
++        } else {
++            (&p.new, p.target.map(|(w, o)| match w { Where::GameData => gd_base, Where::Own => base }.wrapping_add(o)))
++        };
++        if let (Some(label), Some(addr)) = (label, value) {
++            if g.cstr(addr, 256).as_ref() != Some(label) {
++                bad.push(format!("{}: p {:#x}: the label is not at {addr:#010x}", f.rel, p.off));
++            }
++        }
++    }
++    if !bad.is_empty() {
++        return Err(bad);
++    }
++    for v in &f.values {
++        g.write(base.wrapping_add(v.off), if revert { &v.old } else { &v.new });
++    }
++    for p in &f.ptrs {
++        let value = if revert {
++            p.old_value.map_or(0, |o| base.wrapping_add(o))
++        } else {
++            p.target.map_or(0, |(w, o)| match w { Where::GameData => gd_base, Where::Own => base }.wrapping_add(o))
++        };
++        g.write(base.wrapping_add(p.off), &value.to_le_bytes());
++    }
++    Ok(f.values.len() + f.ptrs.len())
++}
++
++/// One randomized game in this session: its patch, and what of it is in memory now.
++#[derive(Debug)]
++pub struct Run {
++    pub patch: Patch,
++    pub id: String,
++    gamedata_at: Option<u32>,
++    /// (placement name, data start) already laid, so a file is laid once per load
++    dispos_done: HashSet<(String, u32)>,
++    pub notices: Vec<String>,
++}
++
++impl Run {
++    pub fn new(patch: Patch, id: impl Into<String>) -> Run {
++        Run { patch, id: id.into(), gamedata_at: None, dispos_done: HashSet::new(), notices: vec![] }
++    }
++
++    pub fn gamedata_applied(&self) -> bool {
++        self.gamedata_at.is_some()
++    }
++
++    /// lays the GameData cells (Start game with Randomizer on, or a randomized save loaded).
++    pub fn apply_gamedata(&mut self, g: &mut dyn Guest) -> Result<usize, Vec<String>> {
++        if self.gamedata_at.is_some() {
++            return Ok(0);
++        }
++        let base = gamedata_start(g).ok_or_else(|| vec!["GameData is not loaded".to_string()])?;
++        let n = match self.patch.gamedata() {
++            Some(f) => apply_file(g, f, base, base, false)?,
++            None => 0,
++        };
++        self.gamedata_at = Some(base);
++        Ok(n)
++    }
++
++    /// puts GameData back as the original (title screen, a save of the original game loaded).
++    pub fn revert_gamedata(&mut self, g: &mut dyn Guest) -> Result<usize, Vec<String>> {
++        let Some(base) = self.gamedata_at else { return Ok(0) };
++        let n = match self.patch.gamedata() {
++            Some(f) => apply_file(g, f, base, base, true)?,
++            None => 0,
++        };
++        self.gamedata_at = None;
++        self.dispos_done.clear();
++        Ok(n)
++    }
++
++    /// called after each frame while the run is active: lays the chapter placements the
++    /// game has just loaded. A file whose guard fails keeps the original placements (a
++    /// notice says so).
++    pub fn after_frame(&mut self, g: &mut dyn Guest) -> Option<usize> {
++        let gd = self.gamedata_at?;
++        let (name, base) = dispos_now(g)?;
++        if self.dispos_done.contains(&(name.clone(), base)) {
++            return None;
++        }
++        self.dispos_done.insert((name.clone(), base));
++        let f = self.patch.dispos(&name)?;
++        match apply_file(g, f, base, gd, false) {
++            Ok(n) => Some(n),
++            Err(bad) => {
++                self.notices.push(format!("{name}: placements kept original ({} cells differ, first: {})",
++                                          bad.len(), bad[0]));
++                None
++            }
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- side files
++
++/// `<data>/rando/<TITLE>/slots/` (the run each randomized save belongs to).
++pub fn slots_dir(data: &Path) -> PathBuf {
++    data.join("rando").join(format!("{TITLE:016X}")).join("slots")
++}
++
++/// a save file's name as the game opens it ("data:/Chapter0", "ext:/Map0.bak") ->
++/// the side file's name ("Chapter0.json"); None for files that are not per-slot saves.
++pub fn slot_name(save: &str) -> Option<String> {
++    let last = save.rsplit(['/', '\\', ':']).next()?;
++    let ok = matches!(last, "Chapter0" | "Chapter1" | "Chapter2" | "Map0.bak" | "Map1.bak");
++    ok.then(|| format!("{last}.json"))
++}
++
++/// the game wrote a save: with an active run its side file names the run, without one it
++/// is removed (that slot is the original game now).
++pub fn slot_written(data: &Path, save: &str, run: Option<&str>) -> io::Result<()> {
++    let Some(name) = slot_name(save) else { return Ok(()) };
++    let dir = slots_dir(data);
++    let path = dir.join(&name);
++    match run {
++        Some(id) => {
++            fs::create_dir_all(&dir)?;
++            let tmp = dir.join(format!("{name}.tmp"));
++            let id = id.replace('\\', "\\\\").replace('"', "\\\"");
++            fs::write(&tmp, format!("{{\"format\": {FORMAT}, \"run\": \"{id}\", \"save\": \"{name}\"}}\n"))?;
++            fs::rename(&tmp, &path)
++        }
++        None => match fs::remove_file(&path) {
++            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
++            _ => Ok(()),
++        },
++    }
++}
++
++/// the run a save belongs to (None = the original game).
++pub fn slot_run(data: &Path, save: &str) -> Option<String> {
++    let text = fs::read_to_string(slots_dir(data).join(slot_name(save)?)).ok()?;
++    let at = text.find("\"run\"")?;
++    let rest = &text[at + 5..];
++    let start = rest.find('"')? + 1;
++    let mut out = String::new();
++    let mut esc = false;
++    for c in rest[start..].chars() {
++        match (esc, c) {
++            (true, c) => { out.push(c); esc = false; }
++            (false, '\\') => esc = true,
++            (false, '"') => return Some(out),
++            (false, c) => out.push(c),
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    /// guest memory made of a few blocks
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++        writes: usize,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++        fn u32_at(&mut self, addr: u32) -> u32 {
++            self.r32(addr).unwrap()
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++            self.writes += 1;
++        }
++    }
++
++    const GD_FILE: u32 = 0x3000_0000; // GameData's file buffer (data start = +32)
++    const GD: u32 = GD_FILE + 32;
++    const DP_FILE: u32 = 0x3800_0000;
++    const DP: u32 = DP_FILE + 32;
++
++    /// a game with GameData loaded (a value at +0x10, labels "JID_A" at +0x100 and
++    /// "JID_B" at +0x110) and placement file "A005" (pointer at +0x8 to its own "JID_A"
++    /// at +0x40, an item byte at +0xC, a null pointer at +0x10)
++    fn game() -> Fake {
++        let mut m = Fake::default();
++        let mut gd = vec![0u8; 0x200];
++        gd[32 + 0x10] = 7;
++        gd[32 + 0x100..32 + 0x106].copy_from_slice(b"JID_A\0");
++        gd[32 + 0x110..32 + 0x116].copy_from_slice(b"JID_B\0");
++        m.put(GD_FILE, &gd);
++        // ArchiveFile objects: [+4] -> X, [X+112] -> file buffer
++        let mut arch = vec![0u8; 8];
++        arch[4..8].copy_from_slice(&0x2000_0100u32.to_le_bytes());
++        m.put(0x2000_0000, &arch);
++        let mut x = vec![0u8; 120];
++        x[112..116].copy_from_slice(&GD_FILE.to_le_bytes());
++        m.put(0x2000_0100, &x);
++        m.put(GAMEDATA_ARCHIVE, &0x2000_0000u32.to_le_bytes());
++        let mut dp = vec![0u8; 0x80];
++        dp[32 + 0x8..32 + 0xC].copy_from_slice(&(DP + 0x40).to_le_bytes());
++        dp[32 + 0xC] = 3;
++        dp[32 + 0x40..32 + 0x46].copy_from_slice(b"JID_A\0");
++        m.put(DP_FILE, &dp);
++        let mut darch = vec![0u8; 8];
++        darch[4..8].copy_from_slice(&0x2100_0100u32.to_le_bytes());
++        m.put(0x2100_0000, &darch);
++        let mut dx = vec![0u8; 120];
++        dx[112..116].copy_from_slice(&DP_FILE.to_le_bytes());
++        m.put(0x2100_0100, &dx);
++        let mut obj = vec![0u8; 24];
++        obj[..4].copy_from_slice(b"A005");
++        obj[16..20].copy_from_slice(&0x2100_0000u32.to_le_bytes());
++        m.put(0x2200_0000, &obj);
++        m.put(DISPOS_OBJECT, &0x2200_0000u32.to_le_bytes());
++        m
++    }
++
++    const PATCH: &str = "fates-rando-patch 1\nseed r50test\noptions {}\ngamedata-sha256 00\n\
++file gamedata GameData/GameData.bin.lz\nv 10 07 09\n\
++file dispos GameData/Dispos/A/A005.bin.lz\nv c 03 05\np 8 4a49445f41 4a49445f42 g 110 40\n\
++p 10 - 4a49445f41 g 100 -\nend 4\n";
++
++    #[test]
++    fn parse_reads_every_cell() {
++        let p = Patch::parse(PATCH).unwrap();
++        assert_eq!(p.seed, "r50test");
++        assert_eq!(p.files.len(), 2);
++        assert_eq!(p.gamedata().unwrap().values, vec![Value { off: 0x10, old: vec![7], new: vec![9] }]);
++        let d = p.dispos("A005").unwrap();
++        assert_eq!(d.ptrs[0].target, Some((Where::GameData, 0x110)));
++        assert_eq!(d.ptrs[0].old_value, Some(0x40));
++        assert_eq!(d.ptrs[1].old, None);
++        assert!(p.dispos("A/A005.bin").is_some());
++        assert!(p.dispos("A006").is_none());
++        assert!(p.dispos("").is_none());
++    }
++
++    #[test]
++    fn parse_refuses_broken_files() {
++        for bad in ["", "fates-rando-patch 2\nend 0\n", "fates-rando-patch 1\nseed x\n",
++                    "fates-rando-patch 1\nv 0 00 01\nend 1\n",
++                    "fates-rando-patch 1\nfile gamedata g\nv 0 00 0101\nend 1\n",
++                    "fates-rando-patch 1\nfile gamedata g\nv 0 00 01\nend 2\n",
++                    "fates-rando-patch 1\nfile dispos d\np 2 - 41 g 0 -\nend 1\n",
++                    "fates-rando-patch 1\nfile dispos d\np 4 - 41 - - -\nend 1\n",
++                    "fates-rando-patch 1\nfile other x\nend 0\n",
++                    "fates-rando-patch 1\nend 0\nv 0 00 01\n"] {
++            assert!(Patch::parse(bad).is_err(), "{bad:?}");
++        }
++    }
++
++    #[test]
++    fn finds_gamedata_and_placements() {
++        let mut m = game();
++        assert_eq!(gamedata_start(&mut m), Some(GD));
++        assert_eq!(dispos_now(&mut m), Some(("A005".to_string(), DP)));
++        let mut empty = Fake::default();
++        assert_eq!(gamedata_start(&mut empty), None);
++        assert_eq!(dispos_now(&mut empty), None);
++    }
++
++    #[test]
++    fn apply_then_revert_gives_back_the_original() {
++        let mut m = game();
++        let before = m.blocks.clone();
++        let mut run = Run::new(Patch::parse(PATCH).unwrap(), "r50test");
++        assert_eq!(run.apply_gamedata(&mut m), Ok(1));
++        assert_eq!(m.blocks[&GD_FILE][32 + 0x10], 9);
++        assert_eq!(run.after_frame(&mut m), Some(3));
++        assert_eq!(m.blocks[&DP_FILE][32 + 0xC], 5);
++        assert_eq!(m.u32_at(DP + 0x8), GD + 0x110);
++        let p8 = m.u32_at(DP + 0x8);
++        assert_eq!(m.cstr(p8, 64).unwrap(), b"JID_B");
++        assert_eq!(m.u32_at(DP + 0x10), GD + 0x100);
++        assert_eq!(run.after_frame(&mut m), None, "a file is laid once per load");
++        let f = run.patch.dispos("A005").unwrap().clone();
++        assert_eq!(apply_file(&mut m, &f, DP, GD, true), Ok(3));
++        assert_eq!(run.revert_gamedata(&mut m), Ok(1));
++        assert_eq!(m.blocks, before);
++    }
++
++    #[test]
++    fn guard_refuses_and_writes_nothing() {
++        let mut m = game();
++        m.blocks.get_mut(&GD_FILE).unwrap()[32 + 0x10] = 8; // another mod changed the cell
++        let before = m.blocks.clone();
++        let mut run = Run::new(Patch::parse(PATCH).unwrap(), "x");
++        assert!(run.apply_gamedata(&mut m).is_err());
++        assert!(!run.gamedata_applied());
++        assert_eq!(run.after_frame(&mut m), None, "no placements without GameData");
++        assert_eq!(m.writes, 0);
++        assert_eq!(m.blocks, before);
++    }
++
++    #[test]
++    fn placement_guard_keeps_the_original_and_says_so() {
++        let mut m = game();
++        m.blocks.get_mut(&DP_FILE).unwrap()[32 + 0x40..32 + 0x45].copy_from_slice(b"JID_Z");
++        let mut run = Run::new(Patch::parse(PATCH).unwrap(), "x");
++        run.apply_gamedata(&mut m).unwrap();
++        let writes = m.writes;
++        assert_eq!(run.after_frame(&mut m), None);
++        assert_eq!(m.writes, writes);
++        assert_eq!(run.notices.len(), 1);
++    }
++
++    #[test]
++    fn a_new_load_of_the_same_file_is_laid_again() {
++        let mut m = game();
++        let mut run = Run::new(Patch::parse(PATCH).unwrap(), "x");
++        run.apply_gamedata(&mut m).unwrap();
++        assert_eq!(run.after_frame(&mut m), Some(3));
++        // the game loads A005 again into a new buffer (a restart of the chapter)
++        let mut dp = m.blocks[&DP_FILE].clone();
++        dp[32 + 0x8..32 + 0xC].copy_from_slice(&(0x3900_0020u32 + 0x40).to_le_bytes());
++        dp[32 + 0xC] = 3;
++        dp[32 + 0x10..32 + 0x14].fill(0);
++        m.put(0x3900_0000, &dp);
++        m.blocks.get_mut(&0x2100_0100).unwrap()[112..116].copy_from_slice(&0x3900_0000u32.to_le_bytes());
++        assert_eq!(run.after_frame(&mut m), Some(3));
++        assert_eq!(m.blocks[&0x3900_0000][32 + 0xC], 5);
++    }
++
++    #[test]
++    fn off_reads_and_writes_nothing() {
++        // no Run = no call into this module at all; a Run whose patch has no files only reads
++        let mut m = game();
++        let p = Patch::parse("fates-rando-patch 1\nseed s\nend 0\n").unwrap();
++        let mut run = Run::new(p, "s");
++        assert_eq!(run.apply_gamedata(&mut m), Ok(0));
++        assert_eq!(run.after_frame(&mut m), None);
++        assert_eq!(m.writes, 0);
++    }
++
++    /// a patch made by `rando.py make --patch-out` (game data: never kept in the repo), when
++    /// FEF_RANDO_PATCH names one; skipped otherwise.
++    #[test]
++    fn parses_a_made_patch() {
++        let Ok(path) = std::env::var("FEF_RANDO_PATCH") else { return };
++        let text = fs::read_to_string(&path).unwrap();
++        let p = Patch::parse(&text).unwrap();
++        let cells: usize = p.files.iter().map(|f| f.values.len() + f.ptrs.len()).sum();
++        let end: usize = text.lines().last().unwrap()[4..].parse().unwrap();
++        assert_eq!(cells, end);
++        assert!(p.gamedata().is_some());
++        for f in p.files.iter().filter(|f| f.kind == Kind::Dispos) {
++            assert!(p.dispos(stem(&f.rel)).is_some(), "{}", f.rel);
++        }
++        eprintln!("{path}: {} files, {cells} cells", p.files.len());
++    }
++
++    #[test]
++    fn new_game_watch_fires_once_on_the_pick_and_not_on_a_load() {
++        let mut m = Fake::default();
++        let cfg = |w: u32, b: u8| {
++            let mut v = vec![0u8; 16];
++            v[4..8].copy_from_slice(&w.to_le_bytes());
++            v[0xB] = b;
++            v
++        };
++        m.put(GAME_CONFIG, &0x2300_0000u32.to_le_bytes());
++        m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
++        let mut w = NewGameWatch::default();
++        assert!(!w.after_frame(&mut m), "first look only remembers");
++        assert!(!w.after_frame(&mut m));
++        m.put(0x2300_0000, &cfg(0x4001_5EDE, 1)); // new game (frame 4019 of bt-prologue)
++        assert!(w.after_frame(&mut m));
++        assert!(!w.after_frame(&mut m));
++        m.put(0x2300_0000, &cfg(0x4001_5EDE, 0)); // the chapter starts later
++        assert!(!w.after_frame(&mut m));
++        let mut w = NewGameWatch::default();
++        m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
++        w.after_frame(&mut m);
++        m.put(0x2300_0000, &cfg(0x4001_5EDE, 0)); // a save loaded (frame 2839 of bt-ch2)
++        assert!(!w.after_frame(&mut m));
++    }
++
++    #[test]
++    fn side_files_follow_the_saves() {
++        let top = std::env::temp_dir().join(format!("fates_rando_test_{}", std::process::id()));
++        let _ = fs::remove_dir_all(&top);
++        assert_eq!(slot_name("data:/Chapter1").as_deref(), Some("Chapter1.json"));
++        assert_eq!(slot_name("ext:/Map0.bak").as_deref(), Some("Map0.bak.json"));
++        assert_eq!(slot_name("data:/Global"), None);
++        slot_written(&top, "data:/Chapter0", Some("r50\"x")).unwrap();
++        assert_eq!(slot_run(&top, "data:/Chapter0").as_deref(), Some("r50\"x"));
++        assert_eq!(slot_run(&top, "data:/Chapter1"), None);
++        slot_written(&top, "data:/Global", Some("r50")).unwrap();
++        assert!(!slots_dir(&top).join("Global.json").exists());
++        slot_written(&top, "data:/Chapter0", None).unwrap();
++        assert_eq!(slot_run(&top, "data:/Chapter0"), None);
++        slot_written(&top, "data:/Chapter0", None).unwrap(); // removing twice is fine
++        assert!(slots_dir(&top).ends_with("rando/0004000000179800/slots"));
++        let _ = fs::remove_dir_all(&top);
++    }
++}
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index dbd1424..dccb653 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -4,6 +4,7 @@
+ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
++pub mod fates_rando;
+ pub mod game_ui;
+ pub mod cro;
+ pub mod download_play;

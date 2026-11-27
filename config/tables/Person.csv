@@ -1,0 +1,44 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,8,flags64:PersonFlag,flags,high,Person::IsFemale/IsPlayer/IsBond/IsCapture/IsDownload (0053ED90.. 0053DFEC) test the u64 at +0x0 against 1<<n for n = PrivateSkill::Get("SPID_..") (SPID_女性/プレイヤー/絆/捕獲/ダウンロード),
+0x08,4,str:self,pid,high,record label = this string in every record; Person::Get(const char*) looks persons up by PID_,
+0x0C,4,str,fid,high,Person::GetCaptureChange 0053E1BC reads +0xC and skips 4 chars (FID_ prefix); data: FID_ face IDs,
+0x10,4,str,aid,medium,data: AID_ asset (model) IDs; Paragon FE14 Person.yml 'aid' (fact),
+0x14,4,str,mpid_name,high,Person::GetNameWithCaptureNameIndex 0053E2D0 reads +0x14 (MPID_ message ID of the name),
+0x18,4,str,mpid_help,high,Person::GetHelp 0053ECD0 reads +0x18 (MPID_H_ description message),
+0x1C,4,ptr,attack_stance_bonus,high,Unit::GetDualSupport 0052E974 reads Person+0x1C (Attack Stance support bonus block; Paragon: 5 support ranks x 4 bytes),
+0x20,4,ptr,guard_stance_bonus,high,Unit::GetDoubleCapability 00530A34 reads Person+0x20 (Guard Stance support bonus block; Paragon: 5 ranks x 8 bytes),
+0x24,2,u16,pid_number,high,Person::Get(unsigned short) 0044A6F8: index = number - (first record +0x24); GameData persons are 0..254; chapter files start at 0x7A00,
+0x26,1,u8,support_route,low,Unit::AddChapterReliance reads +0x26 (u8); Paragon 'support_route' (fact),
+0x27,1,ref8:Belong,belong,high,Unit::CreateImpl 003D3954 reads Person+0x27 (u8) for the unit's army; values < Belong count,
+0x28,2,u16,replace_index,low,read by map::Dispos::Data::CalculateImpl/Unit::Handover/Unit::CreateImpl2 (u16); data 0..0x26; Paragon 'replacing' (fact),
+0x2A,2,u16,family_index,medium,unit::Family::GetGrow / ParentSingle::GetGrow / Person::GetRelianceRecollection* compare +0x2A (u16) to find parents and siblings; Unit::GetGrow 005330B4 averages the unit's growth with the parent's (unit::Family::GetGrow) when +0x2A != 0 and the parent exists; Paragon 'parent' (fact),
+0x2C,2,ref16:Job,job,high,Person::GetLowJobIndex 0053E198 returns +0x2C (or +0x2E when Job::IsHigh); Unit::CreateImpl reads +0x2C,
+0x2E,2,ref16:Job,job_low,high,Person::GetLowJobIndex returns +0x2E when the class at +0x2C is promoted (base class for reclassing),
+0x30,2,s16,support_id,low,data -1 in 1806 records; Paragon 'support_id' (fact),
+0x32,1,u8,level,high,Unit::CreateImpl reads Person+0x32 (u8) as the starting level,
+0x33,1,s8,internal_level,high,Unit::CreateImpl 003D3954 stores +0x33 (s8) in Unit+0x12F (levels gained before promotion); -1 means 0 for an unpromoted class and 20 for a promoted one; Paragon 'internal_level' (fact),
+0x34,1,u8,unit_kind,high,growth source: Unit::GetGrow 005330B4 and Unit::CaclulateAutoGrowCapability 00532880 add Job.growth (+0x24) when +0x34 == 1 and Job.enemy_growth (+0x2C) otherwise; Unit::CaclulateAutoGrowCapability 00532880 gives automatic level-based stats only when +0x34 == 0 (generic units); Person::GetCaptureChange tests == 1; values 0-3; Paragon 'enemy_flag' (fact),
+0x35,1,u8,autolevel_rank,high,"Unit::CreateImpl 003D3954: when the scenario rank (GameUserData+0x30; the ScenarioRankGet script command and spot::Data::GetRank read it) is above this value and this is non-zero, the new unit gets (rank - this) extra level-ups (Unit::CollectiveLevelUpCapability); 0 = never; WAS part of unknown_35 (u8[3])",
+0x36,1,s8,normal_extra_levels,high,Unit::CaclulateAutoGrowCapability 00532880 adds +0x36 (s8) to the automatic level count on difficulty 0 (GameUserData+0x2D; Normal); data -5..0; WAS part of unknown_35,
+0x37,1,s8,lunatic_extra_levels,high,Unit::CaclulateAutoGrowCapability 00532880 adds +0x37 (s8) to the automatic level count on difficulty 2 (Lunatic); data 0..10; WAS part of unknown_35,
+0x38,8,s8[8],base,high,Unit::GetMHPImpl/GetStrImpl/GetPowImpl/GetTechImpl/GetQuickImpl/GetLuckImpl/GetDefImpl/GetMdefImpl read Person+0x38..+0x3F (s8) in that order,hp|str|mag|skl|spd|lck|def|res
+0x40,8,s8[8],growth,high,Unit::GetGrow(int) 005330B4 (Person.growth + Job.growth or Job.enemy_growth; +10 with one equipped skill) and Unit::CaclulateAutoGrowCapability 00532880 read Person+0x40[i] (s8); plain values (multiples of 5) - Fates does not obfuscate them,hp|str|mag|skl|spd|lck|def|res
+0x48,8,s8[8],limit_mod,high,Unit::GetLimit(int) 005337F0 adds Person+0x48[i] to Job+0x34[i] (maximum-stat modifier),hp|str|mag|skl|spd|lck|def|res
+0x50,8,s8[8],normal_mod,high,Unit::CaclulateAutoGrowCapability 00532880 adds Person+0x50[i] (s8) to the unit's created stats on difficulty 0 (GameUserData+0x2D; Normal); data almost all <= 0; Paragon calls it 'penalties' (fact); WAS named stat_mod_50,hp|str|mag|skl|spd|lck|def|res
+0x58,8,s8[8],lunatic_mod,high,Unit::CaclulateAutoGrowCapability 00532880 adds Person+0x58[i] (s8) to the unit's created stats on difficulty 2 (Lunatic) (from the disassembly: the evidence walk misses this branch); data almost all >= 0; Paragon calls it 'bonuses' (fact); WAS named stat_mod_58,hp|str|mag|skl|spd|lck|def|res
+0x60,8,u8[8],weapon_exp,medium,Unit::CaclulateFirstWeaponExp and CollectiveLevelUpCapability read Person+0x60[i] (u8); order from Paragon (fact),sword|lance|axe|dagger|bow|tome|staff|stone
+0x68,10,ref16:Skill[5],skill,high,Unit::CreateImpl 003D3954 reads +0x68+2i (s16) for i = 0..4 and adds EquipSkill::Get(short) as an equipped skill when skill_mask allows it; Paragon skill_1..5 (fact),1|2|3|4|5
+0x72,2,u16,skill_mask,high,Unit::CreateImpl 003D3954: skill i (+0x68) is given only when bit (3*i + difficulty) of +0x72 (u16) is set (difficulty = GameUserData+0x2D); 0x7FFF = every skill on every difficulty; Paragon 'skill_flags' (fact),
+0x74,6,ref16:Skill[3],personal_skill,high,Unit::IsEquipSkill 0052DD04 reads +0x74 + 2*difficulty (GameUserData+0x2D) as the unit's personal skill; Paragon normal/hard/lunatic (fact),normal|hard|lunatic
+0x7A,2,u8[2],birthday,low,data month/day pairs; Paragon 'birthday' (fact),month|day
+0x7C,4,ref16:Job[2],reclass,medium,data: Job indexes (0 = none); Paragon reclass_1/2 (fact),1|2
+0x80,2,u16,parent_id,low,data 0xFFFF in most records; Paragon 'parent_id' (fact),
+0x82,2,u16,child_id,low,data 0xFFFF in most records; Paragon 'child_id' (fact),
+0x84,2,u16,support_index,low,data 0xFFFF or 0x8E9..; Paragon 'support_index' (fact),
+0x86,1,s8,level_cap,high,Unit::CreateImpl stores +0x86 in Unit+0x130; Unit::GetLimitLevel 0052E5EC = Job::GetLimitLevel + Unit+0x130 * step for promoted or special classes (pre-applied level-limit extensions; not a level cap by itself); Unit::LevelUp reads it; Paragon 'level_cap' (fact),
+0x87,1,u8,body_type,low,data 0xFF in most records; Paragon 'body_type' (fact),
+0x88,4,str,combat_music,medium,data: BGM cue names; Paragon (fact),
+0x8C,4,str,voice,medium,data: voice set names; Paragon (fact),
+0x90,2,ref16:Item,recruit_weapon,low,data: Item indexes in 4 records; Paragon 'recruit_equip_weapon' (fact),
+0x92,2,ref16:Item,shop_item,low,data: Item indexes in 4 records; Paragon 'special_shop_item' (fact),
+0x94,4,pad,pad_94,high,zero in every record of every Person file,

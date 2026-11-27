@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x0,2,u16,hearts,medium,"File declares the heart count that unlocks it"
+0x2,1,u8,kind,medium,"File declares the kind (0..4 in data)"
+0x3,1,u8,scene_chance,medium,"File declares a scene chance"
+0x4,4,str,dialog,medium,"File declares the dialog message label (MKID_...)"

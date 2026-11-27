@@ -1,0 +1,12 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,position,medium,"File declares the position name"
+0x4,4,str,direction,medium,"File declares the facing name"
+0x8,4,str,motion,medium,"File declares the motion name"
+0xC,4,str,idle_motion,medium,"File declares the idle motion name"
+0x10,4,str,random_motion,medium,"File declares the random motion name"
+0x14,2,u16,max_frequency,medium,"File declares the highest frequency"
+0x16,2,u16,min_frequency,medium,"File declares the lowest frequency"
+0x18,4,str,face,medium,"File declares the facial expression"
+0x1C,4,str,invite_motion,medium,"File declares the motion when invited"
+0x20,4,str,invite_motion_2,medium,"File declares the second motion when invited"
+0x24,4,u32,flags,medium,"File declares flags"

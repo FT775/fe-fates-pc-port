@@ -1,0 +1,9 @@
+offset,size,type,name,confidence,evidence
+0x00,4,ptr:AchieveBonusRoute,route_list,high,AchieveBonus::Initialize 001A8114 stores header+0x0; AchieveBonus::GetRoute 001A8134 returns it; castle::AchieveBonusMenuItem::Draw reads +0x0 (list)
+0x04,4,u32,route_count,high,castle::CastleAchieveBonus::CastleAchieveBonus 0045BE70 reads +0x4 of AchieveBonus::GetRoute (entry count); AchieveBonusMenuItem::Draw bounds the index with it
+0x08,4,ptr:AchieveBonusBattle,battle_list,high,AchieveBonus::Initialize 001A8114 stores header+0x8; AchieveBonus::GetBattle 001A8154 returns it; castle::AchieveBonusMenuItem::Draw reads +0x0 (list)
+0x0C,4,u32,battle_count,high,castle::CastleAchieveBonus::CastleAchieveBonus 0045BE70 reads +0x4 of AchieveBonus::GetBattle (entry count); AchieveBonusMenuItem::Draw bounds the index with it
+0x10,4,ptr:AchieveBonusVisit,visit_list,high,AchieveBonus::Initialize 001A8114 stores header+0x10; AchieveBonus::GetVisit 001A8144 returns it; castle::AchieveBonusMenuItem::Draw reads +0x0 (list)
+0x14,4,u32,visit_count,high,castle::CastleAchieveBonus::CastleAchieveBonus 0045BE70 reads +0x4 of AchieveBonus::GetVisit (entry count); AchieveBonusMenuItem::Draw bounds the index with it
+0x18,4,ptr:AchieveBonusList4,list4_list,high,AchieveBonus::Initialize stores header+0x18 (no named getter reads it)
+0x1C,4,u32,list4_count,medium,data: entry count of list 4 (the list ends where the next block starts)

@@ -1,0 +1,158 @@
+{
+ "about": "The smoke set (tools/harness/smoke.py, docs/harness/SMOKE.md): the Vanilla+ set since round 84 (F-072): 6 robot jobs (Birthright, Conquest and Revelation, each randomizer off and everything-on all1 re-made with today's code) plus the randomizer-off memory compare of the installed game exe (round 62b's: boot, frames 3000/4600/5200, end). The Seal edition's 2 jobs are config/seal/smoke_set.json. Inputs are COPIES in fixtures_dir (git-ignored), each with its sha256; no game values here.",
+ "version": 1,
+ "fixtures_dir": "build/fixtures/smoke",
+ "rom": "found and checked by tools/paths.find_rom (roms/, full check against config/game.json, cached in build/rom_check.json)",
+ "baseline": "config/harness/smoke_baseline.json",
+ "inputs": {
+  "robot-boot-server": {
+   "file": "robot/boot-server.exe",
+   "src": "engine/target/zakuro-server/release/boot-server.exe",
+   "sha256": "ee5ec22ecd0ac10393c4ca560c6413042f8722b0cd5898f9452aa963117dc2df",
+   "about": "installed boot-server (round 82b, F-069; round 81b's 90e5638a in build/backup/*.2026-11-26-pre-r82b)"
+  },
+  "robot-capture-lib": {
+   "file": "robot/0004000000179800.dll",
+   "src": "build/harness/lib/0004000000179800.dll",
+   "sha256": "405f2bac2f383fed116a39e64c460345c711f1519b6c154016015e62645d50fb",
+   "about": "capture library (rebuilt 2026-11-24 with owner OK; old 610f791d in build/backup/*.2026-11-24-pre-caplib)"
+  },
+  "game-exe": {
+   "file": "game/Fire Emblem Fates.exe",
+   "src": "play/game/Fire Emblem Fates.exe",
+   "sha256": "3a47126912eebda23c584b3bcfd7c02befa08657edd09e9e0567caa3e7205bf9",
+   "about": "installed game exe (round 83, F-071; round 82b's 7ddae842 in build/backup/*.2026-11-26-pre-r83); run only as this copy, never play/game itself"
+  },
+  "save:bt-ch10-clear": {
+   "file": "saves/bt-ch10-clear.zip",
+   "src": "build/harness/saves/bt-ch10-clear.zip",
+   "sha256": "76ef35061bb9bc82c8cfd5f4861593ae847f6b3539c85f035a34282fc7b13224"
+  },
+  "save:cq-ch16-clear": {
+   "file": "saves/cq-ch16-clear.zip",
+   "src": "build/harness/saves/cq-ch16-clear.zip",
+   "sha256": "828a87c0d82128fb50da38735c95238dc65b3bc96fa2db1c7fed1ccf7f978b02"
+  },
+  "save:rv-ch11-clear": {
+   "file": "saves/rv-ch11-clear.zip",
+   "src": "build/harness/saves/rv-ch11-clear.zip",
+   "sha256": "c4a6b57b55b1cb80ea9263ddc574a5a7cbda21ee3a80f265717779a900172862"
+  },
+  "replay:new-game": {
+   "file": "replays/new-game.replay",
+   "src": "build/r58/assemble/new-game.replay",
+   "sha256": "131dc51842f14c91629ab767e82941b995c45c90dc32afeecdfeba6c67b25f36",
+   "about": "the memory compare's inputs (round 58 assemble)"
+  },
+  "answer:fates-all-1": {
+   "file": "answers/answer-fates-all-1.json",
+   "src": "build/r59/assemble/smoke/answer-fates-all-1.json",
+   "sha256": "b2f1f911fd456d5490de3c161cf41a0a861397c89b87b42d123b206d38a1d9e2",
+   "about": "round 59's answer, the base of the all1 recipe (both games)"
+  }
+ },
+ "robot": {
+  "server": "robot-boot-server",
+  "lib": "robot-capture-lib",
+  "server_timeout": 900
+ },
+ "runs": {
+  "fates-all1": {
+   "game": "fates",
+   "answer_base": "answer:fates-all-1",
+   "drop": [
+    "seed"
+   ],
+   "overlay": {
+    "class_move": "wide",
+    "weapon_traits": 50,
+    "wild_traits": true,
+    "enemy_upgrade": 50,
+    "enemy_drops": 25,
+    "enemy_growths": "scaling",
+    "enemy_buff": 20,
+    "class_growth_variance": 20,
+    "class_base_variance": 3,
+    "enemy_levels": 5,
+    "boss_stats": "linear",
+    "boss_max_boost": 10,
+    "boss_variance": 2,
+    "music": "maps+battles",
+    "shop_sides": "mixed",
+    "recruit": "route",
+    "recruit_class": "own",
+    "recruit_stats": "autolevel"
+   },
+   "seed": "r59fall1",
+   "expect_id": "r59fall1-37ec8c6e"
+  }
+ },
+ "jobs": [
+  {
+   "name": "bt-A011-off",
+   "game": "fates",
+   "chapter": "A011",
+   "base": "save:bt-ch10-clear",
+   "run": null,
+   "ref_run": "fates-all1"
+  },
+  {
+   "name": "bt-A011-all1",
+   "game": "fates",
+   "chapter": "A011",
+   "base": "save:bt-ch10-clear",
+   "run": "fates-all1"
+  },
+  {
+   "name": "cq-B016-off",
+   "game": "fates",
+   "chapter": "B016",
+   "base": "save:cq-ch16-clear",
+   "run": null,
+   "ref_run": "fates-all1"
+  },
+  {
+   "name": "cq-B016-all1",
+   "game": "fates",
+   "chapter": "B016",
+   "base": "save:cq-ch16-clear",
+   "run": "fates-all1"
+  },
+  {
+   "name": "rv-C012-off",
+   "game": "fates",
+   "chapter": "C012",
+   "base": "save:rv-ch11-clear",
+   "run": null,
+   "ref_run": "fates-all1"
+  },
+  {
+   "name": "rv-C012-all1",
+   "game": "fates",
+   "chapter": "C012",
+   "base": "save:rv-ch11-clear",
+   "run": "fates-all1"
+  }
+ ],
+ "memory": {
+  "name": "mem-off",
+  "exe": "game-exe",
+  "replay": "replay:new-game",
+  "frames": 5200,
+  "hash_at": [
+   3000,
+   4600,
+   5200
+  ],
+  "ranges": "0x08000000:0x6000000,0x14000000:0x8000000,0x30000000:0x8000000"
+ },
+ "timeouts": {
+  "make": 600,
+  "job": 480,
+  "memory": 300
+ },
+ "lanes": {
+  "default": 2,
+  "max": 6
+ }
+}

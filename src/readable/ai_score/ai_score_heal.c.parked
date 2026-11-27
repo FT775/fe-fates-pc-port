@@ -1,0 +1,62 @@
+/* AI attack-score readers, the heal side (Fates class Unit): how much a staff
+   heals. Plain-language description: docs/AI_SCORE.md section 5.
+
+   AIThink::GetEntrustHealRodScore asks Unit::GetRodHealPower for every heal it
+   weighs; the staff use on the map asks it too. The score function itself
+   stores (its out-pointers, the random generator) and is not here
+   (docs/AI_SCORE.md section 1).
+
+   A reader: it stores nothing of the game's. It fills two one-time caches the
+   first time (a skill and an item-skill flag found by name); its callees
+   Unit::GetWeaponExpLimit and Unit::GetPowImpl fill their own. The readable code
+   gives up while any of them is cold, before reading anything else. The one
+   store it makes is guest_call5's fifth argument word in the dead stack below sp
+   (docs/READABLE.md 17), where the game's own call puts the same word. Guest
+   calls left: the ones the game makes (ai_score.h), in the game's order
+   (docs/DECISIONS.md F-018).
+
+   Status: UNVERIFIED (below shadow-clean). Host differential test against the
+   original ARM code: src/readable/ai_score/tests/ai_score_diff.py. */
+
+#include "ai_score.h"
+
+/* How many hit points a staff heals:
+   the staff's base heal (its record's +0x1F)
+   + a third of the healer's magic (rounded toward zero) when the staff has the
+     item-skill flag "effect + magic / 3" (Unit::GetPowImpl with no item, extras
+     and loss on, rally kind 0)
+   + the staff rank bonus: the WeaponBonus row of the staff kind, signed byte at
+     2 x rank, the rank of the unit's staff exp capped at its staff exp limit
+   and, when the healed unit (target, may be 0) has the cached "absent-minded"
+   skill [low for the English], half again (rounded down).
+   Guest function: 0x0052F008 Unit::GetRodHealPower(const unit::Item*,const Unit*) const. */
+int32_t unit_rod_heal_power(Context *ctx, gaddr unit, gaddr item, gaddr target) {
+    if (!fe_static_ready(ctx, S_RodSkillGuard) || !fe_static_ready(ctx, S_RodMagicGuard) ||
+        !fe_static_ready(ctx, S_RodLimitGuardA) || !fe_static_ready(ctx, S_RodLimitGuardB) ||
+        !fe_static_ready(ctx, S_RodLimitGuardC) || !unit_stat_caches_ready(ctx, AS_STAT_MAG))
+        return (int32_t)fe_use_original(ctx);
+    gaddr record = guest_call1(ctx, AS_ItemToData, item);
+    int32_t heal = guest_u8(ctx, record + ITEM_HEAL);
+    uint64_t mask = guest_u64(ctx, S_RodMagicMask);
+    if (READ_FIELD(ctx, ItemData, record, flags) & mask) {
+        int32_t magic = (int32_t)guest_call5(ctx, AS_UnitGetPowImpl, unit, 0u, 1u, 1u, 0u);
+        heal = fe_add32(heal, magic / 3);
+    }
+
+    gaddr bonus = guest_call1(ctx, AS_WeaponBonusGet, STAFF_KIND);
+    int32_t exp = guest_u8(ctx, unit + UNIT_STAFF_EXP);
+    int32_t limit = (int32_t)guest_call2(ctx, AS_UnitGetWeaponExpLimit, unit, STAFF_KIND);
+    int32_t capped = limit < exp ? limit : exp;
+    gaddr levels = guest_call(ctx, AS_WeaponLevelGet, 0u, 0u, 0u, 0u);
+    int32_t rank = (int32_t)guest_call2(ctx, AS_WeaponLevelGetLevel, levels, (uint32_t)capped);
+    heal = fe_add32(heal, guest_s8(ctx, bonus + ((gaddr)rank << 1)));
+
+    if (target != 0 &&
+        guest_call2(ctx, AS_UnitIsEquipSkill, target, (uint32_t)(int32_t)guest_s16(ctx, S_RodSkill)) != 0)
+        heal = fe_add32(heal, fe_asr(heal, 1));
+    return heal;
+}
+
+RECOMP_OVERRIDE(0x0052F008) {
+    FE_ENTRY(0x0052F008, unit_rod_heal_power, FE_ARG(0), FE_ARG(1), FE_ARG(2));
+}

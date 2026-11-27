@@ -1,0 +1,215 @@
+{
+ "about": "Test lines of the FE options file parse, shared by the page (tools/zakuro-options patch 0002, fe_options::parse) and the readable library's reader (src/readable/core/options.c). expect = [danger_zone, hp_bars, animation_skip, anim_speed]. Checked by src/readable/menu/tests/w12_diff.py (--options). Made-up text only.",
+ "cases": [
+  {
+   "why": "patch 0002 test: the game lines take their list length",
+   "text": "danger_zone = 2\nhp_bars = 1\nanimation_skip = 1\nanim_speed = 3\n",
+   "expect": [
+    2,
+    1,
+    1,
+    3
+   ]
+  },
+  {
+   "why": "patch 0002 test: past the list, negative, a word, past the list: the game's choice",
+   "text": "danger_zone = 3\nhp_bars = -1\nanimation_skip = yes\nanim_speed = 4\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "patch 0001 test: a missing (empty) file is all off",
+   "text": "",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "patch 0002 render: the page's own file form",
+   "text": "# FE options. 0 is off, and off is the original game.\nstance_forecast = 0\ngrowth_display = 0\nvein_highlight = 0\ndanger_zone = 2\nhp_bars = 1\nanimation_skip = 1\nanim_speed = 3\ndual_strike = 0\ndual_guard = 0\ndeath_rule = 0\n",
+   "expect": [
+    2,
+    1,
+    1,
+    3
+   ]
+  },
+  {
+   "why": "patch 0002 test: slot blocks are not sections for parse; game lines read anywhere",
+   "text": "[slot 1]\ndanger_zone = 1\nanim_speed = 2\ndual_guard = 1\n",
+   "expect": [
+    1,
+    0,
+    0,
+    2
+   ]
+  },
+  {
+   "why": "the last of two equal keys wins",
+   "text": "danger_zone = 1\ndanger_zone = 2\n",
+   "expect": [
+    2,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "a bad last value wins too (it gives 0)",
+   "text": "anim_speed = 2\nanim_speed = x\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "u8 parse: one leading plus, leading zeros",
+   "text": "hp_bars = +2\nanim_speed = 003\n",
+   "expect": [
+    0,
+    2,
+    0,
+    3
+   ]
+  },
+  {
+   "why": "u8 parse: a lone plus, minus zero, empty, 256, a fullwidth digit",
+   "text": "danger_zone = +\nhp_bars = -0\nanimation_skip =\nanim_speed = 256\ndanger_zone = \uff11\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "no spaces, tabs, CRLF line ends",
+   "text": "danger_zone=1\r\n\thp_bars\t=\t2\t\r\n",
+   "expect": [
+    1,
+    2,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "Unicode white space is trimmed (NBSP, ideographic space)",
+   "text": "\u00a0anim_speed\u3000= 1\u00a0\n",
+   "expect": [
+    0,
+    0,
+    0,
+    1
+   ]
+  },
+  {
+   "why": "U+001C is not white space for Rust (it is for Python's strip)",
+   "text": "anim_speed = 1\u001c\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "a byte order mark stays part of the first key",
+   "text": "\ufeffdanger_zone = 1\nhp_bars = 1\n",
+   "expect": [
+    0,
+    1,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "a comment line and a trailing comment (the value is then not a number)",
+   "text": "#danger_zone = 1\nhp_bars = 1 # shown\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "split at the first '=' only",
+   "text": "danger_zone = 1 = 2\nanimation_skip==1\n",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "keys are exact (case, near names)",
+   "text": "Danger_zone = 1\nhp_bar = 1\nanimation_skip = 2\n",
+   "expect": [
+    0,
+    0,
+    2,
+    0
+   ]
+  },
+  {
+   "why": "a line without '=' and unknown keys are ignored",
+   "text": "hello\nfuture_key = 1\nanim_speed = 2",
+   "expect": [
+    0,
+    0,
+    0,
+    2
+   ]
+  },
+  {
+   "why": "not valid UTF-8: the whole file is empty",
+   "hex": "64616e6765725f7a6f6e65203d20310aff0a",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "an encoded surrogate is not UTF-8",
+   "hex": "eda0800a64616e6765725f7a6f6e65203d20310a",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "an overlong form is not UTF-8",
+   "hex": "c0af0a68705f62617273203d20310a",
+   "expect": [
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  {
+   "why": "a lone CR inside a line is trimmed at its ends",
+   "text": "anim_speed = 3\r\r\n",
+   "expect": [
+    0,
+    0,
+    0,
+    3
+   ]
+  }
+ ]
+}

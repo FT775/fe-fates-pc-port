@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x00,2,u16,requirement,medium,castle::anonymous_namespace::AchieveBonusMenuItem::Draw 0048B2A4 reads entry +0x0 (u16); data: rising thresholds in lists 2-4
+0x02,2,u16,requirement_2,low,data: zero except in list 4; no read found yet
+0x04,2,ref16:Item,item,medium,data: every value is an Item index (the reward); no read found yet
+0x06,2,pad,pad_06,high,zero in every entry (high half of a 32-bit item word)

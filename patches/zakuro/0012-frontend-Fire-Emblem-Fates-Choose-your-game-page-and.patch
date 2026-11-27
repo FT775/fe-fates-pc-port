@@ -1,0 +1,1497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Fri, 20 Nov 2026 14:24:55 -0500
+Subject: [PATCH 12/21] frontend: Fire Emblem Fates' Choose your game page and
+ Switch game (Seal of Flames)
+
+A Fire Emblem Fates program (linked recompiled code starting Fates SE USA,
+0004000000179800) with a window first shows "Choose your game": Fire Emblem
+Fates (the default) or the optional fan mod Seal of Flames by Laz14
+(gamebanana.com/mods/656034, CC BY-NC-ND 4.0), shown only when its profile
+is installed, else greyed with an Install button that runs the port's
+tools/play/sof.py install hidden (python -I, CREATE_NO_WINDOW, 10 min cap).
+The last choice is remembered in game-choice.txt beside the program's folder
+(never in settings.toml, never written headless) and pre-selected; Enter,
+Start or A continues. The Esc menu gets Switch game, which asks first
+("Unsaved progress will be lost") and then stops the game and starts the
+other one in the same window: the same drop and loader::load that Reset
+makes, with the other game's data folder and settings in between. Every
+other program and game is unchanged.
+
+Per choice (new module game_pick):
+- Fire Emblem Fates keeps exactly today's data folder (--data, else the
+  system's place) and settings: its Config is today's in every field.
+- Seal of Flames plays from <profile>\data (saves, states, cheats, its mods
+  folder, the log); the profile is --seal-profile, else FEF_SEAL_PROFILE,
+  else seal-of-flames beside the program's folder. bring_saves is not run
+  for it (it only copies ./user of old Zakuro builds into the normal folder).
+- General settings stay shared (the owner's settings.toml); the game bits
+  of the shared title id (per_game and enhancements) are kept apart in
+  <profile>\game-settings.toml, seeded once from the round-52 profile's own
+  settings or the port's first-run picks. While Seal plays, saves write the
+  owner's file with his own game bits put back unchanged.
+- The randomizer runs only for Fire Emblem Fates: Config::fates_rando (patch
+  0011) is off for Seal, the Randomizer page's schema is not asked for and
+  the Esc menu's Randomizer entry stays out.
+
+Command line: --game fates|seal (pre-selects with a window, starts directly
+headless), --seal-profile <dir>, --seal-broken (the launcher's full check
+failed: shown as Needs repair). Headless with neither --game nor
+FEF_GAME_CHOICE is Fire Emblem Fates and never reads the remembered file.
+Test hooks (headless only, same code path): FEF_GAME_SWITCH_AT=frames calls
+the same switch_game, replaying ZAKURO_REPLAY from its start at each boot;
+FEF_HEADLESS_REPORT=file writes one JSON record per boot, switch and end
+(choice, data folder, frames, fates_rando, sha256 of FEF_HEADLESS_RANGES,
+also at FEF_HEADLESS_HASH_AT).
+
+Checked: cargo test -p zakuro --lib, 88 passed, 2 ignored (9 new: CLI
+pre-select, choice order and headless default, remembered file round trip,
+installed by names only, page greying and controller, settings split keeps
+the owner's game bits byte-equal, Seal bits round trip and seeding, hidden
+install command, report ranges).
+---
+ crates/zakuro/src/cli.rs       |  55 ++-
+ crates/zakuro/src/game_pick.rs | 655 +++++++++++++++++++++++++++++++++
+ crates/zakuro/src/lib.rs       | 433 ++++++++++++++++++++--
+ crates/zakuro/src/library.rs   |   6 +
+ crates/zakuro/src/menus.rs     |  26 +-
+ 5 files changed, 1132 insertions(+), 43 deletions(-)
+ create mode 100644 crates/zakuro/src/game_pick.rs
+
+diff --git a/crates/zakuro/src/cli.rs b/crates/zakuro/src/cli.rs
+index 0986243..4457382 100644
+--- a/crates/zakuro/src/cli.rs
++++ b/crates/zakuro/src/cli.rs
+@@ -28,6 +28,13 @@ pub struct Options {
+     pub interpreter: bool,
+     /// play no sound.
+     pub mute: bool,
++    /// a Fire Emblem Fates port's game to pick (see game_pick): pre-selected on its
++    /// page with a window, started directly headless.
++    pub game: Option<crate::game_pick::Game>,
++    /// where the Fates port's Seal of Flames profile is, in place of the usual place.
++    pub seal_profile: Option<String>,
++    /// the Fates port's launcher found the Seal of Flames install incomplete.
++    pub seal_broken: bool,
+ }
+ 
+ const USAGE: &str = "\
+@@ -64,6 +71,11 @@ options:
+                                    place for data, ~/.local/share/zakuro,
+                                    ~/Library/Application Support/zakuro or
+                                    %APPDATA%\\zakuro)
++  --game <fates|seal>              a Fire Emblem Fates program: the game picked on
++                                   its Choose your game page (seal = the fan mod
++                                   Seal of Flames by Laz14, when installed)
++  --seal-profile <dir>             where Seal of Flames is installed (default:
++                                   seal-of-flames beside the program's folder)
+   -h, --help                       show this message
+ 
+ The system font cannot be generated: put a dump at sysdata/shared_font.bin, in
+@@ -71,6 +83,11 @@ the working directory or where saves live, for titles that render text with it.
+ ";
+ 
+ pub fn parse() -> Result<Options, String> {
++    parse_from(std::env::args().skip(1))
++}
++
++/// the options these arguments (the program's name left out) give.
++fn parse_from(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
+     let mut rom = None;
+     let mut options = Options {
+         rom: None,
+@@ -85,9 +102,12 @@ pub fn parse() -> Result<Options, String> {
+         data: None,
+         interpreter: false,
+         mute: false,
++        game: None,
++        seal_profile: None,
++        seal_broken: false,
+     };
+ 
+-    let mut args = std::env::args().skip(1);
++    let mut args = arguments;
+     while let Some(arg) = args.next() {
+         match arg.as_str() {
+             "-h" | "--help" => {
+@@ -129,6 +149,14 @@ pub fn parse() -> Result<Options, String> {
+             }
+             "--interpreter" => options.interpreter = true,
+             "--mute" => options.mute = true,
++            "--game" => {
++                let value = args.next().ok_or("--game needs fates or seal")?;
++                options.game = Some(crate::game_pick::Game::parse(&value).ok_or_else(|| format!("unknown game '{value}', fates or seal"))?);
++            }
++            "--seal-profile" => {
++                options.seal_profile = Some(args.next().ok_or("--seal-profile needs a directory")?);
++            }
++            "--seal-broken" => options.seal_broken = true,
+             "--profile" => options.profile = true,
+             "--test-pattern" => options.test_pattern = true,
+             // macOS hands an app it hasn't run before a process number
+@@ -147,3 +175,28 @@ pub fn parse() -> Result<Options, String> {
+     }
+     Ok(options)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::game_pick::Game;
++
++    fn parsed(args: &[&str]) -> Result<Options, String> {
++        parse_from(args.iter().map(|arg| (*arg).to_owned()))
++    }
++
++    #[test]
++    fn the_game_to_pick_comes_from_the_command_line() {
++        let options = parsed(&["game.cci", "--game", "seal", "--seal-profile", "C:/p/seal-of-flames", "--seal-broken"]).unwrap();
++        assert_eq!(options.game, Some(Game::Seal));
++        assert_eq!(options.seal_profile.as_deref(), Some("C:/p/seal-of-flames"));
++        assert!(options.seal_broken);
++        assert_eq!(options.rom.as_deref(), Some("game.cci"));
++        let options = parsed(&["game.cci", "--game", "Fates"]).unwrap();
++        assert_eq!(options.game, Some(Game::Fates));
++        let options = parsed(&["game.cci"]).unwrap();
++        assert_eq!((options.game, options.seal_profile, options.seal_broken), (None, None, false));
++        assert!(parsed(&["game.cci", "--game", "other"]).is_err());
++        assert!(parsed(&["game.cci", "--game"]).is_err());
++    }
++}
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+new file mode 100644
+index 0000000..5464fa9
+--- /dev/null
++++ b/crates/zakuro/src/game_pick.rs
+@@ -0,0 +1,655 @@
++//! "Choose your game": the Fire Emblem Fates port's page before the game boots, Fire
++//! Emblem Fates or the optional fan mod Seal of Flames by Laz14
++//! (gamebanana.com/mods/656034, CC BY-NC-ND 4.0), and what each choice means for the
++//! program: its data folder, its own game settings and whether the randomizer runs.
++//!
++//! The port's docs/GAME_PICKER.md (round 53) is the design. In short:
++//!
++//! - the page shows only in a program made of one game (linked recompiled code) with a
++//!   window, when the game it starts is Fire Emblem Fates SE USA; everything else is as
++//!   Zakuro always was;
++//! - Fire Emblem Fates keeps exactly today's paths (`--data`, else the system's place);
++//!   Seal of Flames plays from its own profile folder (`<profile>\data`: saves, states,
++//!   cheats, its mods folder with the unchanged mod, its log);
++//! - the general settings (window, keys, controllers, sound, graphics) are shared, the
++//!   owner's settings.toml; the game's own settings (`per_game` and `enhancements` for
++//!   the shared title id) are kept apart for Seal of Flames in
++//!   `<profile>\game-settings.toml`, so a Seal session never changes the owner's;
++//! - the choice is remembered in `game-choice.txt` beside the program's folder (never in
++//!   settings.toml), written only by the window;
++//! - the randomizer runs only for Fire Emblem Fates (`Config::fates_rando`).
++//!
++//! No byte of the mod is read here: "installed" is decided from folder names and the
++//! profile's own JSON. The Install button runs the port's `tools/play/sof.py install`
++//! hidden; that tool reads the owner's download, read-only.
++
++use std::path::{Path, PathBuf};
++use std::sync::mpsc::{channel, Receiver};
++use std::time::Duration;
++
++use egui::{Color32, RichText, Vec2};
++use serde::{Deserialize, Serialize};
++
++use crate::settings::{game_key, GameSettings, Settings, FATES_SE_USA};
++
++/// the credit shown wherever the choice is.
++pub const CREDIT: &str = "Seal of Flames by Laz14 (gamebanana.com/mods/656034), CC BY-NC-ND 4.0";
++/// the Seal of Flames line on the page and in the menu.
++pub const SEAL_NAME: &str = "Seal of Flames (by Laz14)";
++pub const FATES_NAME: &str = "Fire Emblem Fates";
++/// the mods folder name the mod lives in (the title id it shares with Fates).
++const TITLE_DIR: &str = "0004000000179800";
++/// how long the Install button's tool may take.
++const INSTALL_LIMIT: Duration = Duration::from_secs(600);
++
++/// the game the program plays.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum Game {
++    #[default]
++    Fates,
++    Seal,
++}
++
++impl Game {
++    pub fn word(self) -> &'static str {
++        match self {
++            Game::Fates => "fates",
++            Game::Seal => "seal",
++        }
++    }
++
++    pub fn parse(text: &str) -> Option<Game> {
++        match text.trim().trim_start_matches('\u{feff}').to_ascii_lowercase().as_str() {
++            "fates" | "fire emblem fates" => Some(Game::Fates),
++            "seal" | "sof" | "seal-of-flames" | "seal of flames" => Some(Game::Seal),
++            _ => None,
++        }
++    }
++
++    pub fn name(self) -> &'static str {
++        match self {
++            Game::Fates => FATES_NAME,
++            Game::Seal => SEAL_NAME,
++        }
++    }
++
++    pub fn other(self) -> Game {
++        match self {
++            Game::Fates => Game::Seal,
++            Game::Seal => Game::Fates,
++        }
++    }
++}
++
++/// what the game to start is, before any page: the command line's `--game`, else
++/// FEF_GAME_CHOICE, else (with a window only) the remembered choice, else Fire Emblem
++/// Fates. Headless runs never read the remembered file, so every existing test run
++/// plays Fire Emblem Fates as before.
++pub fn initial(cli: Option<Game>, env: Option<Game>, remembered: Option<Game>, headless: bool) -> Game {
++    cli.or(env).or(if headless { None } else { remembered }).unwrap_or_default()
++}
++
++/// FEF_GAME_CHOICE, when it names a game.
++pub fn env_choice() -> Option<Game> {
++    std::env::var("FEF_GAME_CHOICE").ok().and_then(|text| Game::parse(&text))
++}
++
++/// the program's folder.
++fn exe_dir() -> Option<PathBuf> {
++    Some(std::env::current_exe().ok()?.parent()?.to_owned())
++}
++
++/// where the remembered choice is: `game-choice.txt` one folder above the program's
++/// (`play\game\..\game-choice.txt`, beside the port's play\config.json).
++pub fn choice_file() -> Option<PathBuf> {
++    Some(exe_dir()?.parent()?.join("game-choice.txt"))
++}
++
++/// the remembered choice; a missing or unreadable file is none.
++pub fn read_choice(file: &Path) -> Option<Game> {
++    Game::parse(std::fs::read_to_string(file).ok()?.lines().next()?)
++}
++
++/// remembers the choice: a temporary file, then renamed over the old one.
++pub fn write_choice(file: &Path, game: Game) -> std::io::Result<()> {
++    if let Some(dir) = file.parent() {
++        std::fs::create_dir_all(dir)?;
++    }
++    let partial = file.with_extension("txt.new");
++    std::fs::write(&partial, format!("{}\n", game.word()))?;
++    std::fs::rename(&partial, file)
++}
++
++/// the Seal of Flames profile folder: `--seal-profile`, else FEF_SEAL_PROFILE, else
++/// `seal-of-flames` beside the program's folder (`play\game\..\seal-of-flames`).
++pub fn profile(cli: Option<&str>) -> Option<PathBuf> {
++    if let Some(dir) = cli.filter(|dir| !dir.is_empty()) {
++        return Some(PathBuf::from(dir));
++    }
++    if let Some(dir) = std::env::var_os("FEF_SEAL_PROFILE").filter(|dir| !dir.is_empty()) {
++        return Some(PathBuf::from(dir));
++    }
++    Some(exe_dir()?.parent()?.join("seal-of-flames"))
++}
++
++/// the data folder Seal of Flames plays from.
++pub fn profile_data(profile: &Path) -> PathBuf {
++    profile.join("data")
++}
++
++/// whether Seal of Flames can be chosen.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SealStatus {
++    Installed,
++    /// no profile, or no mod in it.
++    Missing,
++    /// there, but something is wrong with it (the launcher's full check failed, or
++    /// something else is in its mods folder): Install again repairs it.
++    Broken(String),
++}
++
++impl SealStatus {
++    pub fn installed(&self) -> bool {
++        *self == SealStatus::Installed
++    }
++
++    /// why it can't be chosen, in a line.
++    pub fn reason(&self) -> Option<String> {
++        match self {
++            SealStatus::Installed => None,
++            SealStatus::Missing => Some("Not installed. Put the Seal of Flames v6 download in the port folder, then press Install.".into()),
++            SealStatus::Broken(why) => Some(format!("Needs repair ({why}): press Install again (your saves are kept).")),
++        }
++    }
++}
++
++/// what the profile folder holds, by names only (the same fail-closed rule the port's
++/// sof.py has): `profile.json` reads as JSON, the mod's `romfs` folder is there, and the
++/// profile's mods folder holds nothing else. `broken` is the launcher's word that its
++/// full names-and-sizes check failed.
++pub fn seal_status(profile: Option<&Path>, broken: bool) -> SealStatus {
++    let Some(profile) = profile else { return SealStatus::Missing };
++    let json = std::fs::read_to_string(profile.join("profile.json")).ok();
++    let mods = profile_data(profile).join("mods");
++    let romfs = mods.join(TITLE_DIR).join("romfs");
++    if json.is_none() && !romfs.is_dir() {
++        return SealStatus::Missing;
++    }
++    if json.as_deref().and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok()).is_none() {
++        return SealStatus::Broken("profile.json is missing or unreadable".into());
++    }
++    if !romfs.is_dir() {
++        return SealStatus::Broken("the mod's romfs folder is missing".into());
++    }
++    let others: Vec<String> = std::fs::read_dir(&mods)
++        .map(|entries| entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name != TITLE_DIR).collect())
++        .unwrap_or_default();
++    if !others.is_empty() {
++        return SealStatus::Broken(format!("other entries in its mods folder: {}", others.join(", ")));
++    }
++    if broken {
++        return SealStatus::Broken("the launcher's check of the installed files failed".into());
++    }
++    SealStatus::Installed
++}
++
++// ------------------------------------------------------------------ the game's own settings
++
++/// what Fire Emblem Fates' title id has of its own in the settings: its "Settings for
++/// this game" and its enhancements (60 fps battles, 16:9, ...).
++#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct GameBits {
++    pub per_game: Option<GameSettings>,
++    pub enhancements: Option<Vec<String>>,
++}
++
++/// Seal of Flames' own game settings file, `<profile>\game-settings.toml`.
++#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
++#[serde(default)]
++struct SealFile {
++    format: u32,
++    #[serde(flatten)]
++    bits: GameBits,
++}
++
++/// the title's game bits in these settings.
++pub fn take_bits(settings: &Settings) -> GameBits {
++    let key = game_key(FATES_SE_USA);
++    GameBits { per_game: settings.per_game.get(&key).cloned(), enhancements: settings.enhancements.get(&key).cloned() }
++}
++
++/// puts game bits in, in place of the title's (none = the entry left out).
++pub fn put_bits(settings: &mut Settings, bits: GameBits) {
++    let key = game_key(FATES_SE_USA);
++    match bits.per_game {
++        Some(own) => settings.per_game.insert(key.clone(), own),
++        None => settings.per_game.remove(&key),
++    };
++    match bits.enhancements {
++        Some(names) => settings.enhancements.insert(key, names),
++        None => settings.enhancements.remove(&key),
++    };
++}
++
++pub fn seal_settings_file(profile: &Path) -> PathBuf {
++    profile.join("game-settings.toml")
++}
++
++/// Seal of Flames' game bits: its own file, else (the first time) those the round-52
++/// profile's own settings had (`<profile>\appdata\zakuro\settings.toml`, read only),
++/// else the port's first-run picks.
++pub fn load_seal_bits(profile: &Path) -> GameBits {
++    if let Ok(text) = std::fs::read_to_string(seal_settings_file(profile)) {
++        match toml::from_str::<SealFile>(&text) {
++            Ok(file) => return file.bits,
++            Err(error) => log::warn!("could not read {}, {error}; Seal of Flames starts with the first-run picks", seal_settings_file(profile).display()),
++        }
++    }
++    let old = profile.join("appdata").join("zakuro").join("settings.toml");
++    if let Some(settings) = std::fs::read_to_string(&old).ok().and_then(|text| toml::from_str::<Settings>(&text).ok()) {
++        log::info!("Seal of Flames' own game settings start from {}", old.display());
++        return take_bits(&settings);
++    }
++    take_bits(&Settings::first_run())
++}
++
++/// writes Seal of Flames' game bits to its own file.
++pub fn save_seal_bits(profile: &Path, bits: &GameBits) {
++    let file = seal_settings_file(profile);
++    let written = toml::to_string_pretty(&SealFile { format: 1, bits: bits.clone() })
++        .map_err(|error| error.to_string())
++        .and_then(|text| std::fs::write(&file, text).map_err(|error| error.to_string()));
++    if let Err(error) = written {
++        log::warn!("could not save Seal of Flames' game settings to {}, {error}", file.display());
++    }
++}
++
++/// what is written to the owner's settings.toml while Seal of Flames plays: the
++/// settings as they are now (a shared change lands there), with the owner's own game
++/// bits put back; and the Seal bits, which go to the profile's file.
++pub fn split_for_save(settings: &Settings, owner: &GameBits) -> (Settings, GameBits) {
++    let seal = take_bits(settings);
++    let mut shared = settings.clone();
++    put_bits(&mut shared, owner.clone());
++    (shared, seal)
++}
++
++// ------------------------------------------------------------------ the Install button
++
++/// the port's folder: FEF_REPO, else the first folder above the program holding
++/// tools\play\sof.py.
++pub fn repo() -> Option<PathBuf> {
++    if let Some(dir) = std::env::var_os("FEF_REPO").filter(|dir| !dir.is_empty()) {
++        return Some(PathBuf::from(dir));
++    }
++    let exe = std::env::current_exe().ok()?;
++    exe.ancestors().skip(1).take(6).find(|dir| dir.join("tools").join("play").join("sof.py").is_file()).map(Path::to_owned)
++}
++
++/// the hidden install command: `python -I <repo>\tools\play\sof.py install`, no window
++/// (CREATE_NO_WINDOW), no input, its output piped to the log. Returns the creation flags
++/// too, for the test.
++pub fn install_command(python: &zakuro_core::fates_rando_session::Python, repo: &Path) -> (std::process::Command, u32) {
++    let script = repo.join("tools").join("play").join("sof.py");
++    let args: [&std::ffi::OsStr; 3] = ["-I".as_ref(), script.as_os_str(), "install".as_ref()];
++    let (mut cmd, flags) = zakuro_core::fates_rando_session::python_command(python, &args);
++    cmd.current_dir(repo);
++    (cmd, flags)
++}
++
++/// runs the install in a thread; the answer is its last line, or why it failed.
++fn start_install() -> Receiver<Result<String, String>> {
++    let (send, receive) = channel();
++    std::thread::spawn(move || {
++        let result = (|| {
++            let repo = repo().ok_or("the port's tools\\play\\sof.py was not found above the program")?;
++            let python = zakuro_core::fates_rando_session::find_python().map_err(|_| "Python 3 was not found".to_owned())?;
++            let (cmd, _) = install_command(&python, &repo);
++            let (code, lines) = zakuro_core::fates_rando_session::run_hidden(cmd, INSTALL_LIMIT)?;
++            for line in &lines {
++                log::info!(target: "zakuro::game_pick", "sof.py: {line}");
++            }
++            let last = lines.iter().rev().find(|line| !line.trim().is_empty()).cloned().unwrap_or_default();
++            if code == 0 {
++                Ok(last)
++            } else {
++                Err(if last.is_empty() { format!("sof.py stopped with {code}") } else { last })
++            }
++        })();
++        let _ = send.send(result);
++    });
++    receive
++}
++
++// ------------------------------------------------------------------ the page
++
++/// what the page asks the program for.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PickAction {
++    /// start this game.
++    Continue(Game),
++}
++
++/// the page's state, kept apart from egui so it can be tested without a window.
++#[derive(Default)]
++pub struct GamePick {
++    /// the page shows, in place of the game.
++    pub open: bool,
++    pub selected: Game,
++    pub seal: SealStatus,
++    /// the Seal profile's folder, to check again after an install.
++    pub profile: Option<PathBuf>,
++    /// the launcher said its check of the installed files failed.
++    pub broken: bool,
++    installing: Option<Receiver<Result<String, String>>>,
++    /// what the last install said, and whether it failed.
++    pub install_note: Option<(String, bool)>,
++    /// the Esc menu's Switch game confirm window, for this game.
++    pub confirm: Option<Game>,
++    /// why the last start or switch failed, shown on the page.
++    pub error: Option<String>,
++}
++
++impl Default for SealStatus {
++    fn default() -> Self {
++        SealStatus::Missing
++    }
++}
++
++impl GamePick {
++    /// the page for a start, with this game pre-selected (Fire Emblem Fates in its
++    /// place when Seal of Flames can't be chosen).
++    pub fn new(profile: Option<PathBuf>, broken: bool, preselect: Game) -> GamePick {
++        let seal = seal_status(profile.as_deref(), broken);
++        let selected = if preselect == Game::Seal && !seal.installed() { Game::Fates } else { preselect };
++        GamePick { open: false, selected, seal, profile, broken, ..GamePick::default() }
++    }
++
++    /// checks the profile again (after an install).
++    pub fn refresh(&mut self) {
++        self.seal = seal_status(self.profile.as_deref(), false);
++        self.broken = false;
++    }
++
++    pub fn can_choose(&self, game: Game) -> bool {
++        game == Game::Fates || self.seal.installed()
++    }
++
++    /// Up or Down on the page.
++    pub fn move_selection(&mut self) {
++        let other = self.selected.other();
++        if self.can_choose(other) {
++            self.selected = other;
++        }
++    }
++
++    /// Enter, Start or A, or the Continue button: the game to start.
++    pub fn continue_choice(&self) -> Option<Game> {
++        self.can_choose(self.selected).then_some(self.selected)
++    }
++
++    fn poll_install(&mut self) {
++        let Some(receive) = &self.installing else { return };
++        match receive.try_recv() {
++            Ok(result) => {
++                self.installing = None;
++                self.refresh();
++                self.install_note = Some(match result {
++                    Ok(last) if self.seal.installed() => (if last.is_empty() { "Installed.".into() } else { last }, false),
++                    Ok(last) => (format!("The install ended, but the mod is still not there: {last}"), true),
++                    Err(why) => (format!("Install failed: {why}"), true),
++                });
++            }
++            Err(std::sync::mpsc::TryRecvError::Empty) => {}
++            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.installing = None,
++        }
++    }
++
++    /// the page, while open. keys: Up/Down choose, Enter continues; controller buttons
++    /// come through `pad`.
++    pub fn draw(&mut self, ctx: &egui::Context) -> Vec<PickAction> {
++        let mut actions = Vec::new();
++        self.poll_install();
++        if !self.open {
++            return actions;
++        }
++        if self.installing.is_some() {
++            ctx.request_repaint();
++        }
++        let (up_down, enter) = ctx.input(|input| {
++            (
++                input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowDown),
++                input.key_pressed(egui::Key::Enter),
++            )
++        });
++        if up_down {
++            self.move_selection();
++        }
++        if enter {
++            actions.extend(self.continue_choice().map(PickAction::Continue));
++        }
++        egui::Window::new("Choose your game")
++            .id(egui::Id::new("game pick"))
++            .collapsible(false)
++            .resizable(false)
++            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
++            .show(ctx, |ui| {
++                ui.set_min_width(360.0);
++                ui.radio_value(&mut self.selected, Game::Fates, RichText::new(FATES_NAME).strong());
++                ui.add_space(4.0);
++                let seal_ok = self.seal.installed();
++                ui.add_enabled_ui(seal_ok, |ui| {
++                    ui.horizontal(|ui| {
++                        ui.radio_value(&mut self.selected, Game::Seal, RichText::new(SEAL_NAME).strong());
++                        ui.label(RichText::new("fan mod, not part of this port").weak());
++                    });
++                });
++                ui.label(RichText::new(CREDIT).weak().small());
++                if let Some(reason) = self.seal.reason() {
++                    ui.label(RichText::new(reason).color(Color32::GRAY));
++                    ui.horizontal(|ui| {
++                        if self.installing.is_some() {
++                            ui.spinner();
++                            ui.label("Installing... (about a minute)");
++                        } else if ui.button("Install").clicked() {
++                            self.install_note = None;
++                            self.installing = Some(start_install());
++                        }
++                    });
++                }
++                if let Some((note, failed)) = &self.install_note {
++                    ui.label(RichText::new(note).color(if *failed { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN }));
++                }
++                if let Some(error) = &self.error {
++                    ui.label(RichText::new(error).color(Color32::LIGHT_RED));
++                }
++                ui.add_space(8.0);
++                ui.horizontal(|ui| {
++                    let ready = self.continue_choice().is_some() && self.installing.is_none();
++                    if ui.add_enabled(ready, egui::Button::new("Continue").min_size(Vec2::new(120.0, 28.0))).clicked() {
++                        actions.extend(self.continue_choice().map(PickAction::Continue));
++                    }
++                    ui.label(RichText::new("Up/Down choose, Enter or Start continues").weak());
++                });
++            });
++        if self.installing.is_some() {
++            actions.clear();
++        }
++        actions
++    }
++
++    /// a controller button while the page is open: the D-pad chooses, A or Start
++    /// continues.
++    pub fn pad(&mut self, button: gilrs::Button) -> Option<PickAction> {
++        match button {
++            gilrs::Button::DPadUp | gilrs::Button::DPadDown => {
++                self.move_selection();
++                None
++            }
++            gilrs::Button::South | gilrs::Button::Start if self.installing.is_none() => self.continue_choice().map(PickAction::Continue),
++            _ => None,
++        }
++    }
++
++    /// the Esc menu's Switch game confirm window, while asked for: the game to switch
++    /// to once the player says so.
++    pub fn draw_confirm(&mut self, ctx: &egui::Context) -> Option<Game> {
++        let to = self.confirm?;
++        let mut chosen = None;
++        egui::Window::new("Switch game")
++            .id(egui::Id::new("game pick switch"))
++            .collapsible(false)
++            .resizable(false)
++            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
++            .show(ctx, |ui| {
++                ui.label(format!("Unsaved progress will be lost. Switch to {}?", to.name()));
++                if to == Game::Seal {
++                    ui.label(RichText::new(CREDIT).weak().small());
++                }
++                ui.add_space(6.0);
++                ui.horizontal(|ui| {
++                    if ui.add_sized([98.0, 28.0], egui::Button::new("Switch")).clicked() {
++                        chosen = Some(to);
++                    }
++                    if ui.add_sized([98.0, 28.0], egui::Button::new("Cancel")).clicked() {
++                        self.confirm = None;
++                    }
++                });
++            });
++        if chosen.is_some() {
++            self.confirm = None;
++        }
++        chosen
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::settings::TopShape;
++
++    fn scratch(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("zakuro-game-pick-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn install_fake(profile: &Path) {
++        std::fs::create_dir_all(profile_data(profile).join("mods").join(TITLE_DIR).join("romfs")).unwrap();
++        std::fs::write(profile.join("profile.json"), "{\"files\": 978}").unwrap();
++    }
++
++    #[test]
++    fn the_choice_comes_from_the_command_line_then_the_variable_then_the_file() {
++        assert_eq!(initial(None, None, None, false), Game::Fates);
++        assert_eq!(initial(None, None, Some(Game::Seal), false), Game::Seal);
++        assert_eq!(initial(None, Some(Game::Fates), Some(Game::Seal), false), Game::Fates);
++        assert_eq!(initial(Some(Game::Seal), Some(Game::Fates), None, false), Game::Seal);
++        // headless runs never read the remembered file: Fire Emblem Fates as before
++        assert_eq!(initial(None, None, Some(Game::Seal), true), Game::Fates);
++        assert_eq!(initial(None, Some(Game::Seal), None, true), Game::Seal);
++        assert_eq!(Game::parse("SEAL\r\n"), Some(Game::Seal));
++        assert_eq!(Game::parse("\u{feff}fates"), Some(Game::Fates));
++        assert_eq!(Game::parse("other"), None);
++    }
++
++    #[test]
++    fn the_remembered_choice_round_trips_and_a_bad_file_means_none() {
++        let dir = scratch("choice");
++        let file = dir.join("game-choice.txt");
++        assert_eq!(read_choice(&file), None);
++        write_choice(&file, Game::Seal).unwrap();
++        assert_eq!(read_choice(&file), Some(Game::Seal));
++        assert!(!dir.join("game-choice.txt.new").exists());
++        write_choice(&file, Game::Fates).unwrap();
++        assert_eq!(read_choice(&file), Some(Game::Fates));
++        std::fs::write(&file, "nonsense").unwrap();
++        assert_eq!(read_choice(&file), None);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn seal_of_flames_is_installed_only_when_the_profile_says_so_by_names() {
++        let dir = scratch("status");
++        assert_eq!(seal_status(None, false), SealStatus::Missing);
++        assert_eq!(seal_status(Some(&dir), false), SealStatus::Missing);
++        install_fake(&dir);
++        assert_eq!(seal_status(Some(&dir), false), SealStatus::Installed);
++        assert!(matches!(seal_status(Some(&dir), true), SealStatus::Broken(_)));
++        std::fs::create_dir_all(profile_data(&dir).join("mods").join("other")).unwrap();
++        assert!(matches!(seal_status(Some(&dir), false), SealStatus::Broken(_)));
++        std::fs::remove_dir_all(profile_data(&dir).join("mods").join("other")).unwrap();
++        std::fs::write(dir.join("profile.json"), "{not json").unwrap();
++        assert!(matches!(seal_status(Some(&dir), false), SealStatus::Broken(_)));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn the_page_preselects_and_greys_seal_of_flames_when_it_cannot_be_chosen() {
++        let dir = scratch("page");
++        let mut pick = GamePick::new(Some(dir.clone()), false, Game::Seal);
++        // not installed: Fire Emblem Fates in its place, and Up/Down stays there
++        assert_eq!(pick.selected, Game::Fates);
++        pick.move_selection();
++        assert_eq!(pick.selected, Game::Fates);
++        assert_eq!(pick.continue_choice(), Some(Game::Fates));
++        assert!(pick.seal.reason().unwrap().contains("Install"));
++        install_fake(&dir);
++        pick.refresh();
++        pick.move_selection();
++        assert_eq!(pick.selected, Game::Seal);
++        assert_eq!(pick.pad(gilrs::Button::Start), Some(PickAction::Continue(Game::Seal)));
++        assert_eq!(pick.pad(gilrs::Button::DPadDown), None);
++        assert_eq!(pick.selected, Game::Fates);
++        let pick = GamePick::new(Some(dir.clone()), false, Game::Seal);
++        assert_eq!(pick.selected, Game::Seal);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn a_seal_session_never_changes_the_owners_game_settings() {
++        let mut settings = Settings::first_run();
++        settings.scale = 3;
++        let owner = take_bits(&settings);
++        // Seal of Flames' own bits in force, then changed in game
++        let mut seal = owner.clone();
++        seal.per_game = Some(GameSettings { top_shape: Some(TopShape::Console), ..GameSettings::default() });
++        put_bits(&mut settings, seal.clone());
++        settings.per_game.get_mut(&game_key(FATES_SE_USA)).unwrap().layout = Some(crate::settings::Screens::TopOnly);
++        // and a shared one: the window's scale
++        settings.scale = 4;
++        let (shared, seal_now) = split_for_save(&settings, &owner);
++        assert_eq!(take_bits(&shared), owner);
++        assert_eq!(shared.scale, 4);
++        assert_eq!(seal_now.per_game.as_ref().unwrap().layout, Some(crate::settings::Screens::TopOnly));
++        // the owner's file, written from Fire Emblem Fates, is what settings.save() wrote before
++        let mut fates_again = shared.clone();
++        put_bits(&mut fates_again, owner.clone());
++        assert_eq!(toml::to_string_pretty(&fates_again).unwrap(), toml::to_string_pretty(&shared).unwrap());
++    }
++
++    #[test]
++    fn seal_of_flames_game_settings_round_trip_and_start_from_the_first_run_picks() {
++        let dir = scratch("bits");
++        assert_eq!(load_seal_bits(&dir), take_bits(&Settings::first_run()));
++        let bits = GameBits { per_game: Some(GameSettings { scale: Some(5), ..GameSettings::default() }), enhancements: Some(vec!["x".into()]) };
++        save_seal_bits(&dir, &bits);
++        assert_eq!(load_seal_bits(&dir), bits);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn the_install_runs_hidden_and_isolated() {
++        let python = zakuro_core::fates_rando_session::Python { program: "python".into(), args: vec![] };
++        let (cmd, flags) = install_command(&python, Path::new("C:/port"));
++        let args: Vec<String> = cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
++        assert_eq!(args[0], "-I");
++        assert!(args[1].ends_with("sof.py"));
++        assert_eq!(args[2], "install");
++        if cfg!(windows) {
++            assert_eq!(flags, 0x0800_0000);
++        }
++    }
++}
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 3b6bb7e..32191a7 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -6,6 +6,7 @@ mod audio;
+ mod banners;
+ mod camera;
+ mod cli;
++mod game_pick;
+ mod gamepad;
+ mod gui;
+ mod input;
+@@ -100,6 +101,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+     }
+ 
+     let data_dir = options.data.clone().map(PathBuf::from).or_else(default_data_dir);
++    let seal_profile = game_pick::profile(options.seal_profile.as_deref());
+     if let Some(dir) = &data_dir {
+         report::to_file(dir);
+         bring_saves(dir);
+@@ -120,7 +122,12 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+         overlay,
+         overlay_corner: None,
+         library: Library::new(data_dir.clone()),
++        normal_data: data_dir.clone(),
+         data_dir,
++        choice: game_pick::Game::Fates,
++        pick: game_pick::GamePick::default(),
++        owner_bits: None,
++        seal_profile,
+         game: None,
+         menus: {
+             let mut menus = Menus::default();
+@@ -158,10 +165,23 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+     };
+ 
+     if let Some(frames) = app.options.headless {
+-        app.start();
+-        if let Some(game) = &mut app.game {
+-            run_headless(&mut game.system, game.replay.as_mut(), frames);
++        // a Fire Emblem Fates program's game: --game or FEF_GAME_CHOICE, else Fire
++        // Emblem Fates (the remembered choice is never read headless); and the test
++        // hook that switches games at given frames, through the window's own code
++        let choice = game_pick::initial(app.options.game, game_pick::env_choice(), None, true);
++        let switches = headless_switches();
++        if choice != game_pick::Game::Fates || !switches.is_empty() {
++            if !app.picker_applies() {
++                eprintln!("zakuro: --game, FEF_GAME_CHOICE and FEF_GAME_SWITCH_AT need a Fire Emblem Fates program");
++                std::process::exit(2);
++            }
++            if let Err(error) = app.apply_choice(choice) {
++                eprintln!("zakuro: {error}");
++                std::process::exit(1);
++            }
+         }
++        app.start();
++        app.run_headless(frames, &switches);
+         return;
+     }
+ 
+@@ -352,35 +372,35 @@ fn paint_test_pattern(config: Config) -> System {
+     system
+ }
+ 
+-fn run_headless(system: &mut System, mut replay: Option<&mut zakuro_core::replay::Replay>, frames: u64) {
+-    let start = Instant::now();
+-    let mut outcome = FrameOutcome::Completed;
+-    let mut ran = 0;
+-    for frame in 0..frames {
+-        // ZAKURO_REPLAY plays its inputs back headless too (a test run that gets past
+-        // the title by itself, Fire Emblem Fates' randomizer test hook for one)
+-        if let Some(replay) = replay.as_deref_mut() {
+-            system.set_input(replay.input(frame));
+-        }
+-        outcome = system.run_frame();
+-        ran += 1;
+-        if outcome != FrameOutcome::Completed {
+-            break;
+-        }
+-    }
+-    let elapsed = start.elapsed();
+-    println!("{outcome:?} after {ran} frames in {elapsed:.2?}");
+-    println!(
+-        "{:.1} MIPS, {}",
+-        system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1e6,
+-        system.status_line()
+-    );
+-    if !system.fatal_errors.is_empty() {
+-        println!("fatal errors: {}", system.fatal_errors.join("; "));
+-    }
+-    for (thread, pc, hits) in system.hot_spots(10) {
+-        println!("  hot {thread:<8} 0x{pc:08X} {hits}");
+-    }
++/// frames from a variable, `4600,9200`.
++fn frame_list(name: &str) -> Vec<u64> {
++    std::env::var(name).map(|text| text.split(',').filter_map(|frame| frame.trim().parse().ok()).collect()).unwrap_or_default()
++}
++
++/// the Fates port's headless test hook: switch games at these frames (FEF_GAME_SWITCH_AT).
++fn headless_switches() -> Vec<u64> {
++    frame_list("FEF_GAME_SWITCH_AT")
++}
++
++/// the ranges of memory FEF_HEADLESS_REPORT hashes, FEF_HEADLESS_RANGES=`0x08000000:0x100000,...`.
++fn headless_ranges() -> Vec<(u32, usize)> {
++    parse_ranges(&std::env::var("FEF_HEADLESS_RANGES").unwrap_or_default())
++}
++
++fn parse_ranges(text: &str) -> Vec<(u32, usize)> {
++    let number = |text: &str| {
++        let text = text.trim();
++        match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
++            Some(hex) => u64::from_str_radix(hex, 16).ok(),
++            None => text.parse().ok(),
++        }
++    };
++    text.split(',')
++        .filter_map(|range| {
++            let (addr, len) = range.split_once(':')?;
++            Some((u32::try_from(number(addr)?).ok()?, usize::try_from(number(len)?).ok()?))
++        })
++        .collect()
+ }
+ 
+ /// a game being played.
+@@ -511,6 +531,18 @@ struct App {
+     overlay: Option<Box<dyn GameOverlay>>,
+     overlay_corner: Option<String>,
+     data_dir: Option<PathBuf>,
++    /// the data folder Fire Emblem Fates plays from, `--data` or the system's place:
++    /// data_dir unless the Fates port's Seal of Flames is chosen (game_pick).
++    normal_data: Option<PathBuf>,
++    /// the game chosen on the Fates port's Choose your game page, Fire Emblem Fates in
++    /// every other program.
++    choice: game_pick::Game,
++    pick: game_pick::GamePick,
++    /// the owner's own game settings for Fates' title id, kept aside while Seal of
++    /// Flames plays with its own in their place.
++    owner_bits: Option<game_pick::GameBits>,
++    /// where Seal of Flames is installed.
++    seal_profile: Option<PathBuf>,
+     game: Option<Running>,
+     library: Library,
+     menus: Menus,
+@@ -669,8 +701,16 @@ impl ApplicationHandler for App {
+                 self.window = Some(window);
+                 self.backend = Some(backend);
+                 // the game the command line names starts on the device the
+-                // presenter may lend the renderer, once there is one
+-                self.start();
++                // presenter may lend the renderer, once there is one; a Fire
++                // Emblem Fates program asks which game first
++                if self.picker_applies() {
++                    let remembered = game_pick::choice_file().and_then(|file| game_pick::read_choice(&file));
++                    let preselect = game_pick::initial(self.options.game, game_pick::env_choice(), remembered, false);
++                    self.pick = game_pick::GamePick::new(self.seal_profile.clone(), self.options.seal_broken, preselect);
++                    self.pick.open = true;
++                } else {
++                    self.start();
++                }
+             }
+             Err(error) => {
+                 eprintln!("zakuro: could not start the {renderer:?} backend: {error}");
+@@ -773,6 +813,7 @@ impl App {
+             username: self.nickname(),
+             console_id: settings.console_id,
+             slider_3d: settings.slider_3d(),
++            fates_rando: self.choice == game_pick::Game::Fates,
+             ..Config::default()
+         }
+     }
+@@ -900,7 +941,7 @@ impl App {
+         // Fire Emblem Fates' Randomizer page asks the port's tool for its rows now, in a
+         // thread, so they are there by the mode pick; a new game starts with none open
+         self.menus.rando.reset();
+-        if rando_link::is_fates(&game.system) && self.options.headless.is_none() {
++        if rando_link::is_fates(&game.system) && self.options.headless.is_none() && self.choice == game_pick::Game::Fates {
+             self.menus.rando.ask();
+         }
+         // with a window the mode pick waits for the page; headless runs answer by
+@@ -948,7 +989,7 @@ impl App {
+             Some(own) => own.layout = Some(layout),
+             None => self.settings.layout = layout,
+         }
+-        self.settings.save();
++        self.save_settings();
+         self.active = self.settings.for_game(self.program_id());
+         self.apply_layout();
+     }
+@@ -1012,7 +1053,13 @@ impl App {
+     /// takes in the controllers' buttons, a binding waiting for one takes
+     /// it, and Home opens and closes the menu over the game.
+     fn poll_gamepads(&mut self) {
++        let mut picked = None;
+         for button in self.gamepads.poll() {
++            // the Choose your game page, while it shows, takes the controller
++            if self.pick.open {
++                picked = self.pick.pad(button).or(picked);
++                continue;
++            }
+             self.extras.any_button_pressed = self.game.is_some();
+             let to_extras = self.extras_active() && !self.menus.over_game();
+             if let Some(index) = self.menus.rebinding_pad.take() {
+@@ -1030,6 +1077,280 @@ impl App {
+                 self.close_bottom_over_with_cancel();
+             }
+         }
++        if let Some(game_pick::PickAction::Continue(game)) = picked {
++            self.pick_continue(game);
++        }
++    }
++
++    /// whether the Fates port's Choose your game applies: a program made of one game,
++    /// starting Fire Emblem Fates SE USA (the fan mod Seal of Flames shares its id).
++    fn picker_applies(&self) -> bool {
++        self.linked.is_some()
++            && !self.options.test_pattern
++            && self
++                .options
++                .rom
++                .as_deref()
++                .and_then(|rom| zakuro_fs::Title::load(Path::new(rom)).ok())
++                .is_some_and(|title| title.program_id() == settings::FATES_SE_USA)
++    }
++
++    /// makes the game chosen the one the next start plays: its data folder (saves,
++    /// states, cheats, mods, the randomizer's runs, the log), its own game settings and
++    /// whether the randomizer runs. Fire Emblem Fates gets exactly what it always had.
++    fn apply_choice(&mut self, game: game_pick::Game) -> Result<(), String> {
++        let data = match game {
++            game_pick::Game::Fates => self.normal_data.clone(),
++            game_pick::Game::Seal => {
++                let profile = self.seal_profile.clone().ok_or("Seal of Flames has no profile folder")?;
++                if let Some(why) = game_pick::seal_status(Some(&profile), false).reason() {
++                    return Err(format!("{}: {why}", game_pick::SEAL_NAME));
++                }
++                Some(game_pick::profile_data(&profile))
++            }
++        };
++        // the owner's own game settings come back, Seal of Flames' kept in its file
++        if let Some(owner) = self.owner_bits.take() {
++            if let Some(profile) = &self.seal_profile {
++                game_pick::save_seal_bits(profile, &game_pick::take_bits(&self.settings));
++            }
++            game_pick::put_bits(&mut self.settings, owner);
++        }
++        if game == game_pick::Game::Seal {
++            if let Some(profile) = &self.seal_profile {
++                self.owner_bits = Some(game_pick::take_bits(&self.settings));
++                game_pick::put_bits(&mut self.settings, game_pick::load_seal_bits(profile));
++            }
++        }
++        if data != self.data_dir {
++            if let Some(dir) = &data {
++                report::to_file(dir);
++            }
++            self.library.set_data_dir(data.clone());
++            self.data_dir = data;
++        }
++        self.choice = game;
++        self.active = self.settings.clone();
++        self.menus.rando_blocked = game != game_pick::Game::Fates;
++        self.menus.seal_playing = game == game_pick::Game::Seal;
++        let to = game.other();
++        let why = (to == game_pick::Game::Seal).then(|| game_pick::seal_status(self.seal_profile.as_deref(), false).reason()).flatten();
++        self.menus.switch_game = Some((to, why));
++        if game == game_pick::Game::Seal {
++            log::info!("{} chosen; {}", game_pick::SEAL_NAME, game_pick::CREDIT);
++        }
++        log::info!(
++            "playing {}, data in {}",
++            game.name(),
++            self.data_dir.as_deref().map_or_else(|| "the working directory".to_owned(), |dir| dir.display().to_string())
++        );
++        Ok(())
++    }
++
++    /// saves the settings: as always, or while Seal of Flames plays, the shared ones to
++    /// the owner's file with his own game settings in it unchanged, and Seal of Flames'
++    /// game settings to its own file.
++    fn save_settings(&self) {
++        match (&self.owner_bits, &self.seal_profile) {
++            (Some(owner), Some(profile)) => {
++                let (shared, seal) = game_pick::split_for_save(&self.settings, owner);
++                shared.save();
++                game_pick::save_seal_bits(profile, &seal);
++            }
++            _ => self.settings.save(),
++        }
++    }
++
++    /// Continue on the Choose your game page: remembered, then started.
++    fn pick_continue(&mut self, game: game_pick::Game) {
++        if let Err(error) = self.apply_choice(game) {
++            self.pick.error = Some(error);
++            return;
++        }
++        if let Some(file) = game_pick::choice_file() {
++            if let Err(error) = game_pick::write_choice(&file, game) {
++                log::warn!("could not remember the game chosen in {}, {error}", file.display());
++            }
++        }
++        self.pick.open = false;
++        self.pick.error = None;
++        if let Some(rom) = self.options.rom.clone() {
++            if let Err(error) = self.play(Path::new(&rom)) {
++                log::warn!("{error}");
++                self.pick.error = Some(error);
++                self.pick.open = true;
++            }
++        }
++        if self.options.profile {
++            if let Some(game) = &mut self.game {
++                game.system.enable_profiler();
++            }
++        }
++    }
++
++    /// the Esc menu's Switch game: stops the game playing and starts the other one in
++    /// this window (the same stop and start Reset makes, with the other game's data
++    /// folder and settings in between).
++    fn switch_game(&mut self, to: game_pick::Game) -> Result<(), String> {
++        if std::env::var_os("ZAKURO_RECORD").is_some() {
++            return Err("The game can't be switched while its inputs are being recorded.".into());
++        }
++        if self.room.is_some() || self.dlp_guest.is_some() {
++            return Err("Leave the room first: the game can't be switched while in one.".into());
++        }
++        let Some(rom) = self.game.as_ref().map(|game| game.path.clone()) else {
++            return Err("No game is playing.".into());
++        };
++        if to == game_pick::Game::Seal {
++            if let Some(why) = game_pick::seal_status(self.seal_profile.as_deref(), false).reason() {
++                return Err(format!("{}: {why}", game_pick::SEAL_NAME));
++            }
++        }
++        log::info!("switching to {}", to.name());
++        // the stop: the game and all that goes with it
++        self.game = None;
++        self.overlay_corner = None;
++        if let Some(audio) = &self.audio {
++            audio.clear();
++        }
++        self.dlp_guest = None;
++        self.wireless_reboot = None;
++        self.menus.rando.reset();
++        self.extras = Extras::default();
++        self.camera = None;
++        self.menus.menu_open = false;
++        self.pick.confirm = None;
++        self.keyboard.release();
++        self.apply_choice(to)?;
++        if self.options.headless.is_none() {
++            if let Some(file) = game_pick::choice_file() {
++                if let Err(error) = game_pick::write_choice(&file, to) {
++                    log::warn!("could not remember the game chosen in {}, {error}", file.display());
++                }
++            }
++        }
++        let started = self.play(&rom);
++        if let Err(error) = &started {
++            log::warn!("{error}");
++            if self.options.headless.is_none() {
++                // back to the page, nothing half switched
++                self.pick = game_pick::GamePick::new(self.seal_profile.clone(), false, to);
++                self.pick.error = Some(error.clone());
++                self.pick.open = true;
++            }
++        }
++        started
++    }
++
++    /// runs headless for this many frames, then reports. FEF_GAME_SWITCH_AT switches
++    /// to the other game at those frames (the Fates port's test hook, through
++    /// switch_game), and FEF_HEADLESS_REPORT writes what each boot was, with hashes of
++    /// FEF_HEADLESS_RANGES at FEF_HEADLESS_HASH_AT and at each switch and the end.
++    fn run_headless(&mut self, frames: u64, switches: &[u64]) {
++        let report = std::env::var_os("FEF_HEADLESS_REPORT").map(PathBuf::from);
++        let ranges = headless_ranges();
++        let hash_at = frame_list("FEF_HEADLESS_HASH_AT");
++        let mut records = Vec::new();
++        if report.is_some() {
++            records.push(self.headless_record("boot", 0, 0, &ranges));
++        }
++        let start = Instant::now();
++        let mut outcome = FrameOutcome::Completed;
++        let mut ran = 0;
++        let mut since = 0;
++        for frame in 0..frames {
++            if switches.contains(&frame) && frame > 0 {
++                if report.is_some() {
++                    records.push(self.headless_record("switch", frame, frame - since, &ranges));
++                }
++                if let Err(error) = self.switch_game(self.choice.other()) {
++                    println!("switch at frame {frame} failed: {error}");
++                    break;
++                }
++                since = frame;
++                if report.is_some() {
++                    records.push(self.headless_record("boot", frame, 0, &ranges));
++                }
++            }
++            let Some(game) = &mut self.game else { break };
++            // ZAKURO_REPLAY plays its inputs back headless too (a test run that gets past
++            // the title by itself, Fire Emblem Fates' randomizer test hook for one); a
++            // game switched to plays it from its start, as a fresh boot would
++            if let Some(replay) = game.replay.as_mut() {
++                game.system.set_input(replay.input(frame - since));
++            }
++            outcome = game.system.run_frame();
++            ran += 1;
++            if report.is_some() && hash_at.contains(&(frame + 1)) {
++                records.push(self.headless_record("at", frame + 1, frame + 1 - since, &ranges));
++            }
++            if outcome != FrameOutcome::Completed {
++                break;
++            }
++        }
++        if let Some(file) = &report {
++            records.push(self.headless_record("end", ran, ran - since.min(ran), &ranges));
++            let text = serde_json::to_string_pretty(&records).unwrap_or_default();
++            if let Err(error) = std::fs::write(file, text) {
++                println!("could not write {}: {error}", file.display());
++            }
++        }
++        let elapsed = start.elapsed();
++        let Some(game) = &mut self.game else { return };
++        let system = &mut game.system;
++        println!("{outcome:?} after {ran} frames in {elapsed:.2?}");
++        println!(
++            "{:.1} MIPS, {}",
++            system.cpu.cycles as f64 / elapsed.as_secs_f64() / 1e6,
++            system.status_line()
++        );
++        if !system.fatal_errors.is_empty() {
++            println!("fatal errors: {}", system.fatal_errors.join("; "));
++        }
++        for (thread, pc, hits) in system.hot_spots(10) {
++            println!("  hot {thread:<8} 0x{pc:08X} {hits}");
++        }
++    }
++
++    /// one record of FEF_HEADLESS_REPORT: the game, its data folder, the frame, whether
++    /// the randomizer may run, and the sha256 of each range of memory asked for.
++    fn headless_record(&mut self, event: &str, frame: u64, game_frame: u64, ranges: &[(u32, usize)]) -> serde_json::Value {
++        use sha2::{Digest, Sha256};
++        let choice = self.choice.word();
++        let data = self.data_dir.as_deref().map(|dir| dir.display().to_string());
++        let Some(game) = &mut self.game else {
++            return serde_json::json!({"event": event, "frame": frame, "choice": choice, "data_dir": data, "game": null});
++        };
++        let hashes: Vec<serde_json::Value> = ranges
++            .iter()
++            .map(|&(addr, len)| {
++                // page by page, unmapped pages as zeros, read without the fault
++                // note an unmapped read leaves, so the report changes nothing
++                let mut bytes = vec![0u8; len];
++                let mut done = 0usize;
++                while done < len {
++                    let at = addr.wrapping_add(done as u32);
++                    let chunk = (0x1000 - (at as usize & 0xFFF)).min(len - done);
++                    if game.system.memory.is_readable(at, chunk as u32) {
++                        game.system.memory.read_bytes(at, &mut bytes[done..done + chunk]);
++                    }
++                    done += chunk;
++                }
++                let digest = Sha256::digest(&bytes);
++                let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
++                serde_json::json!({"addr": format!("0x{addr:08X}"), "len": len, "sha256": hex})
++            })
++            .collect();
++        serde_json::json!({
++            "event": event,
++            "frame": frame,
++            "game_frame": game_frame,
++            "choice": choice,
++            "data_dir": data,
++            "fates_rando": game.system.config.fates_rando,
++            "fatal_errors": game.system.fatal_errors.len(),
++            "hashes": hashes,
++        })
+     }
+ 
+     /// whether the pointer is busy with something other than the game.
+@@ -1282,7 +1603,7 @@ impl App {
+ 
+     /// saves the settings and puts to use what can change right away.
+     fn apply_settings(&mut self) {
+-        self.settings.save();
++        self.save_settings();
+         self.active = self.settings.for_game(self.program_id());
+         if let Some(game) = &mut self.game {
+             if game.system.gpu.interpolates() != self.active.frame_interpolation {
+@@ -1513,7 +1834,7 @@ impl App {
+             Action::ChooseFolder => {
+                 if let Some(folder) = rfd::FileDialog::new().set_title("Where your games are").pick_folder() {
+                     self.settings.games = Some(folder.clone());
+-                    self.settings.save();
++                    self.save_settings();
+                     self.library.scan(&folder);
+                 }
+             }
+@@ -1550,7 +1871,7 @@ impl App {
+                     .pick_file();
+                 if let Some(file) = picked {
+                     self.settings.background = Some(file);
+-                    self.settings.save();
++                    self.save_settings();
+                 }
+             }
+             Action::Rescan => {
+@@ -1590,7 +1911,7 @@ impl App {
+                     if on {
+                         names.push(cheat.name.clone());
+                     }
+-                    self.settings.save();
++                    self.save_settings();
+                 } else {
+                     self.save_cheats();
+                 }
+@@ -1628,6 +1949,7 @@ impl App {
+             }
+             Action::Quit => event_loop.exit(),
+             Action::Settings => self.apply_settings(),
++            Action::AskSwitchGame(to) => self.pick.confirm = Some(to),
+             Action::Keyboard(text, button) => {
+                 if let Some(game) = &mut self.game {
+                     game.system.answer_keyboard(&text, button);
+@@ -2053,6 +2375,20 @@ impl App {
+ 
+     /// the menus, and the actions they asked for, done.
+     fn interface(&mut self, event_loop: &ActiveEventLoop) -> Overlay {
++        // the Fates port's Choose your game page, alone, before any game starts
++        if self.pick.open {
++            let (Some(gui), Some(window)) = (&mut self.gui, &self.window) else { return Overlay::default() };
++            let (pick, menus) = (&mut self.pick, &mut self.menus);
++            let mut picked = Vec::new();
++            let overlay = gui.frame(window, |ui| {
++                picked = pick.draw(ui.ctx());
++                menus.message(ui.ctx());
++            });
++            if let Some(game_pick::PickAction::Continue(game)) = picked.into_iter().next() {
++                self.pick_continue(game);
++            }
++            return overlay;
++        }
+         // when the slot chosen was saved to, while the menu shows it
+         let saved = self
+             .menus
+@@ -2106,6 +2442,8 @@ impl App {
+         let mut actions = Vec::new();
+         let mut rando_actions = Vec::new();
+         let rando_data = self.data_dir.clone();
++        let pick = &mut self.pick;
++        let mut switch_to = None;
+         let overlay = gui.frame(window, |ui| {
+             match &game {
+                 Some((name, fps, recompiled)) => {
+@@ -2156,6 +2494,9 @@ impl App {
+                 actions.extend(menus.keyboard(ui.ctx(), request));
+             }
+             actions.extend(menus.compiler_offer(ui.ctx()));
++            if game.is_some() {
++                switch_to = pick.draw_confirm(ui.ctx());
++            }
+             menus.message(ui.ctx());
+             if cursor_idle {
+                 ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+@@ -2166,6 +2507,11 @@ impl App {
+             self.act(action, event_loop);
+         }
+         self.rando(rando_actions);
++        if let Some(to) = switch_to {
++            if let Err(error) = self.switch_game(to) {
++                self.menus.message = Some(error);
++            }
++        }
+         overlay
+     }
+ 
+@@ -2402,6 +2748,13 @@ const _: RendererKind = RendererKind::Software;
+ mod tests {
+     use super::*;
+ 
++    /// the Fates port's headless report hashes the ranges it is given.
++    #[test]
++    fn report_ranges_are_read_in_hex_or_decimal() {
++        assert_eq!(parse_ranges("0x08000000:0x100000, 4096:16,bad,0x1:"), vec![(0x0800_0000, 0x10_0000), (4096, 16)]);
++        assert!(parse_ranges("").is_empty());
++    }
++
+     /// a frame goes unshown only while the game runs behind with a
+     /// presenter that waits for the display, a few in a row at most.
+     #[test]
+diff --git a/crates/zakuro/src/library.rs b/crates/zakuro/src/library.rs
+index 6d47f4b..a116786 100644
+--- a/crates/zakuro/src/library.rs
++++ b/crates/zakuro/src/library.rs
+@@ -75,6 +75,12 @@ impl Library {
+         Library { data_dir, ..Library::default() }
+     }
+ 
++    /// the data folder the games' mods are looked for under from now on (the Fates
++    /// port's Choose your game gives each game its own).
++    pub fn set_data_dir(&mut self, data_dir: Option<PathBuf>) {
++        self.data_dir = data_dir;
++    }
++
+     /// starts looking through folder again.
+     pub fn scan(&mut self, folder: &Path) {
+         let (send, receive) = channel();
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index 5568985..9c5aba2 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -63,6 +63,8 @@ pub enum Action {
+     ReloadCheats,
+     /// show the cheats folder.
+     CheatsFolder,
++    /// the Fates port's Switch game: ask first whether to switch to this game.
++    AskSwitchGame(crate::game_pick::Game),
+ }
+ 
+ #[derive(Default)]
+@@ -105,6 +107,14 @@ pub struct Menus {
+     background: Background,
+     /// Fire Emblem Fates' Randomizer page (the New Game one and the menu's This run).
+     pub rando: crate::rando_page::RandoPage,
++    /// the Randomizer entry stays out even for Fire Emblem Fates' title id: a game
++    /// sharing it is playing (the Fates port's Seal of Flames).
++    pub rando_blocked: bool,
++    /// the Fates port's Switch game entry, while its page applies: the other game, and
++    /// why it can't be chosen when it can't.
++    pub switch_game: Option<(crate::game_pick::Game, Option<String>)>,
++    /// the game playing is the fan mod Seal of Flames: its credit under its name.
++    pub seal_playing: bool,
+ }
+ 
+ /// the room the player is in, as the multiplayer window shows it.
+@@ -451,7 +461,10 @@ impl Menus {
+             .resizable(false)
+             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+             .show(&ctx, |ui| {
+-                ui.label(RichText::new(name).strong());
++                ui.label(RichText::new(if self.seal_playing { crate::game_pick::SEAL_NAME } else { name }).strong());
++                if self.seal_playing {
++                    ui.label(RichText::new(crate::game_pick::CREDIT).weak().small());
++                }
+                 ui.label(RichText::new(if recompiled { "running its recompiled code" } else { "interpreted" }).weak());
+                 ui.add_space(6.0);
+                 let wide = |ui: &mut egui::Ui, text: &str| ui.add_sized([200.0, 28.0], egui::Button::new(text)).clicked();
+@@ -461,6 +474,15 @@ impl Menus {
+                 if wide(ui, "Reset") {
+                     actions.push(Action::Reset);
+                 }
++                if let Some((to, why)) = &self.switch_game {
++                    let button = ui
++                        .add_enabled(why.is_none(), egui::Button::new("Switch game").min_size(Vec2::new(200.0, 28.0)))
++                        .on_hover_text(format!("Stop this game and start {} in this window.", to.name()))
++                        .on_disabled_hover_text(why.clone().unwrap_or_default());
++                    if button.clicked() {
++                        actions.push(Action::AskSwitchGame(*to));
++                    }
++                }
+                 if wide(ui, "Fullscreen") {
+                     actions.push(Action::Fullscreen);
+                 }
+@@ -492,7 +514,7 @@ impl Menus {
+                     self.cheats_open = true;
+                 }
+                 // Fire Emblem Fates: what the game playing now was started with
+-                if program_id == Some(crate::rando_page::FATES) && wide(ui, "Randomizer") {
++                if program_id == Some(crate::rando_page::FATES) && !self.rando_blocked && wide(ui, "Randomizer") {
+                     self.rando.this_run_open = true;
+                 }
+                 if wide(ui, "Multiplayer") {

@@ -1,0 +1,44 @@
+MIT License (scoped)
+
+Copyright (c) 2026 the FE Fates PC port contributors
+
+Scope. This license covers only the work this project adds for running
+Fire Emblem Fates (Nintendo 3DS) on a PC (the "Port"): its tools, tests,
+configuration, documentation, launchers and patches, as found in this
+repository.
+
+Files of the Port that closely follow the game's own code (the readable C
+in src/readable/ and include/readable/, written to match the game's
+functions) are covered only to the extent they are separable from the
+code they follow.
+
+The patches in patches/zakuro/ and tools/harness/patches/ change Zakuro
+(by fearkov, MIT); the parts they take from Zakuro or from
+fe-awakening-recomp (by Zelkin1, MIT) stay under those projects' MIT
+notices (see patches/zakuro/NOTICE.md and CREDITS.md).
+
+It does not cover, and this project claims no rights over: any code,
+graphics, sound, text or other material owned by Nintendo, Intelligent
+Systems or Koei Tecmo; Seal of Flames by Laz14 (CC BY-NC-ND 4.0, not
+included); or any other third-party software or data. Those remain under
+whatever terms apply to them. No game files are included: bring your own
+legal dump.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of the Port, to deal in the Port without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Port, and to permit
+persons to whom the Port is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice, this scope statement and this permission
+notice shall be included in all copies or substantial portions of the
+Port.
+
+THE PORT IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE PORT OR THE USE OR OTHER DEALINGS IN THE
+PORT.

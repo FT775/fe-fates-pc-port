@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x030,0x60,s32[24],effect_skills,high,"SkillIndexProvider::Initialize 0x00211900 stores 24 skill numbers (EquipSkill::Get by SEID label, +0x10) at +0x30 .. +0x8C; SkillIndexProvider::GetSkillEffectName(int) 0x00211BC4 compares the number with 23 of them (all but +0x3C) and returns an effect name",

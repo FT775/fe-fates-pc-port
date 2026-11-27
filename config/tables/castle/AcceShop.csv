@@ -1,0 +1,13 @@
+offset,size,type,name,confidence,evidence
+0x0,1,u8,number,medium,"File declares an 'index' u8; equals the row number in every row (data). The game itself uses the row number (StructList::GetIndex)"
+0x1,1,u8,trade_kind,medium,"File declares an 'exchange kind' u8; no reader traced"
+0x2,1,u8,damage_up,high,"map::AccessoryEnhanceCalculator::Calculate (003728D0) adds row+0x2 of each worn accessory (unit+0x90..+0x93) to the damage bonus"
+0x3,1,u8,damage_taken_down,high,"map::AccessoryEnhanceCalculator::Calculate (003728D0) adds row+0x3 of each worn accessory to the damage reduction"
+0x4,4,u32,accessory_id,medium,"File declares an 'accessory index' u32 (a model/part number in data); no reader traced"
+0x8,4,str,name,medium,"File declares the name message label (MKID_...)"
+0xC,4,str,help,medium,"File declares the help message label (MKID_H_...)"
+0x10,1,u8,shop_level,medium,"File declares the shop level needed"
+0x11,1,u8,slot,medium,"File declares the body part (head, face, arm, body)"
+0x12,1,u8,material,medium,"File declares the material needed"
+0x13,1,u8,material_count,medium,"File declares how many of that material"
+0x14,4,u32,flags,high,"AccessoryUtil::GetAccessoryNum (001C5EF4) tests row+0x14 bit 0x20000; declared u32 flags; other bits not traced"

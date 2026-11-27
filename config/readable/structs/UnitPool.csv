@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr:Unit,units,high,"UnitPool::Get(int) 0x004F6184 returns this pointer + (index - 1) * 0x140 for index 1 and up (0 gives 0)",
+0x004,0x4,ptr:Force,forces,high,"UnitPool::GetForce(int) 0x004F6310 returns this pointer + index * 12 (Force records)",

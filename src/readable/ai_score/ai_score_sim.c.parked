@@ -1,0 +1,157 @@
+/* AI attack-score readers, the simulator side (Fates classes AIBattleSimulator,
+   map::trick::Data, map::Situation, versus::Config): whether a simulated attack
+   would do nothing to its target, whether a breakable object is a castle-offense
+   target, and whether this is a versus (link) battle.
+   Plain-language description: docs/AI_SCORE.md sections 2 to 4.
+
+   AIThink::GetAttackScore asks AIBattleSimulator::IsPower0Attack for every
+   target and position it tries; GetDestroyScore asks
+   map::trick::Data::IsDestroyTargetCastleOffense when its search is limited to
+   castle-offense targets. The score functions themselves store (their
+   out-pointers, the random generator, a unit flag word) and are not here
+   (docs/AI_SCORE.md section 1).
+
+   All are readers: they store nothing. IsPower0Attack fills eight one-time
+   caches the first time (skills found by name); the readable code gives up while
+   one is cold, before reading anything else. Guest calls left: the ones the
+   game makes (ai_score.h), in the game's order (docs/DECISIONS.md F-018).
+
+   Status: UNVERIFIED (below shadow-clean). Host differential test against the
+   original ARM code: src/readable/ai_score/tests/ai_score_diff.py. */
+
+#include "ai_score.h"
+
+/* The cached skill number i of IsPower0Attack, sign-extended as the game
+   passes it (LDRSH). */
+static uint32_t p0_skill(Context *ctx, int i) {
+    return (uint32_t)(int32_t)guest_s16(ctx, S_P0Skills + 2u * (gaddr)i);
+}
+
+/* Does the attacker have cached skill i? (Unit::IsEquipSkill; the game reloads
+   the attacker pointer from the simulator before every ask.) */
+static int attacker_has(Context *ctx, gaddr sim, int i) {
+    gaddr unit = guest_ptr(ctx, sim + SIM_ATTACKER);
+    return guest_call2(ctx, AS_UnitIsEquipSkill, unit, p0_skill(ctx, i)) != 0;
+}
+
+/* One side's weapon: when it is a concealed weapon (Item::IsHiddenEffect), the
+   Defence and Resistance it lowers raise *def / *res (signed maxima). The
+   game passes the unit::Item only when its item number is not 0, else a null
+   item. */
+static void concealed_debuff(Context *ctx, gaddr item, int32_t *def, int32_t *res) {
+    gaddr arg = guest_u16(ctx, item) != 0 ? item : 0u;
+    gaddr record = guest_call1(ctx, AS_ItemToData, arg);
+    if (guest_call1(ctx, AS_ItemIsHiddenEffect, record) == 0)
+        return;
+    int32_t v = guest_s8(ctx, record + ITEM_DEBUFF_DEF);
+    if (v > *def)
+        *def = v;
+    v = guest_s8(ctx, record + ITEM_DEBUFF_RES);
+    if (v > *res)
+        *res = v;
+}
+
+/* Is skill number `skill` set in side 1's skill bits? (byte skill >> 3,
+   arithmetic, so a negative number reads before the field, as in the game) */
+static int side1_has(Context *ctx, gaddr sim, int32_t skill) {
+    uint32_t byte = guest_u8(ctx, sim + SIM_SIDE1_SKILL_BITS + (gaddr)fe_asr(skill, 3));
+    return (byte & (1u << ((uint32_t)skill & 7u))) != 0;
+}
+
+/* 1 when the simulated attack would be a "power 0" attack: the clever AI then
+   skips this target and position. Read from the code:
+   - side 1's +0x3C above 0: 1 [low for what that field means];
+   - the attacker has the cached "snake venom", "four fangs" or "breath of
+     death" skill: 0;
+   - otherwise the Defence and Resistance the attack would lower: the largest of
+     the concealed-weapon numbers of side 0's weapon and (when side 2's +0x3C is
+     above 0) side 2's weapon, at least 6 with the "seal Defence" / "seal
+     Resistance" skill; none when side 1 has "status immunity", halved when it
+     has "status resistance";
+   - no target unit: 1;
+   - with "chain of the negative": 0 when either number is above 1, else 1;
+   - else 0 when the target's Defence or Resistance already lowered is below
+     that number - 1, else 1.
+   The game first looks at a float (+0x820) when +0x814 is above 0; that is VFP
+   code, which readable C does not run, so the readable code gives up there and
+   the original runs (docs/AI_SCORE.md section 2).
+   Guest function: 0x0050C10C AIBattleSimulator::IsPower0Attack(void) const. */
+uint32_t ai_sim_is_power0_attack(Context *ctx, gaddr sim) {
+    for (int i = 0; i < P0_SKILLS; i++)
+        if (!fe_static_ready(ctx, S_P0GuardFirst - 4u * (gaddr)i))
+            return fe_use_original(ctx);
+    if (!fe_static_ready(ctx, S_P0HiddenGuard))
+        return fe_use_original(ctx);
+    if (guest_s32(ctx, sim + SIM_EXTRA_COUNT) > 0)
+        return fe_use_original(ctx); /* the float test */
+    if (guest_s32(ctx, sim + SIM_SIDE1_COUNT) > 0)
+        return 1;
+    if (attacker_has(ctx, sim, P0_SNAKE_VENOM) || attacker_has(ctx, sim, P0_FOUR_FANGS) ||
+        attacker_has(ctx, sim, P0_DEATH_BREATH))
+        return 0;
+
+    int32_t def = 0, res = 0;
+    concealed_debuff(ctx, sim + SIM_ITEM_SIDE0, &def, &res);
+    if (guest_s32(ctx, sim + SIM_SIDE2_COUNT) > 0)
+        concealed_debuff(ctx, sim + SIM_ITEM_SIDE2, &def, &res);
+    if (attacker_has(ctx, sim, P0_SEAL_DEF) && def < P0_SEAL_AMOUNT)
+        def = P0_SEAL_AMOUNT;
+    if (attacker_has(ctx, sim, P0_SEAL_RES) && res < P0_SEAL_AMOUNT)
+        res = P0_SEAL_AMOUNT;
+    if (side1_has(ctx, sim, (int32_t)p0_skill(ctx, P0_STATUS_IMMUNE))) {
+        def = 0;
+        res = 0;
+    } else if (side1_has(ctx, sim, (int32_t)p0_skill(ctx, P0_STATUS_RESIST))) {
+        def = fe_asr(def, 1);
+        res = fe_asr(res, 1);
+    }
+
+    if (guest_ptr(ctx, sim + SIM_TARGET) == 0)
+        return 1;
+    if (attacker_has(ctx, sim, P0_NEGATIVE_CHAIN))
+        return (def - 1 > 0 || res - 1 > 0) ? 0u : 1u;
+    gaddr target = guest_ptr(ctx, sim + SIM_TARGET);
+    if (guest_s8(ctx, target + UNIT_DEBUFF_DEF) < def - 1)
+        return 0;
+    if (guest_s8(ctx, target + UNIT_DEBUFF_RES) < res - 1)
+        return 0;
+    return 1;
+}
+
+/* 1 when the breakable object's trick type is one of the castle-offense
+   targets (types 15 to 22).
+   Guest function: 0x00526B10 map::trick::Data::IsDestroyTargetCastleOffense(void) const. */
+uint32_t trick_is_destroy_target_castle_offense(Context *ctx, gaddr trick) {
+    uint32_t type = guest_u8(ctx, trick + TRICK_TYPE);
+    return type - TRICK_CASTLE_OFFENSE_FIRST <= TRICK_CASTLE_OFFENSE_SPAN ? 1u : 0u;
+}
+
+/* The versus (link battle) configuration, 0 outside versus play.
+   Guest function: 0x004C5344 versus::Config::Get(void). */
+gaddr versus_config_get(Context *ctx) {
+    return guest_ptr(ctx, G_VersusConfig);
+}
+
+/* 1 in a versus (link) battle: versus::Config::Get gives a configuration (the
+   situation object itself is not read).
+   Guest function: 0x00528238 map::Situation::IsVersus(void) const. */
+uint32_t situation_is_versus(Context *ctx, gaddr situation) {
+    (void)situation;
+    return guest_call(ctx, AS_VersusConfigGet, 0u, 0u, 0u, 0u) != 0 ? 1u : 0u;
+}
+
+RECOMP_OVERRIDE(0x0050C10C) {
+    FE_ENTRY(0x0050C10C, ai_sim_is_power0_attack, FE_ARG(0));
+}
+
+RECOMP_OVERRIDE(0x00526B10) {
+    FE_ENTRY(0x00526B10, trick_is_destroy_target_castle_offense, FE_ARG(0));
+}
+
+RECOMP_OVERRIDE(0x004C5344) {
+    FE_ENTRY0(0x004C5344, versus_config_get);
+}
+
+RECOMP_OVERRIDE(0x00528238) {
+    FE_ENTRY(0x00528238, situation_is_versus, FE_ARG(0));
+}

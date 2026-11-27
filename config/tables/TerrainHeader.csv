@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x00,4,ptr:TerrainTile,tile_table,high,points at the first TID_ record in every terrain file (Terrain::Initialize(const char*) 004E0A2C loads the file)
+0x04,4,u32,tile_count,high,equals the number of TID_ labels in every file
+0x08,4,str,map_model,medium,data: Btl_* / map model names; Paragon FE14 Terrain.yml 'map_model' (fact)
+0x0C,4,ptr:TerrainGrid,grid,high,points at the 0x418-byte grid that ends every file

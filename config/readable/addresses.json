@@ -1,0 +1,38 @@
+{
+ "_comment": "Named guest addresses the code-side tools need (tools/readable/gameaddr.py). One entry per game key (config/game.json 'key'). Each address has the symbol-map name it must carry (checked by gameaddr.py --check when the map is extracted), the instruction set, and where the fact comes from. Addresses and names only. A value of null is a TODO: the tool that needs it refuses or skips until it is found.",
+ "fe14": {
+  "guard": {
+   "address": "0x00302C6C",
+   "symbol": "__cxa_guard_acquire",
+   "isa": "thumb",
+   "used_by": "harness one-time guard (gen_stubs.py guard users, FE_CAPTURE_GUARD default, fe_capture.h FE_CAP_DEFAULT_GUARD via include/readable/generated/fe_game.h)",
+   "evidence": "symbol map name; Thumb body = Awakening func_00314438 semantics (load guard word, if 0 set it to 1 and return 1, else return 0), read 2026-11-10 by tools/readable/symmap.py + word compare. ARM callers reach it with BLX imm, which gen_asm.py emits as a raw .inst, so guard callers are found by decoding code.bin, not by grepping asm/."
+  },
+  "operator_new": {
+   "address": "0x002FDC68",
+   "symbol": "operator new(unsigned int)",
+   "isa": "arm",
+   "used_by": "gen_headers.py (object sizes from operator new call sites)",
+   "evidence": "symbol map name; same shape as Awakening 0x0031521C (mov r1,r0; ldr r0,=allocator; mov r2,#8; load the allocator, call through its vtable)"
+  },
+  "operator_delete": {
+   "address": "0x002FDCE4",
+   "symbol": "operator delete(void*)",
+   "isa": "arm",
+   "used_by": "reference only",
+   "evidence": "symbol map name"
+  },
+  "pure_virtual": {
+   "address": "0x00103D0E",
+   "symbol": "__cxa_pure_virtual",
+   "isa": "thumb",
+   "used_by": "gen_headers.py (pure-virtual vtable slots), reference",
+   "evidence": "symbol map name; 2-aligned, so Thumb"
+  }
+ },
+ "fe13": {
+  "_comment": "The Awakening values these tools were written with, kept so the shared code can be re-checked against the Awakening port (read-only). Not used by the Fates repo at run time.",
+  "guard": {"address": "0x00314438", "symbol": null, "isa": "arm", "used_by": "harness", "evidence": "Awakening docs/HARNESS.md 4.5"},
+  "operator_new": {"address": "0x0031521C", "symbol": null, "isa": "arm", "used_by": "gen_headers.py", "evidence": "Awakening tools/gen_headers.py"}
+ }
+}

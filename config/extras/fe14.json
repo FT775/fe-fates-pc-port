@@ -1,0 +1,59 @@
+{
+ "_comment": ["Fates (fe14) screen and speed extras, our own patches found in this game's code (docs/EXTRAS.md).", "Read by tools/extras/usa_extras.py (native entries: tools/extras/native.py). Every site is checked against", "extracted/code.bin before a cheat file is written: the function that holds it (config/functions.csv), the", "instruction shape of every original word (regex on objdump text), the SHA-1 of the original bytes, and the", "disassembly of every new word. No original game bytes are stored here: only addresses, instruction text,", "a hash, and the words of our own patches. Speed words are filled in by the tool ({speed}, {fast}).", "Public 60 fps codes (GBAtemp, Foxes 2026) were not read or copied; sites come from the symbol-map names."],
+ "status": "ready",
+ "kind": "native",
+ "title": "Fire Emblem Fates - Special Edition (USA)",
+ "title_id": "0004000000179800",
+ "text_base": "0x00100000",
+ "text_end": "0x0061011C",
+ "text_page_end": "0x00611000",
+ "cave": ["0x00610400", "0x00610800"],
+ "speed": {"default": 150, "min": 100, "max": 200, "allowed_note": "percent of the game's normal battle speed; fast-forward becomes twice that"},
+ "extras": [
+  {
+   "id": "fps60",
+   "name": "60 fps battles (Fates port extra)",
+   "summary": "Battles (and class-change / job-intro scenes) draw 60 pictures a second instead of 30, at the same speed: the game moves battle animations by the time that passed, and the three clocks that counted game frames instead (hit-stop, slow-motion periods, the zoom-in / zoom-out camera) are switched to count time too.",
+   "how": "GameTime::ResetFrameStep(n) 0x004EBB38 stores n as the minimum, current and maximum number of vertical blanks per game frame (GameTime+0x10/+0x18/+0x14 = 0x006DCA94/9C/98). Graphics::WaitVSync 0x00106150 waits until that many have passed, and SceneSystem::GetDeltaTime 0x001A3858 / BattleUnit::GetTimeRate 0x0050527C scale animation by the same step. map::World::Setup and the castle pass 1 (60 fps); BattleSeq::Initialize and BattleUtil::BattleInitialize pass 2 (30 fps): the patch makes both pass 1. Three battle clocks add a fixed amount per game frame and would run twice as fast: TimeController::Tick's hit-stop (+0x18) and slow-motion periods (node +0x10) subtract the rate, TransitionCamera::Tick adds 1.0 to the encounter / comeback camera time (+0xBC). Each now goes through a small routine in the spare bytes after the code that scales the amount by step / 2 (the same as before at 30 fps).",
+   "sites": [
+    {"at": "0x004FBB9C", "func": "BattleSeq__Initialize", "what": "argument of the first call, bl GameTime::ResetFrameStep", "orig_asm": ["mov\\s+r0, #2$"], "orig_sha1": "124ae2656e3ac5213cafb3706f06847e3133eaca", "context": [{"at": "0x004FBBA4", "insn": "bl\\s+0x4ebb38$"}], "new_asm": ["mov r0, #1"], "words": ["E3A00001"]},
+    {"at": "0x00193900", "func": "BattleUtil__BattleInitialize", "what": "argument of bl GameTime::ResetFrameStep (ProcJobIntro, class change)", "orig_asm": ["mov\\s+r0, #2$"], "orig_sha1": "124ae2656e3ac5213cafb3706f06847e3133eaca", "context": [{"at": "0x00193908", "insn": "bl\\s+0x4ebb38$"}], "new_asm": ["mov r0, #1"], "words": ["E3A00001"]},
+    {"at": "0x00610440", "func": "(cave)", "what": "s0 -= s16 * step / 2: a TimeController count-down in vertical blanks instead of game frames", "orig_asm": ["andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$"], "orig_sha1": "2f1050adf64f33298ff0ce423eb86d4728441b21", "new_asm": ["push {ip} @ (str ip, [sp, #-4]!)", "ldr ip, [pc, #32] @ 0x61046c", "ldr ip, [ip]", "vmov s1, ip", "vcvt.f32.u32 s1, s1", "vldr s2, [pc, #20] @ 0x610470", "vmul.f32 s1, s1, s2", "vmul.f32 s1, s1, s16", "vsub.f32 s0, s0, s1", "pop {ip} @ (ldr ip, [sp], #4)", "bx lr", ".word 0x006dca9c", ".word 0x3f000000"], "words": ["E52DC004", "E59FC020", "E59CC000", "EE00CA90", "EEF80A60", "ED9F1A05", "EE600A81", "EE600A88", "EE300A60", "E49DC004", "E12FFF1E", "006DCA9C", "3F000000"]},
+    {"at": "0x001D5E08", "func": "TimeController__Tick", "what": "hit-stop (freeze) count-down: freeze -= rate, now rate * step / 2", "orig_asm": ["vsub\\.f32\\s+s0, s0, s16$"], "orig_sha1": "86b6ed1c58fbc051dccf8d179cfbb383c0a58e3e", "context": [{"at": "0x001D5DE8", "insn": "vldr\\s+s0, \\[r4, #24\\]"}, {"at": "0x001D5E1C", "insn": "vstr\\s+s0, \\[r4, #24\\]"}], "new_asm": ["bl 0x610440"], "words": ["EB10E98C"]},
+    {"at": "0x001D5EAC", "func": "TimeController__Tick", "what": "slow-motion period count-down: period -= rate, now rate * step / 2", "orig_asm": ["vsub\\.f32\\s+s0, s0, s16$"], "orig_sha1": "86b6ed1c58fbc051dccf8d179cfbb383c0a58e3e", "context": [{"at": "0x001D5EA4", "insn": "vldr\\s+s0, \\[r0, #16\\]"}, {"at": "0x001D5EB0", "insn": "vstr\\s+s0, \\[r0, #16\\]"}], "new_asm": ["bl 0x610440"], "words": ["EB10E963"]},
+    {"at": "0x00610480", "func": "(cave)", "what": "s0 += step / 2: the battle zoom-in / zoom-out camera's clock in vertical blanks instead of game frames", "orig_asm": ["andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$"], "orig_sha1": "045c85ba38952325e126c70962cc0f9d9077bc67", "new_asm": ["push {ip} @ (str ip, [sp, #-4]!)", "ldr ip, [pc, #24] @ 0x6104a4", "ldr ip, [ip]", "vmov s2, ip", "vcvt.f32.u32 s2, s2", "vldr s3, [pc, #12] @ 0x6104a8", "vmla.f32 s0, s2, s3", "pop {ip} @ (ldr ip, [sp], #4)", "bx lr", ".word 0x006dca9c", ".word 0x3f000000"], "words": ["E52DC004", "E59FC018", "E59CC000", "EE01CA10", "EEB81A41", "EDDF1A03", "EE010A21", "E49DC004", "E12FFF1E", "006DCA9C", "3F000000"]},
+    {"at": "0x001F1A80", "func": "TransitionCamera__Tick", "what": "the encounter / comeback camera time: time += 1.0 per game frame, now step / 2", "orig_asm": ["vadd\\.f32\\s+s0, s0, s17$"], "orig_sha1": "524b5d2fba423ed9fe1e0c33e3a0dd9ca17955e6", "context": [{"at": "0x001F1A78", "insn": "vldmia\\s+r0, \\{s0-s1\\}$"}, {"at": "0x001F1A90", "insn": "vstr\\s+s0, \\[r4, #188\\]"}, {"word": "0x001F1D5C", "float": 1.0}], "new_asm": ["bl 0x610480"], "words": ["EB107A7E"]}
+   ]
+  },
+  {
+   "id": "fps60_scenes",
+   "name": "60 fps story scenes (Fates port extra, test)",
+   "summary": "TEST ONLY, not recommended: 3D story scenes (CutSceneMain) and the title screen draw 60 pictures a second. The scenes keep their length, but the robot saw the game's random generator and the units' hidden random values come out different after a scene (docs/EXTRAS.md).",
+   "how": "CutSceneMain::CutSceneMain and Title::Create call GameTime::ResetFrameStep(2); the patch passes 1, as map::World::Setup does.",
+   "sites": [
+    {"at": "0x001AD9A4", "func": "CutSceneMain__CutSceneMain", "what": "argument of bl GameTime::ResetFrameStep", "orig_asm": ["mov\\s+r0, #2$"], "orig_sha1": "124ae2656e3ac5213cafb3706f06847e3133eaca", "context": [{"at": "0x001AD9AC", "insn": "bl\\s+0x4ebb38$"}], "new_asm": ["mov r0, #1"], "words": ["E3A00001"]},
+    {"at": "0x00420F28", "func": "Title__Create", "what": "argument of bl GameTime::ResetFrameStep (title screen)", "orig_asm": ["mov\\s+r0, #2$"], "orig_sha1": "124ae2656e3ac5213cafb3706f06847e3133eaca", "context": [{"at": "0x00420F30", "insn": "bl\\s+0x4ebb38$"}], "new_asm": ["mov r0, #1"], "words": ["E3A00001"]}
+   ]
+  },
+  {
+   "id": "battle_speed",
+   "name": "Faster battles {speed}% (Fates port extra)",
+   "summary": "Battle animations play at {speed}% of their normal speed. Fast-forward (hold A, or the >> button) plays at twice that; slow motion (hold Y) and pause (B, or the pause button) stay as they are. Battle results do not change.",
+   "how": "TimeController::Tick 0x001D5CAC asks TimerButtonController::GetSelected which battle button is held and sets the world time rate (+0x24): 2 = 0.5 (slow), 3 = 0 (pause), 4 = 2.0 (fast), anything else 1.0. SceneSystem::SetTimeRate then scales every battle animation. The ten words that pick the rate are rewritten: the normal rate comes from a word inside the block ({speed}/100), fast-forward from the next one (twice that); slow motion still loads the game's own 0.5 at 0x001D5F18 and pause still uses s17 (0.0). The block ends by storing the rate exactly where the original's cases did (0x001D5DC0).",
+   "sites": [
+    {"at": "0x001D5D74", "func": "TimeController__Tick", "what": "the rate pick after bl TimerButtonController::GetSelected (10 words)", "orig_asm": ["cmp\\s+r0, #2$", "vldreq\\s+s0, \\[pc, #\\d+\\]\\s+@ 0x1d5f18$", "beq\\s+0x1d5dc0$", "cmp\\s+r0, #3$", "vstreq\\s+s17, \\[r4, #36\\]", "beq\\s+0x1d5d9c$", "cmp\\s+r0, #4$", "vldreq\\s+s0, \\[pc, #\\d+\\]\\s+@ 0x1d5f1c$", "vstrne\\s+s18, \\[r4, #36\\]", "beq\\s+0x1d5dc0$"], "orig_sha1": "285b0162238e0eaca62edc6baed13a3d051d3940", "context": [{"at": "0x001D5D70", "insn": "bl\\s+0x21c3bc$"}, {"at": "0x001D5DC0", "insn": "vstr\\s+s0, \\[r4, #36\\]"}, {"word": "0x001D5F18", "float": 0.5}, {"word": "0x001D5F1C", "float": 2.0}, {"word": "0x001D5F14", "float": 0.0}, {"at": "0x001D5CC4", "insn": "vldr\\s+s17, \\[pc, #\\d+\\]\\s+@ 0x1d5f14$"}], "new_asm": ["vldr s0, [pc, #24] @ 0x1d5d94", "cmp r0, #2", "vldreq s0, [pc, #404] @ 0x1d5f18", "cmp r0, #4", "vldreq s0, [pc, #12] @ 0x1d5d98", "cmp r0, #3", "vmoveq.f32 s0, s17", "b 0x1d5dc0", ".word {speed}", ".word {fast}"], "words": ["ED9F0A06", "E3500002", "0D9F0A65", "E3500004", "0D9F0A03", "E3500003", "0EB00A68", "EA00000A", "{speed}", "{fast}"]}
+   ]
+  },
+  {
+   "id": "wide",
+   "name": "16:9 top screen (Fates port extra)",
+   "summary": "3D scenes (map, battles) are drawn with a 16:9 camera, to go with Zakuro's top screen shape 16:9 (Settings for this game). Menus, portraits and text stay as the game draws them and are stretched by Zakuro.",
+   "how": "ICamera::UpdateProj 0x004DADD4 (also reached from FieldCamera::UpdateProj, the map camera) and ICamera::UpdateStereo 0x004DB474 build the top-screen projection with nn::math MTX44PerspectiveRadC_FAST(out, fovy, aspect, near, far). The camera aspect is 5:3 (400/240; ICamera::ICamera, ICamera::Reset, CameraParam). Both calls go through a small routine in the spare bytes after the code: when the aspect is exactly 5:3 it is multiplied by 16/15 (5:3 -> 16:9), then the original function runs. Other aspects (the bottom screen's 4:3, render targets) are left alone.",
+   "sites": [
+    {"at": "0x00610400", "func": "(cave)", "what": "aspect 5:3 -> 16:9, then tail call MTX44PerspectiveRadC_FAST", "orig_asm": ["andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$", "andeq\\s+r0, r0, r0$"], "orig_sha1": "de8a847bff8c343d69b853a215e6ee775ef2ef96", "new_asm": ["vldr s4, [pc, #16] @ 0x610418", "vcmp.f32 s1, s4", "vmrs APSR_nzcv, fpscr", "vldreq s4, [pc, #8] @ 0x61041c", "vmuleq.f32 s1, s1, s4", "b 0x12ea7c", ".word 0x3fd55555", ".word 0x3f888889"], "words": ["ED9F2A04", "EEF40A42", "EEF1FA10", "0D9F2A02", "0E600A82", "EAEC7998", "3FD55555", "3F888889"]},
+    {"at": "0x004DAF40", "func": "ICamera__UpdateProj", "what": "the perspective case's call (s0-s3 = fovy, aspect, near, far from the camera +0x28)", "orig_asm": ["bl\\s+0x12ea7c$"], "orig_sha1": "4bc54c6c68be13abf775728803907936f5004216", "context": [{"at": "0x004DAF38", "insn": "vldmia\\s+r0, \\{s0-s3\\}$"}], "new_asm": ["bl 0x610400"], "words": ["EB04D52E"]},
+    {"at": "0x004DB6D4", "func": "ICamera__UpdateStereo", "what": "the stereo case's perspective call", "orig_asm": ["bl\\s+0x12ea7c$"], "orig_sha1": "d460e4b7a1d672a750b4ee4025772c3124c6f3fb", "new_asm": ["bl 0x610400"], "words": ["EB04D349"]}
+   ]
+  }
+ ]
+}

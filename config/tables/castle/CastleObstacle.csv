@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x0,4,list:CastleObstacle_Item,items,high,"castle::Obstacle::Setup (00497F64) reads row+0x0 -> {count, items}"

@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe13 <engine@localhost>
+Date: Mon, 9 Nov 2026 03:16:07 -0500
+Subject: [PATCH 01/21] gpu: screen markers and the bottom screen at native
+ size
+
+A game can name a few small pictures it draws only in one scene ("markers":
+texture format, size, screen and place). Draws that may be one are shaded on
+the CPU, which says where they land; the frontend takes the markers drawn
+each frame (Gpu::take_marked, Gpu::take_spans). Nothing changes for a game
+with no markers: the watch is empty unless the frontend sets one.
+
+Gpu::native_picture gives a screen's newest picture at the console's size
+from the capture the hardware renderer already keeps for write-backs.
+
+Adapted from fe-awakening-recomp 832fe86 (github.com/Zelkin1/fe-awakening-recomp,
+MIT, Copyright (c) 2026 the authors of the Fire Emblem: Awakening
+recompilation project), patches/zakuro-local-changes.patch: raster.rs
+Marker/Place/MarkerWatch/marker_drawn, lib.rs marker API and native_picture,
+hardware.rs native_picture/read_picture. Only the marker and readback parts
+are taken; its scissor, blit-edge, texture-copy and decoding changes are not.
+---
+ crates/zakuro-gpu/src/lib.rs             |  35 +++++
+ crates/zakuro-gpu/src/raster.rs          | 165 ++++++++++++++++++++++-
+ crates/zakuro-gpu/src/raster/hardware.rs |  48 ++++++-
+ 3 files changed, 239 insertions(+), 9 deletions(-)
+
+diff --git a/crates/zakuro-gpu/src/lib.rs b/crates/zakuro-gpu/src/lib.rs
+index 53095f0..954ebac 100644
+--- a/crates/zakuro-gpu/src/lib.rs
++++ b/crates/zakuro-gpu/src/lib.rs
+@@ -25,6 +25,7 @@ use format::ColorFormat;
+ pub use interpolation::Matches;
+ use registers::*;
+ pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
++pub use raster::{Marker, Place};
+ pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
+ #[cfg(feature = "vulkan")]
+ pub use device::SharedDevice;
+@@ -744,6 +745,28 @@ impl Gpu {
+         on
+     }
+ 
++    /// the game's screen markers, which draws to watch for. none, the
++    /// default, watches for nothing.
++    pub fn set_markers(&mut self, markers: Vec<Marker>) {
++        self.resources.marker_watch.markers = markers;
++    }
++
++    /// whether the game has screen markers.
++    pub fn follows_markers(&self) -> bool {
++        !self.resources.marker_watch.markers.is_empty()
++    }
++
++    /// the markers drawn since the last call.
++    pub fn take_marked(&mut self) -> Vec<u32> {
++        std::mem::take(&mut self.resources.marker_watch.drawn)
++    }
++
++    /// where each marker drawn since the last call was first drawn: left,
++    /// top, right, bottom, fractions of its screen.
++    pub fn take_spans(&mut self) -> Vec<(u32, [f32; 4])> {
++        std::mem::take(&mut self.resources.marker_watch.spans)
++    }
++
+     /// whether frame interpolation is on.
+     pub fn interpolates(&self) -> bool {
+         self.interpolation.is_some()
+@@ -818,6 +841,18 @@ impl Gpu {
+         None
+     }
+ 
++    /// a screen's newest picture at the console's own size, upright RGBA,
++    /// as the host's GPU drew it, none until it drew one.
++    pub fn native_picture(&mut self, screen: ScreenRef) -> Option<Vec<u8>> {
++        #[cfg(feature = "vulkan")]
++        if let Some(hardware) = self.resources.hardware.as_mut() {
++            return hardware.native_picture(screen);
++        }
++        #[cfg(not(feature = "vulkan"))]
++        let _ = screen;
++        None
++    }
++
+     /// a screen's picture upright, RGBA the way the screen shows it, and the
+     /// scale it is at, once the GPU finished it.
+     pub fn scaled_picture(&mut self, screen: ScreenRef) -> Option<Picture> {
+diff --git a/crates/zakuro-gpu/src/raster.rs b/crates/zakuro-gpu/src/raster.rs
+index 2e71e86..403e4f4 100644
+--- a/crates/zakuro-gpu/src/raster.rs
++++ b/crates/zakuro-gpu/src/raster.rs
+@@ -1344,6 +1344,108 @@ fn to_screen(vertex: &Vertex, viewport: (f32, f32, f32, f32)) -> Option<Screen>
+     })
+ }
+ 
++/// the most vertices a draw a game's screen marker is can have: markers are
++/// small pictures (a window, a panel), drawn with a few quads.
++const MARKER_VERTICES: u32 = 64;
++
++/// a picture a game draws only in one scene, which tells the frontend what
++/// shows: its texture's format and size, the screen it is drawn on, and
++/// where on that screen (fractions of the screen, upright).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Marker {
++    pub id: u32,
++    pub format: u32,
++    pub width: u32,
++    pub height: u32,
++    pub place: Place,
++    pub bottom: bool,
++}
++
++impl Marker {
++    /// the format of a marker drawn with no texture.
++    pub const UNTEXTURED: u32 = u32::MAX;
++
++    fn matches_texture(&self, registers: &[u32]) -> bool {
++        if registers[REG_TEXTURE_CONFIG] & 1 == 0 {
++            return self.format == Self::UNTEXTURED;
++        }
++        let (width, height) = texture0_size(registers);
++        self.format == registers[REG_TEXTURE0_FORMAT] & 0xF && self.width == width && self.height == height
++    }
++
++    /// whether the viewport is the marker's screen, the console's buffers
++    /// lying on their side.
++    fn targets(&self, (_, _, width, height): (f32, f32, f32, f32)) -> bool {
++        let screen_height = if self.bottom { 320.0 } else { 400.0 };
++        (width - 240.0).abs() <= 0.5 && (height - screen_height).abs() <= 0.5
++    }
++}
++
++/// the ranges a marker's left, top, width and height may be in, as
++/// fractions of its screen.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Place {
++    pub left: [f32; 2],
++    pub top: [f32; 2],
++    pub width: [f32; 2],
++    pub height: [f32; 2],
++}
++
++impl Place {
++    fn contains(&self, [left, top, right, bottom]: [f32; 4]) -> bool {
++        let within = |value: f32, [from, to]: [f32; 2]| (from..=to).contains(&value);
++        within(left, self.left) && within(top, self.top) && within(right - left, self.width) && within(bottom - top, self.height)
++    }
++}
++
++/// the markers a game has, and those drawn since the frontend last looked,
++/// with where each was first drawn.
++#[derive(Default)]
++pub(crate) struct MarkerWatch {
++    pub(crate) markers: Vec<Marker>,
++    pub(crate) drawn: Vec<u32>,
++    pub(crate) spans: Vec<(u32, [f32; 4])>,
++}
++
++impl MarkerWatch {
++    fn may_match(&self, registers: &[u32]) -> bool {
++        self.markers.iter().any(|marker| marker.matches_texture(registers))
++    }
++
++    fn record(&mut self, id: u32, span: [f32; 4]) {
++        if !self.drawn.contains(&id) {
++            self.drawn.push(id);
++        }
++        if !self.spans.iter().any(|&(seen, _)| seen == id) {
++            self.spans.push((id, span));
++        }
++    }
++}
++
++fn texture0_size(registers: &[u32]) -> (u32, u32) {
++    let dimensions = registers[REG_TEXTURE0_DIMENSIONS];
++    ((dimensions >> 16) & 0x7FF, dimensions & 0x7FF)
++}
++
++/// where on the screen, upright and in fractions of it, a draw's vertices
++/// reach: left, top, right, bottom.
++fn screen_span(vertices: &[Vertex], viewport: (f32, f32, f32, f32)) -> Option<[f32; 4]> {
++    let (x, y, width, height) = viewport;
++    vertices.iter().filter_map(|vertex| to_screen(vertex, viewport)).fold(None, |span: Option<[f32; 4]>, screen| {
++        let (across, down) = (1.0 - (screen.y - y) / height, 1.0 - (screen.x - x) / width);
++        let [left, top, right, bottom] = span.unwrap_or([across, down, across, down]);
++        Some([left.min(across), top.min(down), right.max(across), bottom.max(down)])
++    })
++}
++
++/// the marker a draw is, and where it is, if it is one.
++fn marker_drawn(registers: &[u32], markers: &[Marker], shaded: Option<&[Vertex]>, viewport: (f32, f32, f32, f32)) -> Option<(u32, [f32; 4])> {
++    let mut candidates = markers.iter().filter(|marker| marker.targets(viewport) && marker.matches_texture(registers)).peekable();
++    candidates.peek()?;
++    let span = shaded.and_then(|vertices| screen_span(vertices, viewport))?;
++    candidates.find(|marker| marker.place.contains(span)).map(|marker| (marker.id, span))
++}
++
+ /// signed distances to the planes of the volume the PICA draws, w
+ /// positive, and -w <= z <= 0, a vertex is inside when all are >= 0.
+ const CLIP_PLANES: [fn(&Vertex) -> f32; 3] = [|v| v.clip[3] - 1e-5, |v| -v.clip[2], |v| v.clip[2] + v.clip[3]];
+@@ -1537,6 +1639,8 @@ pub struct Resources {
+     /// where the last draw's varyings were in the output registers.
+     #[cfg(feature = "vulkan")]
+     semantics: LastSemantics,
++    /// the game's screen markers, none for most games.
++    pub(crate) marker_watch: MarkerWatch,
+     /// the host GPU, when draws go to it rather than to the software path.
+     #[cfg(feature = "vulkan")]
+     pub(crate) hardware: Option<hardware::Hardware>,
+@@ -2885,9 +2989,12 @@ pub fn draw<M: GpuMemory>(
+         plan.loaders.iter().map(|l| (l.offset, l.stride, l.size)).collect::<Vec<_>>(),
+     );
+     // the GPU decodes the arrays itself when it shades the draw, from the
+-    // first vertex the draw uses to the last
++    // first vertex the draw uses to the last. a draw that may be a screen
++    // marker is shaded on the CPU, which says where it lands
++    #[cfg(feature = "vulkan")]
++    let may_be_marker = vertex_count <= MARKER_VERTICES && resources.marker_watch.may_match(registers);
+     #[cfg(feature = "vulkan")]
+-    if resources.hardware.as_ref().is_some_and(|hardware| hardware.shades()) && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
++    if resources.hardware.as_ref().is_some_and(|hardware| hardware.shades()) && registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 && !may_be_marker {
+         let index_short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
+         let first_vertex = registers[REG_VERTEX_OFFSET];
+         let (first, span) = if indexed {
+@@ -3109,6 +3216,19 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
+     }
+ }
+ 
++/// a draw's vertices through the shaders on the CPU, none for arrays only
++/// the GPU decodes.
++fn cpu_shaded_vertices(registers: &[u32], vertices: Vertices) -> Option<Vec<Vertex>> {
++    match vertices {
++        Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order } if registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 => {
++            Some(process_vertices(registers, vertex_shader, geometry_shader, inputs, order).0)
++        }
++        Vertices::Shaded(shaded) => Some(shaded.to_vec()),
++        Vertices::Prepared(prepared) => Some(prepared.shaded.clone()),
++        _ => None,
++    }
++}
++
+ /// assembles shaded vertices into triangles the way the primitive configuration
+ /// says, and fills them with the current back-end state.
+ /// the triangles drawn, none for arrays the GPU could not decode, which the
+@@ -3185,6 +3305,18 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
+     }
+     let textures: [Option<BoundTexture>; 3] =
+         std::array::from_fn(|unit| bind_texture(registers, memory, &mut resources.textures, unit, drawn[unit], past[unit]));
++    // a game's screen marker, seen once per real frame (not in the frames
++    // drawn in between for frame interpolation)
++    #[cfg(feature = "vulkan")]
++    let interpolated_pass = resources.hardware.as_ref().is_some_and(|hardware| hardware.pass == Pass::Twin);
++    #[cfg(not(feature = "vulkan"))]
++    let interpolated_pass = false;
++    if !interpolated_pass && vertex_count as u32 <= MARKER_VERTICES && resources.marker_watch.may_match(registers) {
++        let cpu_vertices = cpu_shaded_vertices(registers, vertices);
++        if let Some((id, span)) = marker_drawn(registers, &resources.marker_watch.markers, cpu_vertices.as_deref(), viewport) {
++            resources.marker_watch.record(id, span);
++        }
++    }
+     let tex_env = resources.tex_env.read(registers);
+     // the lighting only matters to a draw whose combiners read it.
+     let lighting = if tex_env.reads_lighting() { resources.lighting.read(registers) } else { None };
+@@ -3408,6 +3540,35 @@ mod tests {
+         [&vertex.clip[..], &vertex.color, texcoords, &vertex.quaternion, &vertex.view, &[vertex.texcoord0_w]].concat().iter().map(|v| v.to_bits()).collect()
+     }
+ 
++    fn placed_at((x, y): (f32, f32), (width, height): (f32, f32), w: f32, uv: [f32; 2]) -> Vertex {
++        let clip = [(x / width * 2.0 - 1.0) * w, (y / height * 2.0 - 1.0) * w, 0.0, w];
++        Vertex { clip, color: [1.0; 4], texcoords: [uv, [0.0; 2], [0.0; 2]], quaternion: [0.0; 4], view: [0.0; 3], texcoord0_w: 1.0 }
++    }
++
++    #[test]
++    fn a_marker_is_found_by_its_texture_and_place() {
++        let mut registers = vec![0u32; 0x300];
++        registers[REG_TEXTURE_CONFIG] = 1;
++        registers[REG_TEXTURE0_DIMENSIONS] = 32 << 16 | 32;
++        registers[REG_TEXTURE0_FORMAT] = 0xD;
++        let top_screen = (0.0, 0.0, 240.0, 400.0);
++        let bottom_screen = (0.0, 0.0, 240.0, 320.0);
++        let size = (240.0, 400.0);
++        let corner = |down: f32, across: f32| placed_at((240.0 - down, 400.0 - across), size, 1.0, [0.0; 2]);
++        let unit_window = [corner(4.0, 256.0), corner(4.0, 400.0), corner(44.0, 256.0), corner(44.0, 400.0)];
++        let terrain_window = [corner(4.0, 0.0), corner(4.0, 144.0), corner(44.0, 0.0), corner(44.0, 144.0)];
++        let place = Place { left: [0.55, 0.98], top: [0.0, 0.06], width: [0.3, 0.42], height: [0.12, 0.21] };
++        let marker = Marker { id: 7, format: 0xD, width: 32, height: 32, place, bottom: false };
++        assert_eq!(marker_drawn(&registers, &[marker], Some(&unit_window), top_screen).map(|(id, _)| id), Some(7));
++        assert_eq!(marker_drawn(&registers, &[marker], Some(&terrain_window), top_screen), None);
++        assert_eq!(marker_drawn(&registers, &[marker], None, top_screen), None);
++        assert_eq!(marker_drawn(&registers, &[marker], Some(&unit_window), bottom_screen), None);
++        let wider = Marker { width: 64, ..marker };
++        assert_eq!(marker_drawn(&registers, &[wider], Some(&unit_window), top_screen), None);
++        registers[REG_TEXTURE_CONFIG] = 0;
++        assert_eq!(marker_drawn(&registers, &[marker], Some(&unit_window), top_screen), None);
++    }
++
+     /// placing a vertex's fields gives the bits reading each component
+     /// does, for every type and count.
+     #[test]
+diff --git a/crates/zakuro-gpu/src/raster/hardware.rs b/crates/zakuro-gpu/src/raster/hardware.rs
+index 2257602..ba55738 100644
+--- a/crates/zakuro-gpu/src/raster/hardware.rs
++++ b/crates/zakuro-gpu/src/raster/hardware.rs
+@@ -4809,13 +4809,44 @@ impl Hardware {
+             return Ok(crop(image));
+         }
+         // its batch finished before a screen showed the surface
+-        self.read_picture(index)?;
++        self.read_picture(index, false)?;
+         Ok(picture(&self.surfaces, index).and_then(crop))
+     }
+ 
+-    /// reads the picture a finished batch left in a surface's screen buffer.
+-    fn read_picture(&mut self, index: usize) -> Result<(), String> {
+-        let Some(capture) = self.surfaces[index].screen.as_mut() else { return Ok(()) };
++    /// a screen's newest picture at the console's own size, upright RGBA,
++    /// from the capture its buffer is written back to memory from. asking
++    /// once watches the buffer: each later picture is read out as its batch
++    /// finishes, so the first call may find none yet.
++    pub(crate) fn native_picture(&mut self, screen: ScreenRef) -> Option<Vec<u8>> {
++        let (row_pixels, rows) = screen.size;
++        if screen.rows != (0, rows) || screen.columns != row_pixels {
++            return None;
++        }
++        let index = self.surfaces.iter().position(|s| {
++            s.addr == screen.addr && s.width == row_pixels && s.height == rows && s.kind == Kind::Color(screen.format) && !s.tiled
++        })?;
++        let capture = self.surfaces[index].capture.as_mut()?;
++        capture.watched = true;
++        let (_, image) = capture.pictures.back()?;
++        let (width, height) = (rows as usize, row_pixels as usize);
++        if image.len() < width * height * 4 {
++            return None;
++        }
++        let mut out = vec![0u8; width * height * 4];
++        for x in 0..width {
++            for y in 0..height {
++                let at = ((width - 1 - x) * height + (height - 1 - y)) * 4;
++                out[(y * width + x) * 4..][..4].copy_from_slice(&image[at..at + 4]);
++            }
++        }
++        Some(out)
++    }
++
++    /// reads the picture a finished batch left in a surface's screen buffer,
++    /// or in its capture at the console's own size when native.
++    fn read_picture(&mut self, index: usize, native: bool) -> Result<(), String> {
++        let surface = &mut self.surfaces[index];
++        let Some(capture) = (if native { surface.capture.as_mut() } else { surface.screen.as_mut() }) else { return Ok(()) };
+         let buffer = &capture.buffer;
+         if buffer.incoherent {
+             let range = [vk::MappedMemoryRange::default().memory(buffer.memory).offset(0).size(vk::WHOLE_SIZE)];
+@@ -5138,9 +5169,12 @@ impl Hardware {
+         // pictures for screens are read out before a later batch can draw
+         // over them
+         for index in 0..self.surfaces.len() {
+-            let finished = self.surfaces[index].screen.as_ref().is_some_and(|capture| capture.watched && Some(capture.batch) == batch);
+-            if finished {
+-                self.read_picture(index)?;
++            for native in [false, true] {
++                let surface = &self.surfaces[index];
++                let capture = if native { surface.capture.as_ref() } else { surface.screen.as_ref() };
++                if capture.is_some_and(|capture| capture.watched && Some(capture.batch) == batch) {
++                    self.read_picture(index, native)?;
++                }
+             }
+         }
+         Ok(())

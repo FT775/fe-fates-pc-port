@@ -1,0 +1,702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 13:08:32 -0500
+Subject: [PATCH 0026] page: Fire Emblem Fates randomizer: the page robot hook
+ (FEF_PAGEBOT)
+
+The Randomizer page reports where it drew each control this frame
+(RandoPage::targets: btn:start, btn:everything_on, btn:defaults,
+btn:back, btn:original, btn:random, row:<key>, opt:<key>=<value>) and
+the background makes it threw away (RandoPage::thrown), and offers
+values_text() (the exact text Start game sends), has_rows() and
+rows_settled(). Nothing else on the page changes.
+
+New pagebot.rs: with FEF_PAGEBOT=<script.json> and
+FEF_PAGEBOT_LOG=<file> in a --headless run of Fire Emblem Fates, the
+mode pick waits for the page as it does with a window (the game does
+not run while the page is open), the real page is drawn each frame
+into an egui context that has no window, and the script's clicks are
+real pointer events at the rectangles the page reported (a click goes
+out only at a rectangle that stayed the same for two frames). One JSON
+line per event in the log (hook, page_open, prebuild_start,
+prebuild_done, discarded, click, expect, answer, laid, avatar, end).
+The run ends by itself when the script is done, or after 10 minutes
+with the page open. The headless pace (FEF_HEADLESS_PACE) does not
+count the time the page was open.
+
+Without FEF_PAGEBOT nothing runs: run_headless and rando() take the old
+path (round 61: the headless memory hashes of a run with the randomizer
+off are identical to the round-60 exe's at frames 0, 3000, 4600, 5200).
+Tools: tools/harness/pagebot.py, docs/tests/PAGEBOT.md.
+---
+ crates/zakuro/src/lib.rs        | 100 ++++++++++++-
+ crates/zakuro/src/pagebot.rs    | 247 ++++++++++++++++++++++++++++++++
+ crates/zakuro/src/rando_page.rs | 113 ++++++++++++---
+ 3 files changed, 442 insertions(+), 18 deletions(-)
+ create mode 100644 crates/zakuro/src/pagebot.rs
+
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 2f0fdc8..904d384 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -13,6 +13,7 @@ mod input;
+ mod library;
+ mod menus;
+ mod overlays;
++mod pagebot;
+ mod present;
+ mod rando_link;
+ mod rando_page;
+@@ -134,6 +135,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+             menus.slot = 1;
+             menus
+         },
++        pagebot: None,
+         jobs: Vec::new(),
+         waiting: Vec::new(),
+         download_compiler: false,
+@@ -546,6 +548,9 @@ struct App {
+     game: Option<Running>,
+     library: Library,
+     menus: Menus,
++    /// round 61: the page robot hook (FEF_PAGEBOT, headless only; pagebot.rs). None in every
++    /// other run.
++    pagebot: Option<pagebot::PageBot>,
+     jobs: Vec<Job>,
+     /// the games waiting for their turn to recompile, the next one first.
+     waiting: Vec<Wanted>,
+@@ -1263,6 +1268,19 @@ impl App {
+         let mut outcome = FrameOutcome::Completed;
+         let mut ran = 0;
+         let mut since = 0;
++        // round 61: FEF_PAGEBOT (pagebot.rs): the mode pick waits for the real page, drawn
++        // with no window and clicked by the script; without it nothing below changes
++        if self.game.as_ref().is_some_and(|game| rando_link::is_fates(&game.system)) {
++            self.pagebot = pagebot::PageBot::from_env();
++        }
++        if self.pagebot.is_some() {
++            if let Some(game) = &mut self.game {
++                rando_link::set_interactive(&mut game.system, true);
++            }
++            self.menus.rando.ask();
++        }
++        // the time the page was open (the game waited): the pace's clock does not count it
++        let mut paused = Duration::ZERO;
+         for frame in 0..frames {
+             if switches.contains(&frame) && frame > 0 {
+                 if report.is_some() {
+@@ -1277,6 +1295,9 @@ impl App {
+                     records.push(self.headless_record("boot", frame, 0, &ranges));
+                 }
+             }
++            if self.pagebot.is_some() && !self.pagebot_page(pace, ran, &mut paused) {
++                break;
++            }
+             let Some(game) = &mut self.game else { break };
+             // ZAKURO_REPLAY plays its inputs back headless too (a test run that gets past
+             // the title by itself, Fire Emblem Fates' randomizer test hook for one); a
+@@ -1288,8 +1309,17 @@ impl App {
+             ran += 1;
+             // FEF_HEADLESS_PACE=<frames per second>: a headless run kept to the clock (a
+             // timing test as a player sees it), never faster than that
++            if self.pagebot.is_some() {
++                self.pagebot_after_frame(ran);
++                if self.pagebot.as_ref().is_some_and(pagebot::PageBot::finished) {
++                    if let Some(bot) = &mut self.pagebot {
++                        bot.event("end", serde_json::json!({"frame": ran}));
++                    }
++                    break;
++                }
++            }
+             if let Some(fps) = pace.filter(|f| *f > 0.0) {
+-                let due = start + Duration::from_secs_f64(ran as f64 / fps);
++                let due = start + paused + Duration::from_secs_f64(ran as f64 / fps);
+                 let now = Instant::now();
+                 if due > now {
+                     std::thread::sleep(due - now);
+@@ -1326,6 +1356,65 @@ impl App {
+         }
+     }
+ 
++    /// round 61, the page robot hook: before a game frame, the page's frames while it is open
++    /// (the game waits, as with a window), each kept to the pace. False = the run ends (the
++    /// page stayed open too long).
++    fn pagebot_page(&mut self, pace: Option<f64>, ran: u64, paused: &mut Duration) -> bool {
++        let data = self.data_dir.clone();
++        let fps = pace.filter(|f| *f > 0.0).unwrap_or(60.0);
++        let opened = Instant::now();
++        let mut frames = 0u64;
++        loop {
++            let Some(mut bot) = self.pagebot.take() else { return true };
++            let actions = bot.frame(&mut self.menus.rando, data.as_deref(), ran);
++            self.pagebot = Some(bot);
++            self.rando(actions);
++            if !self.menus.rando.new_game {
++                break;
++            }
++            frames += 1;
++            if frames > pagebot::PAGE_FRAMES_MAX {
++                if let Some(bot) = &mut self.pagebot {
++                    bot.event("timeout", serde_json::json!({"page_frames": frames}));
++                }
++                return false;
++            }
++            let due = opened + Duration::from_secs_f64(frames as f64 / fps);
++            let now = Instant::now();
++            if due > now {
++                std::thread::sleep(due - now);
++            }
++        }
++        *paused += opened.elapsed();
++        true
++    }
++
++    /// round 61, the page robot hook: after a game frame, the mode pick opens the page, and
++    /// the core's reply to the page's answer is logged.
++    fn pagebot_after_frame(&mut self, ran: u64) {
++        let pending = self.game.as_mut().is_some_and(|game| rando_link::take_pending(&mut game.system));
++        if pending {
++            self.menus.rando.game = self.game.as_ref().and_then(|game| game.system.config.fates_rando_game.clone());
++            self.menus.rando.open_new_game();
++            if let Some(bot) = &mut self.pagebot {
++                bot.event("page_open", serde_json::json!({"frame": ran}));
++            }
++        }
++        let laid = self.game.as_ref().and_then(|game| rando_link::active_run(&game.system));
++        let Some(bot) = &mut self.pagebot else { return };
++        if let Some(reply) = bot.answered.take() {
++            match reply {
++                Ok(run) if bot.laid_at.is_none() => {
++                    bot.event("laid", serde_json::json!({"id": run, "active": laid, "frame": ran}));
++                    bot.laid_at = Some(ran);
++                }
++                Ok(_) => {}
++                Err(why) => bot.event("answer_failed", serde_json::json!({"why": why, "frame": ran})),
++            }
++        }
++        bot.tick(ran);
++    }
++
+     /// one record of FEF_HEADLESS_REPORT: the game, its data folder, the frame, whether
+     /// the randomizer may run, and the sha256 of each range of memory asked for.
+     fn headless_record(&mut self, event: &str, frame: u64, game_frame: u64, ranges: &[(u32, usize)]) -> serde_json::Value {
+@@ -2545,7 +2634,14 @@ impl App {
+         let data = self.data_dir.clone();
+         let Some(game) = &mut self.game else { return };
+         if let Some(text) = answers.into_iter().next() {
+-            let result = rando_link::answer(&mut game.system, &text).map(|run| {
++            if let Some(bot) = &mut self.pagebot {
++                bot.event("answer", serde_json::json!({"text": text}));
++            }
++            let reply = rando_link::answer(&mut game.system, &text);
++            if let Some(bot) = &mut self.pagebot {
++                bot.answered = Some(reply.clone());
++            }
++            let result = reply.map(|run| {
+                 let notices = rando_link::notices(&game.system);
+                 let parsed = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
+                 match run {
+diff --git a/crates/zakuro/src/pagebot.rs b/crates/zakuro/src/pagebot.rs
+new file mode 100644
+index 0000000..c9c7e2d
+--- /dev/null
++++ b/crates/zakuro/src/pagebot.rs
+@@ -0,0 +1,247 @@
++//! The Fates port's page robot hook (round 61; tools/harness/pagebot.py, docs/tests/PAGEBOT.md).
++//!
++//! With FEF_PAGEBOT=<script.json> and FEF_PAGEBOT_LOG=<file> in a `--headless` run of Fire
++//! Emblem Fates, the mode pick waits for the Randomizer page as it does with a window, the
++//! real page (rando_page.rs, its own rows, background make, throw-away, Start game and
++//! clean-up) is drawn each frame into an egui context that has no window, and the script's
++//! clicks are real pointer events at the rectangles the page's controls reported. While the
++//! page is open the game waits, as with a window. One JSON line per event goes to the log.
++//! When the script's last step is done the run ends by itself.
++//!
++//! Nothing here runs without FEF_PAGEBOT: the program does exactly what it did before.
++
++use std::io::Write;
++use std::path::{Path, PathBuf};
++use std::time::Instant;
++
++use serde_json::{json, Value};
++
++use crate::rando_page::{PageAction, RandoPage};
++
++/// page frames (at 60 a second) the page may stay open before the run gives up: 10 minutes.
++pub const PAGE_FRAMES_MAX: u64 = 60 * 600;
++
++/// page frames the page is drawn before the script's first step after it opened (egui sizes
++/// a new window in its first frames; the rectangles are final after that).
++const SETTLE_FRAMES: u32 = 5;
++
++pub struct PageBot {
++    steps: Vec<Value>,
++    next: usize,
++    ctx: egui::Context,
++    log: std::fs::File,
++    started: Instant,
++    pending: Vec<egui::Event>,
++    release: Option<egui::Pos2>,
++    time: f64,
++    last_prebuild: Option<(String, bool)>,
++    open_frames: u32,
++    /// the click target looked for and its rectangle last frame: a click goes out only at a
++    /// rectangle that stayed the same for two frames (a choice list's first frame is a sizing
++    /// pass, drawn elsewhere and not clickable)
++    seen: Option<(String, egui::Rect)>,
++    /// page frames drawn while the page was open (the game waited)
++    pub page_frames: u64,
++    /// game frames from the lay to the avatar creator (pagebot.py's calibration)
++    avatar_after: Option<u64>,
++    /// the game frame the core laid the randomized game (or went on with the original)
++    pub laid_at: Option<u64>,
++    /// the core's reply to the page's answer this frame (set by the program's rando())
++    pub answered: Option<Result<Option<String>, String>>,
++}
++
++impl PageBot {
++    /// the hook, when FEF_PAGEBOT names a readable script and FEF_PAGEBOT_LOG a writable file.
++    pub fn from_env() -> Option<PageBot> {
++        let script = std::env::var_os("FEF_PAGEBOT")?;
++        let log_path = PathBuf::from(std::env::var_os("FEF_PAGEBOT_LOG")?);
++        let script: Value = match std::fs::read_to_string(&script).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
++            Ok(script) => script,
++            Err(error) => {
++                log::warn!(target: "zakuro::pagebot", "FEF_PAGEBOT {script:?}: {error}");
++                return None;
++            }
++        };
++        let log = std::fs::File::create(&log_path).map_err(|e| log::warn!(target: "zakuro::pagebot", "{}: {e}", log_path.display())).ok()?;
++        let mut bot = PageBot {
++            steps: script["steps"].as_array().cloned().unwrap_or_default(),
++            next: 0,
++            ctx: egui::Context::default(),
++            log,
++            started: Instant::now(),
++            pending: Vec::new(),
++            release: None,
++            time: 0.0,
++            last_prebuild: None,
++            open_frames: 0,
++            seen: None,
++            page_frames: 0,
++            avatar_after: script["avatar_after"].as_u64(),
++            laid_at: None,
++            answered: None,
++        };
++        let n = bot.steps.len();
++        bot.event("hook", json!({"steps": n, "avatar_after": bot.avatar_after}));
++        Some(bot)
++    }
++
++    /// one line of the log: {"event": name, "ms": since the hook started, ...extra}.
++    pub fn event(&mut self, name: &str, extra: Value) {
++        let mut line = json!({"event": name, "ms": self.started.elapsed().as_millis() as u64});
++        if let (Some(o), Value::Object(e)) = (line.as_object_mut(), extra) {
++            o.extend(e);
++        }
++        let _ = writeln!(self.log, "{line}");
++        let _ = self.log.flush();
++    }
++
++    /// every step of the script is done.
++    pub fn finished(&self) -> bool {
++        self.next >= self.steps.len()
++    }
++
++    /// one page frame: the next script step, then the real page drawn with its events. Called
++    /// every frame, the page open or not (closed, the page only makes its early guess).
++    pub fn frame(&mut self, page: &mut RandoPage, data: Option<&Path>, game_frame: u64) -> Vec<PageAction> {
++        if page.new_game {
++            self.open_frames = self.open_frames.saturating_add(1);
++            self.page_frames += 1;
++        } else {
++            self.open_frames = 0;
++        }
++        let pb = page.prebuild.as_mut().map(|p| {
++            p.poll();
++            (p.id.clone(), p.result.is_some())
++        });
++        if pb != self.last_prebuild {
++            match &pb {
++                Some((id, true)) => {
++                    let ok = page.prebuild.as_ref().is_some_and(|p| matches!(p.result, Some(Ok(_))));
++                    let text = page.prebuild.as_ref().map(|p| p.text.clone()).unwrap_or_default();
++                    self.event("prebuild_done", json!({"id": id, "ok": ok, "text": text, "frame": game_frame}))
++                }
++                Some((id, false)) => {
++                    let text = page.prebuild.as_ref().map(|p| p.text.clone()).unwrap_or_default();
++                    self.event("prebuild_start", json!({"id": id, "text": text, "frame": game_frame}))
++                }
++                None => {}
++            }
++            self.last_prebuild = pb;
++        }
++        for id in std::mem::take(&mut page.thrown) {
++            self.event("discarded", json!({"id": id}));
++        }
++        if page.new_game {
++            self.step(page);
++        }
++        self.time += 1.0 / 60.0;
++        let mut events = std::mem::take(&mut self.pending);
++        if events.is_empty() {
++            if let Some(pos) = self.release.take() {
++                events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
++            }
++        }
++        let input = egui::RawInput {
++            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 480.0))),
++            time: Some(self.time),
++            focused: true,
++            events,
++            ..Default::default()
++        };
++        let mut actions = Vec::new();
++        self.ctx
++            .run_ui(input, |ui| actions = page.draw_new_game(ui.ctx(), data))
++            .drop_without_applying_deltas();
++        actions
++    }
++
++    /// the waits that need no page frame (laid, avatar): called after every game frame.
++    pub fn tick(&mut self, game_frame: u64) {
++        let Some(step) = self.steps.get(self.next).cloned() else { return };
++        let done = match step["wait"].as_str() {
++            Some("laid") => self.laid_at.is_some(),
++            Some("avatar") => self.laid_at.zip(self.avatar_after).is_some_and(|(at, n)| game_frame >= at + n),
++            _ => false,
++        };
++        if done {
++            if step["wait"] == "avatar" {
++                self.event("avatar", json!({"frame": game_frame}));
++            } else {
++                self.event("wait_done", json!({"wait": step["wait"], "frame": game_frame}));
++            }
++            self.next += 1;
++        }
++    }
++
++    fn step(&mut self, page: &mut RandoPage) {
++        if self.release.is_some() || self.open_frames < SETTLE_FRAMES {
++            return; // a click's release goes out first; a new window settles first
++        }
++        let Some(step) = self.steps.get(self.next).cloned() else { return };
++        if let Some(w) = step["wait"].as_str() {
++            if w == "page_open" && page.rows_settled() && !page.has_rows() {
++                // no rows (no Python or no tool): the page offers only the original game; the
++                // script cannot go on, the run ends
++                self.event("rows_missing", json!({}));
++                self.next = self.steps.len();
++                return;
++            }
++            let done = match w {
++                "page_open" => page.has_rows() && page.targets.iter().any(|(k, _)| k == "btn:start"),
++                "prebuild_done" => page.prebuild.as_ref().is_some_and(|p| p.result.is_some()),
++                _ => false, // laid / avatar: tick()
++            };
++            if done {
++                self.event("wait_done", json!({"wait": w}));
++                self.next += 1;
++            }
++            return;
++        }
++        if let (Some(mark), None) = (step["mark"].as_str(), step.get("click")) {
++            self.event("mark", json!({"name": mark}));
++            self.next += 1;
++            return;
++        }
++        if let Some(target) = step["click"].as_str() {
++            // not drawn yet (a choice list opens the frame after its box is clicked): wait for it
++            let Some(rect) = page.targets.iter().rev().find(|(k, _)| k == target).map(|(_, r)| *r) else {
++                self.seen = None;
++                return;
++            };
++            let stable = self.seen.as_ref().is_some_and(|(k, r)| k == target && *r == rect);
++            self.seen = Some((target.to_owned(), rect));
++            if !stable {
++                return;
++            }
++            self.seen = None;
++            let pos = rect.center();
++            self.pending.push(egui::Event::PointerMoved(pos));
++            self.pending.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
++            self.release = Some(pos);
++            let values = page.values_text();
++            let mut extra = json!({"target": target, "x": pos.x, "y": pos.y, "values": values});
++            if let Some(mark) = step["mark"].as_str() {
++                extra["mark"] = Value::String(mark.to_owned());
++            }
++            if target == "btn:start" {
++                // the click acts in the next page frame: the values then are these unless the
++                // script changed something in between (it does not: the click is this step)
++                extra["page_values"] = Value::String(values);
++            }
++            self.event("click", extra);
++            self.next += 1;
++            return;
++        }
++        if step.get("expect").is_some() {
++            let values = page.values_text();
++            let parsed: Value = serde_json::from_str(&values).unwrap_or(Value::Null);
++            let ok = step["expect"].as_object().is_some_and(|want| want.iter().all(|(k, v)| parsed.get(k) == Some(v)));
++            self.event("expect", json!({"expect": step["expect"], "ok": ok, "values": values}));
++            self.next += 1;
++            return;
++        }
++        // a step this hook does not know: logged and skipped
++        self.event("unknown_step", json!({"step": step}));
++        self.next += 1;
++    }
++}
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+index eb0ed9f..97ee17d 100644
+--- a/crates/zakuro/src/rando_page.rs
++++ b/crates/zakuro/src/rando_page.rs
+@@ -499,6 +499,14 @@ pub struct RandoPage {
+     waiting: Option<String>,
+     /// the first guess of this game start was made (or not needed).
+     early_guess: bool,
++    /// round 61: where this frame drew each control: "btn:start", "btn:everything_on",
++    /// "btn:defaults", "btn:back", "btn:original", "btn:random", "row:<key>" (a choice's box,
++    /// a number, the seed), "opt:<key>=<value>" (an on/off half or an open choice list's
++    /// entry); read by the page robot hook only (pagebot.rs, FEF_PAGEBOT)
++    pub targets: Vec<(String, egui::Rect)>,
++    /// round 61: background makes thrown away since last read (their run ids), for the page
++    /// robot hook's log
++    pub thrown: Vec<String>,
+ }
+ 
+ impl Default for RandoPage {
+@@ -520,6 +528,8 @@ impl Default for RandoPage {
+             settling: None,
+             waiting: None,
+             early_guess: false,
++            targets: Vec::new(),
++            thrown: Vec::new(),
+         }
+     }
+ }
+@@ -619,6 +629,7 @@ impl RandoPage {
+         if let Some(old) = self.prebuild.take() {
+             old.cancel();
+             log::info!(target: "zakuro::rando", "background make of {} thrown away (the values changed)", old.id);
++            self.thrown.push(old.id.clone());
+             self.discarded.push(old);
+         }
+         let Some(want) = want else {
+@@ -642,6 +653,7 @@ impl RandoPage {
+         if self.prebuild.as_ref().is_none_or(|p| p.text != text) {
+             if let Some(old) = self.prebuild.take() {
+                 old.cancel();
++                self.thrown.push(old.id.clone());
+                 self.discarded.push(old);
+             }
+             self.prebuild = data.and_then(|d| Prebuild::start(text.clone(), d, self.game.as_deref()));
+@@ -695,6 +707,23 @@ impl RandoPage {
+         }
+     }
+ 
++    /// round 61 (page robot hook): the exact text Start game sends with the page's values
++    /// now (the proposed seed when none is typed, as Start game puts it in).
++    pub fn values_text(&self) -> String {
++        self.form.as_ref().map(|form| form.answers_preview(&self.proposed_seed).to_string()).unwrap_or_default()
++    }
++
++    /// round 61 (page robot hook): the rows are read and the form is there.
++    pub fn has_rows(&self) -> bool {
++        matches!(self.rows, Rows::Ready(_)) && self.form.is_some()
++    }
++
++    /// round 61 (page robot hook): asking the randomizer for its rows has ended (read or
++    /// missing).
++    pub fn rows_settled(&self) -> bool {
++        matches!(self.rows, Rows::Ready(_) | Rows::Missing(_))
++    }
++
+     /// the answer to give the core this frame, after "making" was shown for one.
+     pub fn take_answer(&mut self) -> Option<String> {
+         self.pending_answer.take()
+@@ -773,6 +802,8 @@ impl RandoPage {
+             self.keep_prebuild(data);
+         }
+         let height = (ctx.content_rect().height() - 140.0).max(120.0);
++        self.targets.clear();
++        let targets = &mut self.targets;
+         egui::Window::new("Randomizer")
+             .id(egui::Id::new("rando new game"))
+             .collapsible(false)
+@@ -783,7 +814,9 @@ impl RandoPage {
+                 if let Some(status) = &self.status {
+                     ui.label(RichText::new(status).color(if self.failed { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN }));
+                     if self.waiting.is_some() {
+-                        if ui.button("Back to the settings").clicked() {
++                        let back = ui.button("Back to the settings");
++                        targets.push(("btn:back".into(), back.rect));
++                        if back.clicked() {
+                             // the wait ends; nothing is laid, the make goes on as the guess
+                             self.waiting = None;
+                             self.status = None;
+@@ -791,11 +824,15 @@ impl RandoPage {
+                     }
+                     if self.failed {
+                         ui.horizontal(|ui| {
+-                            if ui.button("Back to the settings").clicked() {
++                            let back = ui.button("Back to the settings");
++                            targets.push(("btn:back".into(), back.rect));
++                            if back.clicked() {
+                                 self.status = None;
+                                 self.failed = false;
+                             }
+-                            if ui.button("Play the original game").clicked() {
++                            let original = ui.button("Play the original game");
++                            targets.push(("btn:original".into(), original.rect));
++                            if original.clicked() {
+                                 actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
+                             }
+                         });
+@@ -808,17 +845,22 @@ impl RandoPage {
+                 }
+                 match (&self.rows, &mut self.form) {
+                     (Rows::Ready(_), Some(form)) => {
+-                        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form));
++                        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form, targets));
+                         ui.separator();
+                         ui.horizontal(|ui| {
+-                            if ui.button("Everything on").clicked() {
++                            let all = ui.button("Everything on");
++                            targets.push(("btn:everything_on".into(), all.rect));
++                            if all.clicked() {
+                                 form.everything_on();
+                             }
+-                            if ui.button("Defaults").clicked() {
++                            let defaults = ui.button("Defaults");
++                            targets.push(("btn:defaults".into(), defaults.rect));
++                            if defaults.clicked() {
+                                 form.defaults();
+                             }
+                             let problem = form.problem();
+                             let start = ui.add_enabled(problem.is_none() && !self.failed, egui::Button::new(RichText::new("Start game").strong()));
++                            targets.push(("btn:start".into(), start.rect));
+                             if start.clicked() {
+                                 if form.on() && form.seed().is_empty() {
+                                     // the random seed the background make used
+@@ -840,14 +882,18 @@ impl RandoPage {
+                     }
+                     (Rows::Missing(why), _) => {
+                         ui.label(RichText::new(why).weak());
+-                        if ui.button("Start game").clicked() {
++                        let start = ui.button("Start game");
++                        targets.push(("btn:start".into(), start.rect));
++                        if start.clicked() {
+                             actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
+                         }
+                     }
+                     _ => {
+                         ui.label(RichText::new("Asking the randomizer for its settings...").weak());
+                         ctx.request_repaint();
+-                        if ui.button("Play the original game").clicked() {
++                        let original = ui.button("Play the original game");
++                        targets.push(("btn:original".into(), original.rect));
++                        if original.clicked() {
+                             actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
+                         }
+                     }
+@@ -898,7 +944,7 @@ impl RandoPage {
+ 
+ /// the rows. With Randomizer off they show grey but can still be set (the FE8 port's
+ /// rule); a fixed row (Children) is grey and cannot be changed.
+-fn rows(ui: &mut egui::Ui, form: &mut RandoForm) {
++fn rows(ui: &mut egui::Ui, form: &mut RandoForm, targets: &mut Vec<(String, egui::Rect)>) {
+     let on = form.on();
+     let rows = form.rows.clone();
+     egui::Grid::new("rando rows").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+@@ -915,8 +961,10 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm) {
+                     Kind::OnOff => {
+                         let mut v = value.as_bool().unwrap_or(false);
+                         ui.horizontal(|ui| {
+-                            ui.selectable_value(&mut v, false, "Off");
+-                            ui.selectable_value(&mut v, true, "On");
++                            let off = ui.selectable_value(&mut v, false, "Off");
++                            targets.push((format!("opt:{}=off", row.key), off.rect));
++                            let on = ui.selectable_value(&mut v, true, "On");
++                            targets.push((format!("opt:{}=on", row.key), on.rect));
+                         });
+                         if Value::Bool(v) != value {
+                             form.set(&row.key, Value::Bool(v));
+@@ -925,8 +973,11 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm) {
+                     Kind::Seed => {
+                         let mut text = value.as_str().unwrap_or("").to_owned();
+                         ui.horizontal(|ui| {
+-                            ui.add(egui::TextEdit::singleline(&mut text).char_limit(32).hint_text("new one at Start game").desired_width(160.0));
+-                            if ui.button("Random").clicked() {
++                            let edit = ui.add(egui::TextEdit::singleline(&mut text).char_limit(32).hint_text("new one at Start game").desired_width(160.0));
++                            targets.push((format!("row:{}", row.key), edit.rect));
++                            let random = ui.button("Random");
++                            targets.push(("btn:random".into(), random.rect));
++                            if random.clicked() {
+                                 text = random_seed();
+                             }
+                         });
+@@ -937,18 +988,21 @@ fn rows(ui: &mut egui::Ui, form: &mut RandoForm) {
+                     }
+                     Kind::Choice(choices) => {
+                         let mut v = value.as_str().unwrap_or("").to_owned();
+-                        egui::ComboBox::from_id_salt(&row.key).selected_text(v.clone()).show_ui(ui, |ui| {
++                        let shown = egui::ComboBox::from_id_salt(&row.key).selected_text(v.clone()).show_ui(ui, |ui| {
+                             for choice in choices {
+-                                ui.selectable_value(&mut v, choice.clone(), choice);
++                                let entry = ui.selectable_value(&mut v, choice.clone(), choice);
++                                targets.push((format!("opt:{}={}", row.key, choice), entry.rect));
+                             }
+                         });
++                        targets.push((format!("row:{}", row.key), shown.response.rect));
+                         if value.as_str() != Some(v.as_str()) {
+                             form.set(&row.key, Value::String(v));
+                         }
+                     }
+                     Kind::Number(min, max) => {
+                         let mut v = value.as_i64().unwrap_or(*min);
+-                        ui.add(egui::DragValue::new(&mut v).range(*min..=*max));
++                        let number = ui.add(egui::DragValue::new(&mut v).range(*min..=*max));
++                        targets.push((format!("row:{}", row.key), number.rect));
+                         if value.as_i64() != Some(v) {
+                             form.set(&row.key, json!(v));
+                         }
+@@ -1172,6 +1226,33 @@ mod tests {
+         assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
+     }
+ 
++    #[test]
++    fn the_page_reports_its_controls() {
++        // round 61: the page robot hook (pagebot.rs) clicks where the page says its controls are
++        let ctx = egui::Context::default();
++        let mut page = RandoPage::default();
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        page.form = Some(form());
++        page.open_new_game();
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
++        for _ in 0..2 {
++            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                page.draw_new_game(ui.ctx(), None);
++            })
++            .drop_without_applying_deltas();
++        }
++        let keys: Vec<&str> = page.targets.iter().map(|(k, _)| k.as_str()).collect();
++        for key in ["btn:start", "btn:everything_on", "btn:defaults", "opt:randomizer=on", "opt:classes=off", "row:trees", "row:growth_variance", "row:seed", "btn:random"] {
++            assert!(keys.contains(&key), "{key} missing from {keys:?}");
++        }
++        for (key, rect) in &page.targets {
++            assert!(screen.contains_rect(*rect), "{key} {rect:?} outside {screen:?}");
++        }
++        assert!(page.has_rows() && page.rows_settled());
++        assert_eq!(page.values_text(), json!({"randomizer": false}).to_string());
++    }
++
+     /// the port's own tool, through a real Python started hidden:
+     /// FEF_RANDO_TOOL=<repo>/tools/randomizer cargo test -p zakuro --lib -- --ignored real_tool
+     #[test]
+-- 
+2.55.0.windows.5
+

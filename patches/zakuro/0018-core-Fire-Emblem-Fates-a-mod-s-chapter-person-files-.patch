@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 22:29:08 -0500
+Subject: [PATCH 18/21] core: Fire Emblem Fates: a mod's chapter person files
+ served under their own archive name
+
+Person::Serialize (0x0044AB60) writes the inner archive name of each loaded chapter
+Person block into a battle save; Person::Deserialize (0x0044A0FC) loads
+GameData/Person/<route>/<name>.bin.lz by that name. Every file of the game carries its
+own file name; Seal of Flames v6's 41 new chapter person files kept the name of the file
+they were copied from, so a battle save reloaded the original chapter's people (other
+enemies, a black GameElapse screen, or the title). zakuro-fs gets a Fix hook over the
+files a mod puts in (Layered::new_fixed, Title::lay_mods_fixed); zakuro-core's mods::lay
+passes fates_person_name for the Fates title only: a same-length name in a mod's
+GameData/Person file is set to the file's own stem, recompressed with an in-place LZ13
+size. The installed mod is unchanged on disk; without a mods folder nothing runs
+(docs/tests/SEAL_SAVE.md).
+---
+ crates/zakuro-core/src/mods.rs  | 97 ++++++++++++++++++++++++++++++++-
+ crates/zakuro-fs/src/layered.rs | 69 ++++++++++++++++++++++-
+ crates/zakuro-fs/src/lib.rs     |  7 ++-
+ 3 files changed, 167 insertions(+), 6 deletions(-)
+
+diff --git a/crates/zakuro-core/src/mods.rs b/crates/zakuro-core/src/mods.rs
+index ba9a394..386a212 100644
+--- a/crates/zakuro-core/src/mods.rs
++++ b/crates/zakuro-core/src/mods.rs
+@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
+ 
+ use zakuro_common::memory_map::PAGE_SIZE;
+ use zakuro_fs::ncch::ExHeader;
+-use zakuro_fs::{lz77, patch, FsError, Title};
++use zakuro_fs::{layered, lz77, patch, FsError, Title};
+ 
+ /// the folder a title's mods go in.
+ pub fn dir(data_dir: &Path, program_id: u64) -> PathBuf {
+@@ -130,7 +130,11 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
+         log::info!("mods: the game's exheader is {}", dir.join(EXHEADER).display());
+         title.exheader = exheader;
+     }
+-    match title.lay_mods(&dir) {
++    // Fire Emblem Fates: a mod's chapter person files served under their own archive name
++    // (docs/tests/SEAL_SAVE.md); every other title: no fix
++    let fix: Option<layered::Fix> =
++        (title.program_id() == crate::fates_rando::TITLE).then_some(&fates_person_name as layered::Fix);
++    match title.lay_mods_fixed(&dir, fix) {
+         Ok(Some(changes)) => log::info!(
+             "mods from {}: {} files replaced, {} added, {} patched, {} removed",
+             dir.display(),
+@@ -142,9 +146,12 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
+         Ok(None) => log::info!("mods: {} changes nothing in the game's files", dir.display()),
+         Err(error) => log::warn!("mods: {} can't be laid over the game: {error}", dir.display()),
+     }
++    if let Some(l) = title.layered.as_ref().filter(|l| !l.fixed.is_empty()) {
++        log::info!("mods: {} person files served under their own archive name (a battle save reloads the chapter's own people): {}", l.fixed.len(), l.fixed.join(" "));
++    }
+     // and over the update's files, which a game reads besides its own
+     if let Some(update) = title.update_mut() {
+-        match update.title.lay_mods(&dir) {
++        match update.title.lay_mods_fixed(&dir, fix) {
+             Ok(Some(changes)) => log::info!(
+                 "mods over the update's files: {} replaced, {} added, {} patched, {} removed",
+                 changes.replaced,
+@@ -157,3 +164,87 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
+         }
+     }
+ }
++
++/// Fire Emblem Fates keeps a chapter's people in GameData/Person/[A|B|C/]<STEM>.bin.lz: one
++/// Person block whose first word points at its archive name. Person::Serialize (0044AB60)
++/// writes the names of the loaded chapter blocks into a battle save and Person::Deserialize
++/// (0044A0FC) loads GameData/Person/<route>/<name>.bin.lz (else GameData/Person/<name>.bin.lz)
++/// back, so a block must carry its own file's name, as every file of the game does. A mod's
++/// file that kept the name of the file it was copied from (Seal of Flames v6: its 41 new
++/// chapters) makes the reload take the original chapter's people: other enemies, a black
++/// screen, or back to the title (docs/tests/SEAL_SAVE.md). Served under its own name: only a
++/// mod's file under GameData/Person, only a name of the same length that nothing else points
++/// at; every other byte is kept.
++pub fn fates_person_name(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
++    use crate::fates_rando_file::{inplace_margin, lz11_compress, lz_decompress, IsBin};
++    let stem = path.strip_prefix("GameData/Person/")?.rsplit('/').next()?.strip_suffix(".bin.lz")?;
++    let lz = lz_decompress(bytes).ok()?;
++    if lz.format != 0x13 && lz.format != 0x11 {
++        return None;
++    }
++    let mut bin = IsBin::parse(&lz.data).ok()?;
++    if !bin.relocs.contains(&0) {
++        return None;
++    }
++    let ptr = bin.word(0)?;
++    let name = bin.string_at(ptr)?.to_vec();
++    if name == stem.as_bytes() {
++        return None;
++    }
++    if name.len() != stem.len() || bin.relocs.iter().filter(|&&r| bin.word(r) == Some(ptr)).count() != 1 {
++        log::warn!("mods: {path}: its person archive is named {}; not changed (a battle save of this chapter will not reload its own people)", String::from_utf8_lossy(&name));
++        return None;
++    }
++    let at = (ptr - bin.se()) as usize;
++    bin.strtab[at..at + stem.len()].copy_from_slice(stem.as_bytes());
++    let data = bin.build();
++    let mut out = lz11_compress(&data, lz.format, if lz.format == 0x13 { data.len() as u32 } else { 0 });
++    if lz.format == 0x13 {
++        // decoded in place by the game: the outer size keeps every write behind the reads
++        // (the same rule as fates_rando_file's patched files, patch 0017)
++        let need = (out.len() as i64 + inplace_margin(&out)).max(data.len() as i64);
++        if need >= 1 << 24 {
++            return None;
++        }
++        out[1..4].copy_from_slice(&(need as u32).to_le_bytes()[..3]);
++    }
++    Some(out)
++}
++
++#[cfg(test)]
++mod person_name_tests {
++    use super::*;
++    use crate::fates_rando_file::{lz11_compress, lz_decompress, IsBin};
++
++    /// a small Person block: word 0 points at the archive name, one more pointer at a person.
++    fn block(name: &str) -> Vec<u8> {
++        let mut strtab = name.as_bytes().to_vec();
++        strtab.push(0);
++        let pid_at = strtab.len() as u32;
++        strtab.extend_from_slice(b"PID_X\0");
++        let mut bin = IsBin { pad: [0; 16], data: vec![0; 16], relocs: vec![0, 8], labels: vec![], strtab };
++        let se = bin.se();
++        bin.data[0..4].copy_from_slice(&se.to_le_bytes());
++        bin.data[8..12].copy_from_slice(&(se + pid_at).to_le_bytes());
++        let raw = bin.build();
++        lz11_compress(&raw, 0x13, raw.len() as u32)
++    }
++
++    #[test]
++    fn a_copied_name_is_served_as_the_files_own() {
++        let out = fates_person_name("GameData/Person/C/R002.bin.lz", &block("X020")).expect("renamed");
++        let want = lz_decompress(&block("R002")).unwrap().data;
++        assert_eq!(lz_decompress(&out).unwrap().data, want);
++        let orig = lz_decompress(&block("X020")).unwrap().data;
++        let diff = orig.iter().zip(&want).filter(|(a, b)| a != b).count();
++        assert!(diff >= 1 && diff <= 4, "only the name differs");
++    }
++
++    #[test]
++    fn everything_else_is_left_alone() {
++        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", &block("R002")), None);
++        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", &block("X0201")), None);
++        assert_eq!(fates_person_name("GameData/Dispos/C/R002.bin.lz", &block("X020")), None);
++        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", b"not lz at all"), None);
++    }
++}
+diff --git a/crates/zakuro-fs/src/layered.rs b/crates/zakuro-fs/src/layered.rs
+index babe133..4d1531b 100644
+--- a/crates/zakuro-fs/src/layered.rs
++++ b/crates/zakuro-fs/src/layered.rs
+@@ -52,8 +52,15 @@ pub struct Layered {
+     pieces: Vec<Piece>,
+     size: u64,
+     pub changes: Changes,
++    /// the paths a Fix changed (`new_fixed`).
++    pub fixed: Vec<String>,
+ }
+ 
++/// a change the caller makes to a file the mod put in (replaced, patched or added): its
++/// path, from where the mod's paths start, / separated, and its bytes; the bytes to serve
++/// instead, or None.
++pub type Fix<'a> = &'a dyn Fn(&str, &[u8]) -> Option<Vec<u8>>;
++
+ impl std::fmt::Debug for Layered {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("Layered").field("size", &self.size).field("changes", &self.changes).finish()
+@@ -64,6 +71,12 @@ impl Layered {
+     /// romfs, a RomFS in image, with the mod in dir over it. None when the
+     /// mod changes nothing in it.
+     pub fn new(romfs: &RomFs, image: &[u8], dir: &Path) -> Result<Option<Layered>, FsError> {
++        Self::new_fixed(romfs, image, dir, None)
++    }
++
++    /// new, then fix over every file the mod put in. the game's own files are never
++    /// passed to it.
++    pub fn new_fixed(romfs: &RomFs, image: &[u8], dir: &Path, fix: Option<Fix>) -> Result<Option<Layered>, FsError> {
+         let mut tree = Tree::read(romfs)?;
+         let content = tree.content();
+         let mut changes = Changes::default();
+@@ -78,7 +91,13 @@ impl Layered {
+         if !changes.any() {
+             return Ok(None);
+         }
+-        Ok(Some(tree.layout(romfs, changes)))
++        let mut fixed = Vec::new();
++        if let Some(fix) = fix {
++            tree.fix(content, "", fix, (romfs, image), &mut fixed);
++        }
++        let mut layered = tree.layout(romfs, changes);
++        layered.fixed = fixed;
++        Ok(Some(layered))
+     }
+ 
+     /// how many bytes the layered image has.
+@@ -336,6 +355,26 @@ impl Tree {
+         }
+     }
+ 
++    /// fix over every file the mod put in, under the directory at `at` (path `path`).
++    fn fix(&mut self, at: usize, path: &str, fix: Fix, game: (&RomFs, &[u8]), fixed: &mut Vec<String>) {
++        for leaf in self.dirs[at].files.clone() {
++            if self.leaves[leaf].modded.is_none() {
++                continue;
++            }
++            let p = join(path, &self.leaves[leaf].name);
++            let Ok(data) = self.data(leaf, game) else { continue };
++            if let Some(new) = fix(&p, &data) {
++                self.leaves[leaf].size = new.len() as u64;
++                self.leaves[leaf].modded = Some(Source::Memory(new));
++                fixed.push(p);
++            }
++        }
++        for child in self.dirs[at].children.clone() {
++            let p = join(path, &self.dirs[child].name);
++            self.fix(child, &p, fix, game, fixed);
++        }
++    }
++
+     /// the image, the game's file data keeping its offsets and the mod's
+     /// coming after it.
+     fn layout(mut self, romfs: &RomFs, changes: Changes) -> Layered {
+@@ -364,7 +403,7 @@ impl Tree {
+         let game = Piece { start: base, size: self.game_data, source: Source::Image(romfs.base + romfs.header.file_data_offset as u64) };
+         let mut pieces = vec![game];
+         pieces.extend(modded.into_iter().map(|piece| Piece { start: base + piece.start, ..piece }));
+-        Layered { meta, pieces, size: base + end, changes }
++        Layered { meta, pieces, size: base + end, changes, fixed: Vec::new() }
+     }
+ }
+ 
+@@ -513,6 +552,32 @@ mod tests {
+         std::fs::remove_dir_all(mods).unwrap();
+     }
+ 
++    #[test]
++    fn a_fix_changes_only_the_mods_files() {
++        let image = game(&[("a.bin", &[1; 100]), ("b.bin", &[2; 37])]);
++        let romfs = RomFs::parse_level3(&image, 0).unwrap();
++        let mods = folder("fixed");
++        put(&mods, "romfs/c.bin", &[4; 20]);
++        let seen = std::cell::RefCell::new(Vec::new());
++        let fix = |path: &str, bytes: &[u8]| -> Option<Vec<u8>> {
++            seen.borrow_mut().push(path.to_owned());
++            (path == "c.bin").then(|| bytes.iter().map(|b| b + 1).chain([9u8]).collect())
++        };
++        let layered = Layered::new_fixed(&romfs, &image, &mods, Some(&fix)).unwrap().unwrap();
++        assert_eq!(*seen.borrow(), ["c.bin"], "the game's own files are never passed to the fix");
++        assert_eq!(layered.fixed, ["c.bin"]);
++        let (start, size) = layered.lookup("c.bin").unwrap();
++        let mut out = vec![0; size as usize];
++        layered.read(&image, start, &mut out);
++        assert_eq!(out, [&[5u8; 20][..], &[9]].concat());
++        // no fix: the same image as before
++        let plain = Layered::new(&romfs, &image, &mods).unwrap().unwrap();
++        let same = Layered::new_fixed(&romfs, &image, &mods, None).unwrap().unwrap();
++        assert_eq!(whole(&plain, &image), whole(&same, &image));
++        assert!(plain.fixed.is_empty());
++        std::fs::remove_dir_all(mods).unwrap();
++    }
++
+     #[test]
+     fn reads_in_pieces_match_the_whole() {
+         let image = game(&[("a.bin", &[1; 100]), ("b.bin", &[2; 37])]);
+diff --git a/crates/zakuro-fs/src/lib.rs b/crates/zakuro-fs/src/lib.rs
+index 7dd1f29..b22cbaf 100644
+--- a/crates/zakuro-fs/src/lib.rs
++++ b/crates/zakuro-fs/src/lib.rs
+@@ -307,10 +307,15 @@ impl Title {
+     /// lays the mod in dir over the RomFS. what it changed, when it changed
+     /// anything.
+     pub fn lay_mods(&mut self, dir: &Path) -> Result<Option<layered::Changes>, FsError> {
++        self.lay_mods_fixed(dir, None)
++    }
++
++    /// lay_mods, with fix over the mod's own files (layered::Layered::new_fixed).
++    pub fn lay_mods_fixed(&mut self, dir: &Path, fix: Option<layered::Fix>) -> Result<Option<layered::Changes>, FsError> {
+         let Some(romfs) = &self.romfs else {
+             return Ok(None);
+         };
+-        let layered = layered::Layered::new(romfs, self.image.data(), dir)?;
++        let layered = layered::Layered::new_fixed(romfs, self.image.data(), dir, fix)?;
+         let changes = layered.as_ref().map(|layered| layered.changes);
+         self.layered = layered.map(std::sync::Arc::new);
+         Ok(changes)

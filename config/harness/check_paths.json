@@ -1,0 +1,10 @@
+{
+ "about": "The full check's path list for the Vanilla+ edition (round 84, F-072; docs/SEAL_EDITION_PLAN.md section 5): the every-chapter break check, the chests row, the runs remade, the table cells, the page robot runs and the Nuzlocke chapter jobs cover exactly these paths. A full-check driver copied into build/rNN/check reads this file instead of carrying its own list, so a copied driver cannot bring another edition's path back by habit. The Seal edition's path is config/seal/check_paths.json (its small check: docs/seal/CHECK.md).",
+ "version": 1,
+ "edition": "vanilla",
+ "paths": {
+  "bt": "Birthright",
+  "cq": "Conquest",
+  "rv": "Revelation"
+ }
+}

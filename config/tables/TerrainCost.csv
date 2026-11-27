@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,16,s8[16],cost,high,"TerrainCost::GetCostFromUnit 001A6708 reads row Job+0x5C, column = its terrain argument (TerrainTile.move_cost_column) (s8); when the cost is negative and the unit has a SPID_ private-terrain-cost skill bit the game re-reads row 0 (how callers treat negatives is not traced)"

@@ -1,0 +1,27 @@
+# Line endings: LF in the repo for everything text; Windows batch files are CRLF on disk
+# (cmd.exe misparses LF-only .bat files); patch files are byte-exact (they are applied to
+# upstream sources with their own line endings).
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.tsv text eol=lf
+*.json text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.s text eol=lf
+*.S text eol=lf
+*.sh text eol=lf
+*.ld text eol=lf
+*.toml text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.patch -text
+*.diff -text
+*.png binary
+*.bin binary
+*.cci binary
+*.3ds binary
+*.cia binary
+*.zip binary

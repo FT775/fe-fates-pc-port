@@ -1,0 +1,39 @@
+{
+  "_comment": "Per-game constants. Every tool reads this through tools/gamecfg.py instead of hard-coding them. Values from scout/SCOUT.md (2026-11-10) and the owner's dump.",
+  "key": "fe14",
+  "game": "Fire Emblem Fates",
+  "edition": "Special Edition (USA)",
+  "title_id": "0004000000179800",
+  "title_hex": "179800",
+  "product_code": "CTR-P-BFZE",
+  "exheader_name": "Iron15",
+  "extdata_id": "0x1794",
+  "rom_size": 2147483648,
+  "rom_sha256": "a89be7a4cb6a471bcfeac4feca55eeec68937d90d7fed18b1cf967399363f449",
+  "default_rom": "Fire Emblem Fates - Special Edition (USA).cci",
+  "code_fnv1a": "9677F5445E8DCD01",
+  "code_bin_sha1": "038db5d79786914f645fbef08242a138703f8d70",
+  "segments": {
+    "text":   {"vaddr": "0x00100000", "size": "0x0051011C"},
+    "rodata": {"vaddr": "0x00611000", "size": "0x000A23B0"},
+    "data":   {"vaddr": "0x006B4000", "size": "0x0004AF50"},
+    "bss_size": "0x0007BE28"
+  },
+  "romfs": {
+    "gamedata_dir": "GameData",
+    "message_dirs": ["m"],
+    "route_folders": {"A": "Birthright", "B": "Conquest", "C": "Revelation"},
+    "sound_archive": "sound/IRON15_sound.bcsar",
+    "symbol_map": {"names": "debug/name.StackTrace", "addrs": "debug/addr.StackTrace"}
+  },
+  "port": {
+    "program_name": "Fire Emblem Fates",
+    "package": "fe-fates",
+    "port_dir": "build/port/fef",
+    "env_prefix": "FEF",
+    "shortcut_name": "PLAY Fire Emblem Fates",
+    "standalone_name": "Fire Emblem Fates.exe",
+    "options_file": "fe14-options.txt",
+    "mod_tmp_suffix": ".fe14tmp"
+  }
+}

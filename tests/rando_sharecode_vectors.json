@@ -1,0 +1,315 @@
+{
+ "format": 1,
+ "about": "Round 74 share code test vectors (docs/rando/FULL_BLOCK.md sections 7 and 8): made-up rows and seeds, our own option keys only. Read by tests/test_rando_sharecode.py and the Rust tests in rando_page.rs. 'also': other spellings of the same code that decode to the same values (case-blind head and body, space around the code).",
+ "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+ "rows": [
+  {
+   "key": "randomizer",
+   "kind": "onoff",
+   "default": false
+  },
+  {
+   "key": "seed",
+   "kind": "seed",
+   "default": ""
+  },
+  {
+   "key": "music",
+   "kind": "choice",
+   "choices": [
+    "off",
+    "maps",
+    "maps+battles"
+   ],
+   "default": "off"
+  },
+  {
+   "key": "enemy_levels",
+   "kind": "number",
+   "min": 0,
+   "max": 5,
+   "default": 0
+  },
+  {
+   "key": "spoiler_log",
+   "kind": "onoff",
+   "default": true,
+   "page_only": true
+  }
+ ],
+ "layout_text": "enemy_levels:number:0,5;music:choice:off,maps,maps+battles;randomizer:onoff:2",
+ "layout": "XX",
+ "good": [
+  {
+   "game": "fates",
+   "seed": "demo-7",
+   "values": {
+    "randomizer": true,
+    "music": "maps",
+    "enemy_levels": 3
+   },
+   "code": "R1FXX-B1-DC-demo-7",
+   "note": "the worked example of FULL_BLOCK.md section 7",
+   "also": [
+    "r1fxx-b1-dc-demo-7",
+    "  R1FXX-B1-DC-demo-7\n"
+   ]
+  },
+  {
+   "game": "fates",
+   "seed": "Ab-_9-long_seed-with-dashes_0123",
+   "values": {
+    "randomizer": false,
+    "music": "maps+battles",
+    "enemy_levels": 5
+   },
+   "code": "R1FXX-N0-ZJ-Ab-_9-long_seed-with-dashes_0123",
+   "note": "a 32-character seed holding - and _"
+  },
+  {
+   "game": "seal",
+   "seed": "seal1",
+   "values": {
+    "randomizer": false,
+    "music": "off",
+    "enemy_levels": 0
+   },
+   "code": "R1SXX-00-0D-seal1",
+   "note": "a Seal of Flames code, every row at its default"
+  },
+  {
+   "game": "fates",
+   "seed": "Z",
+   "values": {
+    "randomizer": true,
+    "music": "maps+battles",
+    "enemy_levels": 0
+   },
+   "code": "R1FXX-G1-5T-Z",
+   "note": "a one-character seed"
+  }
+ ],
+ "bad": [
+  {
+   "game": "fates",
+   "code": "R1FXX-B1-DD-demo-7",
+   "error": "check",
+   "message": "This code has a typo.",
+   "note": "the check's last character changed"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B1-DC-demo-8",
+   "error": "check",
+   "message": "This code has a typo.",
+   "note": "the seed changed"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-C1-DC-demo-7",
+   "error": "check",
+   "message": "This code has a typo.",
+   "note": "a body character changed"
+  },
+  {
+   "game": "fates",
+   "code": "hello",
+   "error": "format",
+   "message": "This is not a share code.",
+   "note": "not 4 parts"
+  },
+  {
+   "game": "fates",
+   "code": "",
+   "error": "format",
+   "message": "This is not a share code.",
+   "note": "empty"
+  },
+  {
+   "game": "fates",
+   "code": "R2FXX-B1-97-demo-7",
+   "error": "format",
+   "message": "This is not a share code.",
+   "note": "code format 2"
+  },
+  {
+   "game": "fates",
+   "code": "R1QXX-B1-A9-demo-7",
+   "error": "format",
+   "message": "This is not a share code.",
+   "note": "an unknown game letter"
+  },
+  {
+   "game": "fates",
+   "code": "R1F00-B1-HW-demo-7",
+   "error": "layout",
+   "message": "This code was made by another version of the randomizer.",
+   "note": "another layout (another version's rows)"
+  },
+  {
+   "game": "fates",
+   "code": "R1SXX-00-0D-seal1",
+   "error": "game",
+   "message": "This code is for Seal of Flames.",
+   "note": "a Seal of Flames code on the Fire Emblem Fates page"
+  },
+  {
+   "game": "seal",
+   "code": "R1FXX-B1-DC-demo-7",
+   "error": "game",
+   "message": "This code is for Fire Emblem Fates.",
+   "note": "a Fire Emblem Fates code on the Seal of Flames page"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-V1-60-demo-7",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "a choice index at its radix"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B5-28-demo-7",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "a padding bit that is not 0"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B10-QW-demo-7",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "one body character too many"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B-0Z-demo-7",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "one body character too few"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B1-T1--bad",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "a seed the randomizer does not take"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-B1-0Q-",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "an empty seed"
+  },
+  {
+   "game": "fates",
+   "code": "R1FXX-BU-Z8-demo-7",
+   "error": "damaged",
+   "message": "This code is damaged.",
+   "note": "a body character not in the alphabet (U)"
+  }
+ ],
+ "width0": {
+  "about": "Round 75b (docs/SEED_GUARANTEES_PLAN.md section 5 point 3): a one-choice row packs to 0 bits; both codecs must accept width 0. The rows above plus the hidden, fixed one-choice row rando_version (the live page's version marker). Read by tests/test_rando_page62b.py (VersionRowTests); the Rust tests in rando_page.rs read only the top-level rows, good and bad today, which this block leaves unchanged (share_width there gives 0 for radix 1, rando_page.rs ~line 398).",
+  "rows": [
+   {
+    "key": "randomizer",
+    "kind": "onoff",
+    "default": false
+   },
+   {
+    "key": "seed",
+    "kind": "seed",
+    "default": ""
+   },
+   {
+    "key": "music",
+    "kind": "choice",
+    "choices": [
+     "off",
+     "maps",
+     "maps+battles"
+    ],
+    "default": "off"
+   },
+   {
+    "key": "enemy_levels",
+    "kind": "number",
+    "min": 0,
+    "max": 5,
+    "default": 0
+   },
+   {
+    "key": "spoiler_log",
+    "kind": "onoff",
+    "default": true,
+    "page_only": true
+   },
+   {
+    "key": "rando_version",
+    "kind": "choice",
+    "choices": [
+     "2"
+    ],
+    "default": "2",
+    "fixed": true,
+    "hidden": true
+   }
+  ],
+  "layout_text": "enemy_levels:number:0,5;music:choice:off,maps,maps+battles;rando_version:choice:2;randomizer:onoff:2",
+  "layout": "X8",
+  "good": [
+   {
+    "game": "fates",
+    "seed": "demo-7",
+    "values": {
+     "randomizer": true,
+     "music": "maps",
+     "enemy_levels": 3
+    },
+    "code": "R1FX8-B1-8C-demo-7",
+    "note": "the worked example with the version row: the one-choice row takes 0 bits, so the body stays B1; only the layout differs"
+   },
+   {
+    "game": "fates",
+    "seed": "v2",
+    "values": {
+     "randomizer": true,
+     "music": "maps+battles",
+     "enemy_levels": 5,
+     "rando_version": "2"
+    },
+    "code": "R1FX8-N1-C7-v2",
+    "note": "the version row named in the values (its only choice)"
+   },
+   {
+    "game": "seal",
+    "seed": "seal1",
+    "values": {
+     "randomizer": false,
+     "music": "off",
+     "enemy_levels": 0
+    },
+    "code": "R1SX8-00-XD-seal1",
+    "note": "a Seal of Flames code, every row at its default"
+   }
+  ],
+  "bad": [
+   {
+    "game": "fates",
+    "code": "R1FXX-B1-DC-demo-7",
+    "error": "layout",
+    "message": "This code was made by another version of the randomizer.",
+    "note": "a code made before the version row (the round-74 rows above): another version of the randomizer"
+   },
+   {
+    "game": "fates",
+    "code": "R1FX8-B10-TW-demo-7",
+    "error": "damaged",
+    "message": "This code is damaged.",
+    "note": "one body character too many (a width-0 row adds no character)"
+   }
+  ]
+ }
+}

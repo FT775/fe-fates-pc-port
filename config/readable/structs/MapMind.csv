@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x1,u8,unit_index,high,"map::Mind::GetUnit 0x005261FC passes this byte to UnitPool::Get(int)",
+0x004,0x1,s8,x,medium,"ProcSequence::Transform 0x003815CC searches the dragon veins at (+0x4, +0x5); map::Target::EnumerateTransform reads its own +0x4/+0x5 the same way",
+0x005,0x1,s8,y,medium,"ProcSequence::Transform 0x003815D0 (see x)",

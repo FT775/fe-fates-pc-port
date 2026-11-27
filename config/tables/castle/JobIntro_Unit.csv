@@ -1,0 +1,7 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,job,medium,"A class name without its JID_ prefix (data); item+0x0 not traced"
+0x4,4,str,person,high,"JobIntroData::Data::GetPerson (0044A4B4) returns item+0x4"
+0x8,4,str,equipped_item,high,"JobIntroData::Data::GetItem (003D0E40) returns item+0x8"
+0xC,2,u16,value_c,medium,"ProcJobGroup::CreateUnit (001BCE84) loads item+0xC as u16; meaning unknown (0 or 1 in data)"
+0xE,2,u16,value_e,low,"Data only (0 or 1); no reader traced"
+0x10,4,str,field,medium,"A battle field name (Btl_..., data); ProcJobGroup::LoadField not traced"

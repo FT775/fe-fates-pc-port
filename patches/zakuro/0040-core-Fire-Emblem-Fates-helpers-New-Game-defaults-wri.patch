@@ -1,0 +1,867 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 22:11:07 -0500
+Subject: [PATCH] core: Fire Emblem Fates helpers: New Game defaults writer
+
+Round 81 (docs/ROUND81_PLAN.md A2, build/r81/hook/HOOK_TRACE.md; the owner's
+pick F-057 #5 and its new writer group, answered "ok keep going", run on the
+standing OK F-059 (3)). Stores the Esc window's four New Game rows (patch
+0039) into the game's Options block once per New Game, as if they had been
+set on the game's own Options screen before the Prologue.
+
+New core fates_options.rs, on the patch 0031 / 0035 trap machinery:
+- The trap: while the title is Fire Emblem Fates (is_fates_title(), so Seal
+  of Flames too) and at least one New Game row is not Game's choice, the
+  first word of GameConfigData::StartFromBeginning 0x001D0618 (original
+  0xE92D4070) becomes the reserved svc 0xEFFEC003 (0xEFFEC001 chests,
+  0xEFFEC002 names); the recompiled code is checked again. Every row back at
+  Game's choice, or a save state that brought the svc back with the rows off:
+  the original word goes back at the frame's end. A stranger word is left
+  alone (one log line); recompiled code that cannot check itself keeps the
+  trap off (one log line).
+- At the svc (kernel/svc.rs dispatch): only checks, then "pending": ARM at
+  0x001D0618, lr == 0x00441794 (the one call, in JumpMyUnitEdit), r0 ==
+  *G_GameConfig (0x006DA0F8) and not 0, +0x4..+0x18 readable, no player army
+  (fates_nuzlocke::in_game, the randomizer's test), no map (Map::Get's global
+  *0x006D72F4 readable and 0). The replaced push {r4-r6, lr} is done whatever
+  the checks say; no guest data byte is written inside the svc.
+- At the end of that frame (System::run_frame, right after
+  fates_rando_session::after_frame and outside its randomizer gate, so
+  NewGameWatch still sees the block unchanged in the pick frame): the checks
+  again on the recorded block, then each set row's byte stored only if it
+  differs: +0x8 battle animations, +0xC map speed, +0xD enemy turn skip,
+  +0x16 HP bars. Never word +0x4, never +0xE, never the versus copy, no game
+  function call. An offset outside the four or a value at or past its line's
+  size refuses the whole write. One log line, "fates_options: New Game:
+  battle 1->0, speed 2->1, ..." (bytes before and after).
+- Defaults are today's game: with every row at Game's choice no word is laid
+  and the writer reads no guest memory, except one read of the trap word
+  after a frame that does not follow the one before (a save state loaded, or
+  the writer starting late), so a state taken with the svc is put right.
+
+Desk trace before the code (build/r81/writer/JUMP4.md): MainSequence::Jump(4)
+lands on label 4 (GameElapse::Create, title::MyUnitEdit::Create); the
+creator's Regist jumps to label 7 (chapter-save steps, then the castle and
+chapter labels 5 and 6). No GameConfigData::Reset between StartFromBeginning
+and the Prologue: GameReset sits only in labels 2 and 3 (title, main menu),
+reached only by backing out of the creator, after which a new pick writes
+again. The write point stays at the pick frame's end.
+
+lib.rs: the module, a System field `options` (fates_options::Writer), the one
+run_frame call line, and the set_helpers log line also names the four rows.
+
+Tests (13, fates_options): the word rule and a stranger word; the replaced
+push; every svc refusal with a planted bug (Thumb, wrong place, wrong lr,
+wrong r0 = the versus copy, null r0, G_GameConfig null, block unreadable,
+player army, map, Map::Get's global unreadable); the store writes exactly
++0x8 / +0xC / +0xD / +0x16 and compares first (never +0x4 or +0xE, the
+versus copy untouched); every frame's-end refusal writes nothing; a value
+past its line or another offset refuses the whole write; all rows Game's
+choice lays no word and touches no guest memory over 199 frames; a set row
+lays the word and Game's choice puts it back; a state with the word is put
+right with the rows off (and drops a pending store); a state with the
+original word gets the trap again; NewGameWatch still fires in the pick frame
+(and a store before the watch, the planted bug, would hide the pick); a load
+never writes. Eleven code mutations (the lr, r0, null, army, map,
+readability checks removed, the compare dropped, the range off by one, the
+defaults reading the word, the state jump not seen, a stranger overwritten)
+each fail at least one test (build/r81/writer/planted.txt). zakuro-core 259
+passed in engine/target/zakuro-core-test, zakuro 131 passed (2 ignored) in
+engine/target/zakuro-frontend-test.
+---
+ crates/zakuro-core/src/fates_options.rs | 723 ++++++++++++++++++++++++
+ crates/zakuro-core/src/kernel/svc.rs    |   3 +
+ crates/zakuro-core/src/lib.rs           |   8 +-
+ 3 files changed, 733 insertions(+), 1 deletion(-)
+ create mode 100644 crates/zakuro-core/src/fates_options.rs
+
+diff --git a/crates/zakuro-core/src/fates_options.rs b/crates/zakuro-core/src/fates_options.rs
+new file mode 100644
+index 0000000..7e628d4
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_options.rs
+@@ -0,0 +1,723 @@
++//! Fire Emblem Fates: the "New Game defaults" writer (round 81, owner pick F-057 #5, the writer
++//! group F-038; docs/ROUND81_PLAN.md, build/r81/hook/HOOK_TRACE.md).
++//!
++//! The game resets its Options block (`GameConfigData`, the object `*G_GameConfig` 0x006DA0F8
++//! points at) before every title, so every New Game starts from the game's defaults. This
++//! writer stores the Esc window's four New Game rows (`fates_helpers`: battle animations +0x8,
++//! map speed +0xC, enemy turn skip +0xD, HP bars +0x16) into that block **once per New Game**,
++//! as if the player had set them on the game's own Options screen before the Prologue.
++//!
++//! The one New Game moment: `title::ProcTitle::JumpMyUnitEdit` (0x00441768) calls
++//! `GameConfigData::StartFromBeginning(*G_GameConfig)` (0x001D0618; its only caller, the `bl` at
++//! 0x00441790, returns to 0x00441794) right after the mode pick, for every difficulty and mode.
++//! No load (chapter save, battle save, branch of fate, retry) and no save state reaches it.
++//! `StartFromBeginning` changes only word +0x4; the bytes this writer stores are untouched by
++//! it. Desk trace build/r81/writer/JUMP4.md: no `GameConfigData::Reset` runs between this call
++//! and the Prologue's first map (only backing out of the character creator to the main menu
++//! resets the block; a new pick then writes again).
++//!
++//! The trap (the patch-0031 / 0035 machinery): while the title is Fire Emblem Fates (Seal of
++//! Flames shares the title id) **and** at least one New Game row is not Game's choice, the
++//! first word of `StartFromBeginning` (`push {r4-r6, lr}`, 0xE92D4070) is replaced by a reserved
++//! `svc` (0xEFFEC003; 0xEFFEC001 is the chests, 0xEFFEC002 the names). The recompiled code is
++//! checked again, so that one function runs in the interpreter. Recompiled code that cannot
++//! check itself (`checks_itself()` false): the trap stays off, one log line. A word that is
++//! neither the original's nor ours (another version, a cheat or a mod): left alone, one log
++//! line, nothing written. Every row back at Game's choice, or a save state that brought the
++//! svc back with the rows off: the original word goes back at the next frame's end.
++//!
++//! At the svc (`kernel::svc::dispatch` -> [`on_svc`]): only checks, and records "pending" when
++//! all of them hold: ARM state at 0x001D0618, lr == 0x00441794, r0 == `*G_GameConfig` and not
++//! 0, +0x4 .. +0x18 readable, no player army (`fates_nuzlocke::in_game`, the randomizer's own
++//! test) and no map (`Map::Get`'s global `*0x006D72F4` readable and 0). Then it does the
++//! replaced `push` and the function goes on at +4. **No guest data byte is written inside the
++//! svc**, whatever the checks say.
++//!
++//! At the end of that frame ([`after_frame`], called by `System::run_frame` right after
++//! `fates_rando_session::after_frame`, outside its randomizer gate, so the randomizer's
++//! `NewGameWatch` sees the block unchanged in the pick frame): the same checks again on the
++//! recorded block; then for each set row its byte is stored **only if it differs**. Never word
++//! +0x4, never +0xE (the danger zone), never the versus copy (`versus::Data` +0x12AC: only the
++//! block `*G_GameConfig` names is written), no game function called. A value at or past the
++//! line's size, or an offset outside the four, refuses the whole write. One log line with the
++//! bytes before and after. Any doubt: nothing is written (fail closed).
++//!
++//! Defaults are today's game: with every row at Game's choice no trap word is laid and the
++//! writer reads no guest memory at all, except a single read of the trap word after a frame
++//! that did not follow the one before (a save state was loaded, or the writer started late),
++//! so a state taken with the svc in memory is put right.
++
++use zakuro_cpu::Bus;
++
++use crate::fates_helpers::{
++    NewGameByte, BATTLE_ANIMATIONS_OFFSET, BATTLE_ANIMATIONS_VALUES, ENEMY_SKIP_OFFSET, ENEMY_SKIP_VALUES,
++    HP_BARS_OFFSET, HP_BARS_VALUES, MAP_SPEED_OFFSET, MAP_SPEED_VALUES,
++};
++use crate::fates_rando::{Guest, GAME_CONFIG};
++use crate::fates_rando_chests::push_words;
++use crate::System;
++
++/// `GameConfigData::StartFromBeginning`, called once per New Game.
++pub const START_FROM_BEGINNING: u32 = 0x001D_0618;
++/// its first instruction: `push {r4, r5, r6, lr}` (`stmdb sp!, {r4, r5, r6, lr}`).
++pub const ORIGINAL_WORD: u32 = 0xE92D_4070;
++/// the return address of its only call (`title::ProcTitle::JumpMyUnitEdit`, the `bl` at 0x00441790).
++pub const CALL_RETURN: u32 = 0x0044_1794;
++/// the reserved svc number (no 3DS kernel call has a number above 0xFF).
++pub const SVC_NUMBER: u32 = 0x00FE_C003;
++/// `svc #0xFEC003`
++pub const TRAP_WORD: u32 = 0xEF00_0000 | SVC_NUMBER;
++/// `Map::Get` (0x00342574) answers this global: the loaded map, 0 while none is.
++pub const MAP_INSTANCE: u32 = 0x006D_72F4;
++/// the block bytes the checks need readable: word +0x4 up to and including +0x17.
++const BLOCK_FROM: u32 = 0x4;
++const BLOCK_LEN: u32 = 0x14;
++/// the only (offset, line size) pairs this writer ever stores.
++pub const LINES: [(u32, u8, &str); 4] = [
++    (BATTLE_ANIMATIONS_OFFSET, BATTLE_ANIMATIONS_VALUES, "battle"),
++    (MAP_SPEED_OFFSET, MAP_SPEED_VALUES, "speed"),
++    (ENEMY_SKIP_OFFSET, ENEMY_SKIP_VALUES, "enemy skip"),
++    (HP_BARS_OFFSET, HP_BARS_VALUES, "hp bars"),
++];
++
++/// why a New Game step was not used (nothing is written).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Refusal {
++    /// Thumb state, or the svc is not at StartFromBeginning's first word
++    NotTheTrap,
++    /// lr is not the one call site's return address
++    WrongCaller,
++    /// G_GameConfig is not readable or holds 0
++    NoBlock,
++    /// r0 is not the block G_GameConfig names (the versus copy, a new object)
++    WrongBlock,
++    /// the block's +0x4 .. +0x18 is not readable
++    BlockUnreadable,
++    /// the unit pool holds a player army: a game is loaded
++    ArmyPresent,
++    /// a map is loaded, or Map::Get's global cannot be read
++    MapPresent,
++    /// a row asks for an offset outside the four lines, or a value at or past its line's size
++    BadValue,
++}
++
++impl Refusal {
++    pub fn why(self) -> &'static str {
++        match self {
++            Refusal::NotTheTrap => "not the trap's place",
++            Refusal::WrongCaller => "not called from the New Game step",
++            Refusal::NoBlock => "no options block",
++            Refusal::WrongBlock => "not the game's options block",
++            Refusal::BlockUnreadable => "the options block cannot be read",
++            Refusal::ArmyPresent => "a game is loaded (a player army exists)",
++            Refusal::MapPresent => "a map is loaded",
++            Refusal::BadValue => "a value the game's line does not hold",
++        }
++    }
++}
++
++/// what the frame writes at START_FROM_BEGINNING: the svc while a row is wanted and the
++/// original word is there, the original word back while none is wanted and the svc is there,
++/// else nothing (a stranger word is left alone).
++pub fn word_to_write(want: bool, now: u32) -> Option<u32> {
++    match (want, now) {
++        (true, ORIGINAL_WORD) => Some(TRAP_WORD),
++        (false, TRAP_WORD) => Some(ORIGINAL_WORD),
++        _ => None,
++    }
++}
++
++/// the block checks shared by the svc and the frame's end: `block` is the block G_GameConfig
++/// names, readable, with no player army and no map.
++pub fn block_ok(g: &mut dyn Guest, block: u32) -> Result<(), Refusal> {
++    let Some(cfg) = g.r32(GAME_CONFIG).filter(|&c| c != 0) else { return Err(Refusal::NoBlock) };
++    if block != cfg {
++        return Err(Refusal::WrongBlock);
++    }
++    if !g.readable(block.wrapping_add(BLOCK_FROM), BLOCK_LEN) {
++        return Err(Refusal::BlockUnreadable);
++    }
++    if crate::fates_nuzlocke::in_game(g) {
++        return Err(Refusal::ArmyPresent);
++    }
++    match g.r32(MAP_INSTANCE) {
++        Some(0) => Ok(()),
++        _ => Err(Refusal::MapPresent),
++    }
++}
++
++/// the svc checks: Ok(block) when this is the New Game step on the game's block.
++pub fn svc_checks(g: &mut dyn Guest, thumb: bool, at: u32, lr: u32, r0: u32) -> Result<u32, Refusal> {
++    if thumb || at != START_FROM_BEGINNING {
++        return Err(Refusal::NotTheTrap);
++    }
++    if lr != CALL_RETURN {
++        return Err(Refusal::WrongCaller);
++    }
++    if r0 == 0 {
++        return Err(Refusal::NoBlock);
++    }
++    block_ok(g, r0)?;
++    Ok(r0)
++}
++
++/// every byte the rows ask for is one of the four lines and inside its line's size.
++pub fn bytes_ok(bytes: &[NewGameByte]) -> bool {
++    bytes.iter().all(|b| {
++        LINES.iter().any(|&(offset, values, _)| offset == b.offset && values == b.line_values && b.value < values)
++    })
++}
++
++/// one byte stored (or kept): its line's name, the byte before and after.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Stored {
++    pub offset: u32,
++    pub name: &'static str,
++    pub before: u8,
++    pub after: u8,
++}
++
++/// the frame's-end store: the checks again on `block`, then each byte compared and stored only
++/// when it differs. Nothing is written unless every check and every value is good.
++pub fn store(g: &mut dyn Guest, block: u32, bytes: &[NewGameByte]) -> Result<Vec<Stored>, Refusal> {
++    if !bytes_ok(bytes) {
++        return Err(Refusal::BadValue);
++    }
++    block_ok(g, block)?;
++    let mut out = Vec::with_capacity(bytes.len());
++    for b in bytes {
++        let at = block.wrapping_add(b.offset);
++        let mut now = [0u8; 1];
++        g.read(at, &mut now);
++        if now[0] != b.value {
++            g.write(at, &[b.value]);
++        }
++        let name = LINES.iter().find(|l| l.0 == b.offset).map(|l| l.2).unwrap_or("?");
++        out.push(Stored { offset: b.offset, name, before: now[0], after: b.value });
++    }
++    Ok(out)
++}
++
++/// the log line's text for a store.
++pub fn shown(stored: &[Stored]) -> String {
++    stored
++        .iter()
++        .map(|s| if s.before == s.after { format!("{} {} (kept)", s.name, s.after) } else { format!("{} {}->{}", s.name, s.before, s.after) })
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++/// the New Game step seen at the svc, waiting for the frame's end.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Pending {
++    pub block: u32,
++}
++
++/// what the word step decided this frame.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub struct WordStep {
++    /// the word read at START_FROM_BEGINNING (None = not read at all, or not readable)
++    pub now: Option<u32>,
++    /// the word to write there (privileged: a code page)
++    pub write: Option<u32>,
++    /// the word there is a stranger's while a row is wanted
++    pub stranger: bool,
++}
++
++/// the writer's state, kept on `System`.
++#[derive(Debug, Default)]
++pub struct Writer {
++    /// the New Game step seen in this frame's svc
++    pub pending: Option<Pending>,
++    /// the frame number the last `after_frame` saw
++    last_frame: Option<u64>,
++    /// the trap word is (or may be) ours in memory: laid by this program
++    laid: bool,
++    /// the word the recompiled code was last checked against (None = the original's)
++    lib_word: Option<u32>,
++    /// said once: a stranger word, or recompiled code that cannot check itself
++    noted: bool,
++    /// New Game writes done since the program started (the log says each one)
++    pub writes: u64,
++}
++
++impl Writer {
++    /// a frame that does not follow the one before (a state was loaded, or this writer runs late)
++    pub fn jumped(&mut self, frames: u64) -> bool {
++        let jumped = match self.last_frame {
++            Some(last) => frames != last.wrapping_add(1),
++            None => frames > 1,
++        };
++        self.last_frame = Some(frames);
++        if jumped {
++            self.pending = None;
++        }
++        jumped
++    }
++
++    /// the trap word's step: `want` = the trap should be laid. With nothing wanted, nothing laid
++    /// by this program and no jump, the guest is not touched at all.
++    pub fn word_step(&mut self, g: &mut dyn Guest, want: bool, jumped: bool) -> WordStep {
++        if !want && !self.laid && !jumped {
++            return WordStep::default();
++        }
++        let Some(now) = g.r32(START_FROM_BEGINNING) else { return WordStep::default() };
++        let write = word_to_write(want, now);
++        let after = write.unwrap_or(now);
++        self.laid = after == TRAP_WORD;
++        WordStep { now: Some(now), write, stranger: want && after != TRAP_WORD }
++    }
++}
++
++/// `kernel::svc::dispatch` for SVC_NUMBER: true when it was the trap's svc at
++/// START_FROM_BEGINNING (pending recorded when the checks hold and a row is set; the replaced
++/// push done; the function goes on at +4); false for any other place (an unknown svc, as before).
++pub fn on_svc(system: &mut System) -> bool {
++    // the cpu is already past the svc
++    let at = system.cpu.regs[15].wrapping_sub(4);
++    if system.cpu.cpsr.thumb || at != START_FROM_BEGINNING {
++        return false;
++    }
++    let Some((sp, words)) = push_words(ORIGINAL_WORD, &system.cpu.regs) else { return false };
++    if system.is_fates_title() && system.helpers().any_new_game_row() {
++        let (lr, r0) = (system.cpu.regs[14], system.cpu.regs[0]);
++        match svc_checks(&mut system.memory, false, at, lr, r0) {
++            Ok(block) => system.options.pending = Some(Pending { block }),
++            Err(why) => {
++                system.options.pending = None;
++                log::warn!("fates_options: New Game step at frame {} not used: {} (lr {lr:08X}, r0 {r0:08X}); \
++                            nothing written", system.frames, why.why());
++            }
++        }
++    }
++    for (addr, value) in words {
++        system.memory.write32(addr, value);
++    }
++    system.cpu.regs[13] = sp;
++    true
++}
++
++/// once a frame, from `System::run_frame` right after `fates_rando_session::after_frame`:
++/// the pending store, then the trap word follows the rows. Nothing for any other title.
++pub fn after_frame(system: &mut System) {
++    if !system.is_fates_title() {
++        return;
++    }
++    let frames = system.frames;
++    let jumped = system.options.jumped(frames);
++    let helpers = system.helpers();
++    if let Some(Pending { block }) = system.options.pending.take() {
++        if helpers.any_new_game_row() {
++            match store(&mut system.memory, block, &helpers.new_game_bytes()) {
++                Ok(stored) => {
++                    system.options.writes += 1;
++                    log::info!("fates_options: New Game: {} (frame {frames}, block {block:08X})", shown(&stored));
++                }
++                Err(why) => log::warn!("fates_options: New Game at frame {frames}: nothing written: {}", why.why()),
++            }
++        }
++    }
++    let mut want = helpers.any_new_game_row();
++    if want && system.recompiled.as_ref().is_some_and(|lib| !lib.checks_itself()) {
++        if !system.options.noted {
++            system.options.noted = true;
++            log::warn!("fates_options: the New Game defaults need the game recompiled again (its code cannot tell a \
++                        changed function); New Games keep the game's own settings");
++        }
++        want = false;
++    }
++    let step = system.options.word_step(&mut system.memory, want, jumped);
++    let Some(now) = step.now else { return };
++    if let Some(word) = step.write {
++        system.memory.write32_privileged(START_FROM_BEGINNING, word);
++        log::info!("fates_options: New Game trap {}", if word == TRAP_WORD { "on" } else { "off (the original word back)" });
++    }
++    if step.stranger && !system.options.noted {
++        system.options.noted = true;
++        log::warn!("fates_options: StartFromBeginning's first word is 0x{now:08X}, not the original's; the New Game \
++                    defaults stay off");
++    }
++    let Some(now) = Guest::r32(&mut system.memory, START_FROM_BEGINNING) else { return };
++    if now != system.options.lib_word.unwrap_or(ORIGINAL_WORD) {
++        if let Some(lib) = system.recompiled.as_mut() {
++            if lib.checks_itself() {
++                let stale = lib.check(&mut system.memory);
++                log::info!("fates_options: the recompiled code checked again, {stale} functions run in the interpreter");
++            }
++        }
++        system.options.lib_word = Some(now);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::fates_helpers::{BattleAnimations, EnemySkip, Helpers, HpBars, MapSpeed};
++    use crate::fates_nuzlocke::UNIT_POOL;
++    use crate::fates_rando::NewGameWatch;
++    use std::collections::BTreeMap;
++
++    /// guest memory in blocks; counts every access, and can refuse all of them.
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++        reads: usize,
++        writes: Vec<(u32, Vec<u8>)>,
++        untouchable: bool,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++        fn byte(&self, addr: u32) -> u8 {
++            let (b, o) = self.find(addr, 1).unwrap();
++            self.blocks[&b][o]
++        }
++        fn word(&self, addr: u32) -> u32 {
++            let (b, o) = self.find(addr, 4).unwrap();
++            u32::from_le_bytes(self.blocks[&b][o..o + 4].try_into().unwrap())
++        }
++        fn set_word(&mut self, addr: u32, v: u32) {
++            let (b, o) = self.find(addr, 4).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + 4].copy_from_slice(&v.to_le_bytes());
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            assert!(!self.untouchable, "guest memory touched at {addr:08X}");
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            assert!(!self.untouchable, "guest memory read at {addr:08X}");
++            self.reads += 1;
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            assert!(!self.untouchable, "guest memory written at {addr:08X}");
++            self.writes.push((addr, data.to_vec()));
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++        }
++    }
++
++    const BLOCK: u32 = 0x3000_0000;
++    const VERSUS: u32 = 0x3100_0000 + 0x12AC;
++    const POOL: u32 = 0x3200_0000;
++
++    /// the title after GameReset: the block at its reset values (word +0x4 0x00011E5E, +0x8 1,
++    /// +0xC 2, +0xD 0, +0xE 0, +0x16 1), the unit pool empty, no map, the original word in code.
++    fn title() -> Fake {
++        let mut m = Fake::default();
++        let mut b = vec![0u8; 0x40];
++        b[4..8].copy_from_slice(&0x0001_1E5Eu32.to_le_bytes());
++        b[0x8] = 1;
++        b[0xC] = 2;
++        b[0x16] = 1;
++        m.put(BLOCK, &b);
++        m.put(0x3100_0000, &vec![0u8; 0x1300]);
++        m.put(GAME_CONFIG, &BLOCK.to_le_bytes());
++        m.put(UNIT_POOL, &[0u8; 4]);
++        m.put(UNIT_POOL + 4, &POOL.to_le_bytes());
++        m.put(POOL, &[0u8; 12 * 10]);
++        m.put(MAP_INSTANCE, &0u32.to_le_bytes());
++        m.put(START_FROM_BEGINNING, &ORIGINAL_WORD.to_le_bytes());
++        m
++    }
++
++    fn army(m: &mut Fake) {
++        m.set_word(POOL, 0x3300_0000);
++    }
++
++    fn all_set() -> Helpers {
++        Helpers {
++            battle_animations: BattleAnimations::Off,
++            map_speed: MapSpeed::Fast,
++            enemy_skip: EnemySkip::All,
++            hp_bars: HpBars::Off,
++            ..Helpers::default()
++        }
++    }
++
++    fn block_bytes(m: &Fake) -> Vec<u8> {
++        m.blocks[&BLOCK].clone()
++    }
++
++    #[test]
++    fn the_word_follows_the_rows_and_leaves_a_stranger_alone() {
++        assert_eq!(word_to_write(true, ORIGINAL_WORD), Some(TRAP_WORD));
++        assert_eq!(word_to_write(false, TRAP_WORD), Some(ORIGINAL_WORD));
++        assert_eq!(word_to_write(true, TRAP_WORD), None);
++        assert_eq!(word_to_write(false, ORIGINAL_WORD), None, "off: the original word is never written");
++        assert_eq!(word_to_write(true, 0xE1A0_0000), None, "a stranger word is left alone");
++        assert_eq!(word_to_write(false, 0xE1A0_0000), None);
++        assert_eq!(TRAP_WORD, 0xEFFE_C003);
++        assert_ne!(SVC_NUMBER, crate::fates_rando_chests::SVC_NUMBER);
++        assert_ne!(SVC_NUMBER, crate::fates_rando_names::SVC_NUMBER);
++        assert!(SVC_NUMBER > 0xFF, "no kernel call has this number");
++    }
++
++    #[test]
++    fn the_replaced_push_stores_r4_to_r6_and_lr() {
++        let mut regs = [0u32; 16];
++        for (i, r) in regs.iter_mut().enumerate() {
++            *r = 0x100 + i as u32;
++        }
++        regs[13] = 0x0FFF_FF00;
++        let (sp, words) = push_words(ORIGINAL_WORD, &regs).unwrap();
++        assert_eq!(sp, 0x0FFF_FF00 - 16);
++        assert_eq!(words, vec![(sp, 0x104), (sp + 4, 0x105), (sp + 8, 0x106), (sp + 12, 0x10E)]);
++    }
++
++    #[test]
++    fn the_svc_checks_accept_only_the_new_game_step() {
++        let mut m = title();
++        assert_eq!(svc_checks(&mut m, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Ok(BLOCK));
++        // planted bugs, one per refusal
++        assert_eq!(svc_checks(&mut m, true, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::NotTheTrap));
++        assert_eq!(svc_checks(&mut m, false, START_FROM_BEGINNING + 4, CALL_RETURN, BLOCK), Err(Refusal::NotTheTrap));
++        assert_eq!(svc_checks(&mut m, false, START_FROM_BEGINNING, CALL_RETURN + 4, BLOCK), Err(Refusal::WrongCaller),
++                   "wrong lr");
++        assert_eq!(svc_checks(&mut m, false, START_FROM_BEGINNING, CALL_RETURN, VERSUS), Err(Refusal::WrongBlock),
++                   "wrong r0: the versus copy is never the block");
++        assert_eq!(svc_checks(&mut m, false, START_FROM_BEGINNING, CALL_RETURN, 0), Err(Refusal::NoBlock), "null r0");
++        let mut n = title();
++        n.set_word(GAME_CONFIG, 0);
++        assert_eq!(svc_checks(&mut n, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::NoBlock),
++                   "G_GameConfig null (the boot block before its pointer is stored)");
++        let mut short = title();
++        short.put(BLOCK, &[0u8; 0x10]);
++        assert_eq!(svc_checks(&mut short, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::BlockUnreadable));
++        let mut a = title();
++        army(&mut a);
++        assert_eq!(svc_checks(&mut a, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::ArmyPresent),
++                   "player army present: a game is loaded");
++        let mut map = title();
++        map.set_word(MAP_INSTANCE, 0x3400_0000);
++        assert_eq!(svc_checks(&mut map, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::MapPresent));
++        let mut nomap = title();
++        nomap.blocks.remove(&MAP_INSTANCE);
++        assert_eq!(svc_checks(&mut nomap, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK), Err(Refusal::MapPresent),
++                   "Map::Get's global unreadable: not sure, so no");
++        // the svc checks never write
++        for f in [&m, &n, &short, &a, &map, &nomap] {
++            assert!(f.writes.is_empty());
++        }
++    }
++
++    #[test]
++    fn the_store_writes_exactly_the_chosen_bytes_and_compares_first() {
++        let mut m = title();
++        let before = block_bytes(&m);
++        let stored = store(&mut m, BLOCK, &all_set().new_game_bytes()).unwrap();
++        let after = block_bytes(&m);
++        let changed: Vec<usize> = (0..before.len()).filter(|&i| before[i] != after[i]).collect();
++        assert_eq!(changed, vec![0x8, 0xC, 0xD, 0x16]);
++        assert_eq!((after[0x8], after[0xC], after[0xD], after[0x16]), (0, 1, 2, 0));
++        assert_eq!(&after[4..8], &before[4..8], "never word +0x4");
++        assert_eq!(after[0xE], before[0xE], "never +0xE (the danger zone)");
++        assert_eq!(shown(&stored), "battle 1->0, speed 2->1, enemy skip 0->2, hp bars 1->0");
++        // compare-then-store: a byte already at the value is not written
++        let mut k = title();
++        let h = Helpers { battle_animations: BattleAnimations::On, map_speed: MapSpeed::Fast, ..Helpers::default() };
++        let stored = store(&mut k, BLOCK, &h.new_game_bytes()).unwrap();
++        assert_eq!(k.writes, vec![(BLOCK + 0xC, vec![1])], "+0x8 already 1: not written");
++        assert_eq!(shown(&stored), "battle 1 (kept), speed 2->1");
++        // the versus copy is never written, nor anything outside the block's four bytes
++        assert!(m.writes.iter().all(|(a, d)| d.len() == 1 && [0x8, 0xC, 0xD, 0x16].contains(&(a - BLOCK))));
++        assert!(m.blocks[&0x3100_0000].iter().all(|&b| b == 0));
++    }
++
++    #[test]
++    fn the_store_refuses_on_every_doubt_and_writes_nothing() {
++        let bytes = all_set().new_game_bytes();
++        let cases: Vec<(&str, Box<dyn Fn(&mut Fake)>, u32, Refusal)> = vec![
++            ("the block moved", Box::new(|m: &mut Fake| m.set_word(GAME_CONFIG, 0x3100_0000)), BLOCK, Refusal::WrongBlock),
++            ("G_GameConfig null", Box::new(|m: &mut Fake| m.set_word(GAME_CONFIG, 0)), BLOCK, Refusal::NoBlock),
++            ("a player army", Box::new(army), BLOCK, Refusal::ArmyPresent),
++            ("a map", Box::new(|m: &mut Fake| m.set_word(MAP_INSTANCE, 1)), BLOCK, Refusal::MapPresent),
++            ("the versus copy", Box::new(|_: &mut Fake| {}), VERSUS, Refusal::WrongBlock),
++        ];
++        for (what, plant, block, why) in cases {
++            let mut m = title();
++            plant(&mut m);
++            m.writes.clear();
++            assert_eq!(store(&mut m, block, &bytes), Err(why), "{what}");
++            assert!(m.writes.is_empty(), "{what}: nothing written");
++        }
++    }
++
++    #[test]
++    fn a_value_past_the_line_or_another_offset_is_refused() {
++        let good = NewGameByte { offset: HP_BARS_OFFSET, value: 1, line_values: HP_BARS_VALUES };
++        let past = NewGameByte { value: HP_BARS_VALUES, ..good };
++        let battle_past = NewGameByte { offset: BATTLE_ANIMATIONS_OFFSET, value: 5, line_values: 5 };
++        let word4 = NewGameByte { offset: 0x4, value: 0, line_values: 5 };
++        let danger = NewGameByte { offset: 0xE, value: 1, line_values: 3 };
++        let lying = NewGameByte { offset: MAP_SPEED_OFFSET, value: 3, line_values: 4 };
++        assert!(bytes_ok(&[good]));
++        for bad in [past, battle_past, word4, danger, lying] {
++            assert!(!bytes_ok(&[good, bad]), "{bad:?}");
++            let mut m = title();
++            assert_eq!(store(&mut m, BLOCK, &[good, bad]), Err(Refusal::BadValue));
++            assert!(m.writes.is_empty(), "the whole write is refused, the good byte too");
++        }
++        // every value the rows can give is accepted
++        for h in [all_set(), Helpers { battle_animations: BattleAnimations::On, map_speed: MapSpeed::FastWhileA,
++                                       enemy_skip: EnemySkip::Move, hp_bars: HpBars::On, ..Helpers::default() }] {
++            assert!(bytes_ok(&h.new_game_bytes()));
++        }
++    }
++
++    #[test]
++    fn all_rows_at_games_choice_lay_no_word_and_touch_no_guest_memory() {
++        let mut w = Writer::default();
++        let mut m = title();
++        m.untouchable = true;
++        assert!(!Helpers::default().any_new_game_row());
++        // a fresh boot: frames 1, 2, 3 ... (no jump), nothing wanted, nothing laid
++        for f in 1..200 {
++            let j = w.jumped(f);
++            assert!(!j);
++            assert_eq!(w.word_step(&mut m, false, j), WordStep::default());
++        }
++        m.untouchable = false;
++        assert_eq!(m.reads, 0);
++        assert_eq!(m.word(START_FROM_BEGINNING), ORIGINAL_WORD);
++        // an explicit all-"game" table is the same Helpers (the frontend's settings test reads the file)
++        let h = Helpers { battle_animations: BattleAnimations::Game, map_speed: MapSpeed::Game, enemy_skip: EnemySkip::Game,
++                          hp_bars: HpBars::Game, ..Helpers::default() };
++        assert_eq!(h, Helpers::default());
++        assert!(!h.any_new_game_row());
++        assert!(h.new_game_bytes().is_empty());
++    }
++
++    #[test]
++    fn a_set_row_lays_the_word_and_games_choice_puts_it_back() {
++        let mut w = Writer::default();
++        let mut m = title();
++        assert!(!w.jumped(1));
++        let s = w.word_step(&mut m, true, false);
++        assert_eq!(s, WordStep { now: Some(ORIGINAL_WORD), write: Some(TRAP_WORD), stranger: false });
++        m.set_word(START_FROM_BEGINNING, TRAP_WORD);
++        assert!(!w.jumped(2));
++        assert_eq!(w.word_step(&mut m, true, false).write, None, "laid already");
++        // every row back at Game's choice: the original word back, then nothing is read again
++        assert!(!w.jumped(3));
++        assert_eq!(w.word_step(&mut m, false, false).write, Some(ORIGINAL_WORD));
++        m.set_word(START_FROM_BEGINNING, ORIGINAL_WORD);
++        m.untouchable = true;
++        assert!(!w.jumped(4));
++        assert_eq!(w.word_step(&mut m, false, false), WordStep::default());
++    }
++
++    #[test]
++    fn a_stranger_word_is_left_alone_and_said() {
++        let mut w = Writer::default();
++        let mut m = title();
++        m.set_word(START_FROM_BEGINNING, 0xE1A0_0000);
++        let s = w.word_step(&mut m, true, false);
++        assert_eq!(s.write, None);
++        assert!(s.stranger);
++        assert_eq!(m.word(START_FROM_BEGINNING), 0xE1A0_0000);
++        assert!(m.writes.is_empty());
++    }
++
++    #[test]
++    fn a_state_with_the_word_is_put_right_with_the_rows_off() {
++        // a state taken with a row set (the svc in memory) loaded later with every row off: the
++        // frame counter jumps, the word is read once and the original goes back
++        let mut w = Writer::default();
++        let mut m = title();
++        for f in 1..10 {
++            let j = w.jumped(f);
++            w.word_step(&mut m, false, j);
++        }
++        assert_eq!(m.reads, 0);
++        m.set_word(START_FROM_BEGINNING, TRAP_WORD); // the state's memory
++        w.pending = Some(Pending { block: BLOCK });
++        let j = w.jumped(5000);
++        assert!(j, "the state's frame number does not follow");
++        assert_eq!(w.pending, None, "a state drops a pending store");
++        assert_eq!(w.word_step(&mut m, false, j).write, Some(ORIGINAL_WORD));
++        m.set_word(START_FROM_BEGINNING, ORIGINAL_WORD);
++        // and the next frames touch nothing again
++        m.untouchable = true;
++        let j = w.jumped(5001);
++        assert_eq!(w.word_step(&mut m, false, j), WordStep::default());
++        // a state loaded before the first frame (the writer starts late) is checked once too
++        let mut late = Writer::default();
++        assert!(late.jumped(300));
++        assert!(!Writer::default().jumped(1), "a fresh boot's first frame is no jump");
++    }
++
++    #[test]
++    fn a_state_with_the_original_word_gets_the_trap_again_with_a_row_set() {
++        let mut w = Writer::default();
++        let mut m = title();
++        let j = w.jumped(1);
++        w.word_step(&mut m, true, j);
++        m.set_word(START_FROM_BEGINNING, TRAP_WORD);
++        // a state from before the row was set
++        m.set_word(START_FROM_BEGINNING, ORIGINAL_WORD);
++        let j = w.jumped(77);
++        assert_eq!(w.word_step(&mut m, true, j).write, Some(TRAP_WORD));
++    }
++
++    #[test]
++    fn the_randomizer_watch_still_fires_in_the_pick_frame() {
++        let h = all_set();
++        let mut m = title();
++        let mut watch = NewGameWatch::default();
++        let mut w = Writer::default();
++        // two quiet title frames
++        for f in 1..=2 {
++            assert!(!watch.after_frame(&mut m));
++            w.jumped(f);
++        }
++        // the pick frame: StartFromBeginning changes word +0x4 (Normal + Casual), the svc records
++        // pending, then at the frame's end the watch runs first and the store after it
++        m.set_word(BLOCK + 4, 0x4001_5EDE);
++        let block = svc_checks(&mut m, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK).unwrap();
++        w.pending = Some(Pending { block });
++        assert!(!w.jumped(3));
++        assert!(watch.after_frame(&mut m), "the randomizer's watch fires in the pick frame");
++        let p = w.pending.take().unwrap();
++        store(&mut m, p.block, &h.new_game_bytes()).unwrap();
++        // the frame after: no second pick, the bytes stay
++        assert!(!watch.after_frame(&mut m));
++        assert!(!watch.after_frame(&mut m));
++        assert_eq!((m.byte(BLOCK + 0x8), m.byte(BLOCK + 0xC), m.byte(BLOCK + 0xD), m.byte(BLOCK + 0x16)), (0, 1, 2, 0));
++
++        // the planted bug: storing before the watch in the pick frame stops the watch firing
++        let mut m = title();
++        let mut watch = NewGameWatch::default();
++        for _ in 0..2 {
++            watch.after_frame(&mut m);
++        }
++        m.set_word(BLOCK + 4, 0x4001_5EDE);
++        store(&mut m, BLOCK, &h.new_game_bytes()).unwrap();
++        assert!(!watch.after_frame(&mut m), "a write before the watch would hide the pick");
++    }
++
++    #[test]
++    fn a_load_never_writes() {
++        // a load fills the army (and the block from the save) without StartFromBeginning: no svc,
++        // no pending; and even a pending left over meets the army check at the frame's end
++        let mut m = title();
++        army(&mut m);
++        m.writes.clear();
++        assert_eq!(store(&mut m, BLOCK, &all_set().new_game_bytes()), Err(Refusal::ArmyPresent));
++        assert!(m.writes.is_empty());
++        let mut w = Writer::default();
++        w.jumped(10);
++        assert_eq!(w.pending, None);
++    }
++}
+diff --git a/crates/zakuro-core/src/kernel/svc.rs b/crates/zakuro-core/src/kernel/svc.rs
+index d85a6d6..39274ed 100644
+--- a/crates/zakuro-core/src/kernel/svc.rs
++++ b/crates/zakuro-core/src/kernel/svc.rs
+@@ -109,6 +109,9 @@ pub fn dispatch(system: &mut System, number: u32) {
+         // round 74: the names-in-dialogue trap's svc in Mess::Get (only while a run with a
+         // full swap's full.txt is active, else that word is the original's)
+         crate::fates_rando_names::SVC_NUMBER if crate::fates_rando_names::on_svc(system) => {}
++        // round 81: the New Game defaults trap's svc in GameConfigData::StartFromBeginning (only
++        // while a New Game row is set, else that word is the original's)
++        crate::fates_options::SVC_NUMBER if crate::fates_options::on_svc(system) => {}
+         _ => {
+             log::warn!(
+                 "unimplemented svc 0x{number:02X} at 0x{:08X} (r0={:08X} r1={:08X} r2={:08X} r3={:08X})",
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index b0bb5f3..51dc21f 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -7,6 +7,7 @@ pub mod enhancements;
+ pub mod fates_growth_view;
+ pub mod fates_helpers;
+ pub mod fates_nuzlocke;
++pub mod fates_options;
+ pub mod fates_rando;
+ pub mod fates_rando_chests;
+ pub mod fates_rando_file;
+@@ -268,6 +269,8 @@ pub struct System {
+     /// Fire Emblem Fates' Helpers (round 80, fates_helpers): the Esc window's Enemy phase and
+     /// True hit rows, handed over by the frontend; read through `helpers()`.
+     helpers: fates_helpers::Helpers,
++    /// round 81: the New Game defaults writer (fates_options): its trap word and pending store.
++    pub options: fates_options::Writer,
+ }
+ 
+ /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
+@@ -350,6 +353,7 @@ impl System {
+             rando: fates_rando_session::Session::default(),
+             growth: fates_growth_view::GrowthView::default(),
+             helpers: fates_helpers::Helpers::default(),
++            options: fates_options::Writer::default(),
+         }
+     }
+ 
+@@ -408,6 +412,8 @@ impl System {
+         self.end_frame();
+         // the shared after-frame hook (window, headless and boot-server alike)
+         fates_rando_session::after_frame(self);
++        // round 81: the New Game defaults writer, after the randomizer's watch (outside its gate)
++        fates_options::after_frame(self);
+         FrameOutcome::Completed
+     }
+ 
+@@ -992,7 +998,7 @@ impl System {
+     /// they act only for Fire Emblem Fates' title id.
+     pub fn set_helpers(&mut self, helpers: fates_helpers::Helpers) {
+         if self.helpers != helpers {
+-            log::info!(target: "zakuro::fates_helpers", "helpers: enemy phase {}, true hit {}", helpers.enemy_phase.key(), if helpers.true_hit { "on" } else { "off" });
++            log::info!(target: "zakuro::fates_helpers", "helpers: enemy phase {}, true hit {}, new game: battle {}, speed {}, enemy skip {}, hp bars {}", helpers.enemy_phase.key(), if helpers.true_hit { "on" } else { "off" }, helpers.battle_animations.key(), helpers.map_speed.key(), helpers.enemy_skip.key(), helpers.hp_bars.key());
+         }
+         self.helpers = helpers;
+     }

@@ -1,0 +1,16 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,4,str:self,tid,high,record label = this string,
+0x04,4,str,mtid_name,high,Terrain::GetName 005453D0 reads +0x4 (MTID_ message),
+0x08,4,pad,pad_08,high,zero in every record of every file,
+0x0C,1,u8,tile_number,high,read by 16 functions (ObstacleAcquisition/trick::Data::Mutation...); equals the record index in its file,
+0x0D,3,u8[3],change_to,medium,map::Trick::Deserialize / trick::Data::Mutation / TerrainAttributeSetTID read +0xD..+0xF (tile it turns into: index in the same file); Paragon change_id_1..3 (fact),1|2|3
+0x10,1,u8,move_cost_column,high,map::Image::Update / Terrain::IsCastleUnitDispos / Dispos::Data::Calculate read +0x10 (25 functions) (column in the movement-cost table),
+0x11,1,s8,defense,high,AIThink::GetTerrainScore / map::Route::TickMindSeek read +0x11 (s8),
+0x12,1,s8,avoid,high,AIThink::GetTerrainScore / map::Route::TickMindSeek read +0x12 (s8),
+0x13,1,s8,heal,high,ProcTerrainHeal::Calculate / ProcTerrainDamage::Calculate read +0x13 (s8; negative = damage),
+0x14,1,u8,minimap_color,medium,map::MiniMap::Update reads +0x14,
+0x15,3,pad,pad_15,high,zero in every record,
+0x18,4,u32,attributes,medium,read by 43 functions (BattleUtil::IsChangeBattle FieldTrick::Update ItemHelper::Battle::CanUse...) as a bit set,
+0x1C,4,str,unknown_str_1c,low,FieldTrick::Update reads +0x1C; set in 2 records,
+0x20,4,str,unknown_str_20,low,SequenceBattle::..::Destroy reads +0x20; set in 3 records,
+0x24,4,str,effect,medium,castle::Actor::MovePlayer reads +0x24; data FLAT1-style ground-effect names; Paragon 'effect' (fact),

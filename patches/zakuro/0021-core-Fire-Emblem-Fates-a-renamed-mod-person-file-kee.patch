@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 00:58:12 -0500
+Subject: [PATCH 21/21] core: Fire Emblem Fates: a renamed mod person file
+ keeps the mod's stored size
+
+Patch 0018 recompressed a Seal of Flames chapter person file after setting its archive
+name; our compression is shorter than the mod's, so the file was served smaller and the
+randomizer's patch of the same chapter (boss stats, enemy levels, music) no longer fit:
+'chapter people kept original' in 16 Seal chapters (round 59 everything-on check). The
+renamed file is now padded to the mod's stored size, as patch_stored does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/zakuro-core/src/mods.rs | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/crates/zakuro-core/src/mods.rs b/crates/zakuro-core/src/mods.rs
+index 386a212..7bbbcbf 100644
+--- a/crates/zakuro-core/src/mods.rs
++++ b/crates/zakuro-core/src/mods.rs
+@@ -199,15 +199,24 @@ pub fn fates_person_name(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+     bin.strtab[at..at + stem.len()].copy_from_slice(stem.as_bytes());
+     let data = bin.build();
+     let mut out = lz11_compress(&data, lz.format, if lz.format == 0x13 { data.len() as u32 } else { 0 });
++    // round 59 check: the renamed file keeps the stored size of the mod's own file (padded with
++    // zeros, as fates_rando_file::patch_stored does). Our compression is usually shorter than the
++    // mod's; a shorter served file left the randomizer's patch of the same chapter no room
++    // ("does not fit in the original's N bytes": chapter people kept original in 16 Seal chapters).
++    if out.len() > bytes.len() {
++        log::warn!("mods: {path}: renamed archive compresses to {} bytes, more than the mod's {}; not changed", out.len(), bytes.len());
++        return None;
++    }
+     if lz.format == 0x13 {
+         // decoded in place by the game: the outer size keeps every write behind the reads
+         // (the same rule as fates_rando_file's patched files, patch 0017)
+-        let need = (out.len() as i64 + inplace_margin(&out)).max(data.len() as i64);
++        let need = (bytes.len() as i64 + inplace_margin(&out)).max(data.len() as i64).max(lz.outer as i64);
+         if need >= 1 << 24 {
+             return None;
+         }
+         out[1..4].copy_from_slice(&(need as u32).to_le_bytes()[..3]);
+     }
++    out.resize(bytes.len(), 0);
+     Some(out)
+ }
+ 
+@@ -240,6 +249,17 @@ mod person_name_tests {
+         assert!(diff >= 1 && diff <= 4, "only the name differs");
+     }
+ 
++    #[test]
++    fn the_renamed_file_keeps_the_mods_stored_size() {
++        // a mod file compressed less tightly than ours (here: 6 bytes longer): the renamed file is
++        // served at the mod's size, so a randomizer patch of the same chapter has the same room
++        let mut stored = block("X020");
++        stored.extend_from_slice(&[0; 6]);
++        let out = fates_person_name("GameData/Person/C/R002.bin.lz", &stored).expect("renamed");
++        assert_eq!(out.len(), stored.len());
++        assert_eq!(lz_decompress(&out).unwrap().data, lz_decompress(&block("R002")).unwrap().data);
++    }
++
+     #[test]
+     fn everything_else_is_left_alone() {
+         assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", &block("R002")), None);

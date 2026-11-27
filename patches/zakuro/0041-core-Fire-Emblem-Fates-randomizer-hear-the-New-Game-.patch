@@ -1,0 +1,813 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Thu, 26 Nov 2026 00:08:39 -0500
+Subject: [PATCH] core: Fire Emblem Fates randomizer: hear the New Game step
+
+Round 81b (docs/ROUND81B_PLAN.md D1-D4; the owner's "fix the classic bug
+first", Grok's call in docs/collab/ROUND81B_CLASSIC_GROK.md). The
+randomizer's NewGameWatch only sees a New Game when GameConfigData word +0x4
+changes, and on Normal + Classic it does not (docs/RANDOMIZER_INGAME.md
+section 16): no pick, no randomized run, no Nuzlocke, no message. Now the
+randomizer also hears round 81's StartFromBeginning trap (patch 0040).
+
+- D1 (fates_options.rs): the trap word (svc 0xEFFEC003 over 0x001D0618,
+  original 0xE92D4070) is wanted while a New Game row is set OR the
+  randomizer listens (trap_wanted; fates_rando_session::hears_step =
+  listens: the Fates title id, Config::fates_rando, and the game Fates
+  itself, step_game). Seal of Flames keeps the hooks on (F-047) but does not
+  listen: Seal at the defaults lays no trap, hears nothing and shows no
+  warning, as in round 81 (plan D1, P7). The rest as round 81: a stranger
+  word left alone, checks_itself() false = off, a state put right. Not
+  listening and no row: no trap and no guest memory read.
+- D2 (fates_options::on_svc, svc_outcome): the same checks, run once (ARM at
+  0x001D0618, lr 0x00441794, r0 == *0x006DA0F8 non-zero, block readable, no
+  player army, no map). Held: the rows' pending store only while a row is
+  set (exactly round 81), and "the New Game step heard" for the randomizer
+  (fates_rando_session::heard_step) while it listens, stamped with the
+  frame whose end takes it. Refused: round 81's log line while a row is set,
+  else a randomizer log line; the refusal goes to the randomizer too. No
+  guest data byte written in the svc.
+- D3 (fates_rando_session.rs): Session::frame_heard: a pick is NewGameWatch
+  fired OR the step heard in this frame; at most one pick per frame; a pick
+  within SAME_PICK = 2 frames after a pick is the same New Game; the
+  save-read load window still means no pick. take_heard clears the flag at
+  the frame's end and drops one stamped for another frame (a jump); a state
+  restore drops it and the SAME_PICK count. Session::frame(g) = frame_heard(g, false, false), so the
+  watch-only path is as before.
+- D4: while the randomizer listens, once each per program run, on screen (the notice)
+  and in the log: the step refused (or heard inside the load window) and no
+  pick taken that frame -> "This New Game did not use your seed."; the trap
+  cannot be laid (a stranger word, or recompiled code that cannot check
+  itself; Writer::cannot_lay keeps round 81's single rows line apart) ->
+  "Classic New Games cannot start the randomizer in this setup; pick Casual
+  or Phoenix."
+
+Unchanged: the randomizer's output (answer, run id, patch), the page, round
+81's rows and bytes, loads (a load never reaches the step: lr check).
+
+Tests: fates_options the_trap_is_wanted_for_the_rows_or_the_randomizer,
+hooks_off_and_no_rows_lay_no_trap_and_touch_no_guest_memory,
+the_randomizer_alone_lays_the_trap_and_the_rows_store_stays_empty,
+rows_and_randomizer_share_one_check,
+a_trap_that_cannot_be_laid_is_said_once_to_each_listener;
+fates_rando_session a_classic_new_game_is_heard_at_the_trap_once,
+a_casual_new_game_heard_and_watched_in_one_frame_is_one_pick,
+a_watch_after_a_heard_pick_is_the_same_new_game,
+a_load_is_no_pick_and_is_never_heard,
+the_heard_flag_lives_for_its_own_frame_only,
+a_refusal_is_said_once_and_takes_no_pick,
+only_fates_itself_hears_the_new_game_step. Round 81's tests unchanged and
+passing. Fourteen code mutations each fail at least one test
+(build/r81b/core/planted.txt), and two more for the Seal gate and the
+restore (build/r81b/gate/planted-gate.txt). zakuro-core 271 passed in
+engine/target/zakuro-core-test, zakuro 131 passed (2 ignored) in
+engine/target/zakuro-frontend-test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/zakuro-core/src/fates_options.rs       | 231 +++++++++++-
+ crates/zakuro-core/src/fates_rando_session.rs | 354 +++++++++++++++++-
+ crates/zakuro-core/src/kernel/svc.rs          |   3 +-
+ 3 files changed, 564 insertions(+), 24 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_options.rs b/crates/zakuro-core/src/fates_options.rs
+index 7e628d4..3d6a386 100644
+--- a/crates/zakuro-core/src/fates_options.rs
++++ b/crates/zakuro-core/src/fates_options.rs
+@@ -46,6 +46,20 @@
+ //! writer reads no guest memory at all, except a single read of the trap word after a frame
+ //! that did not follow the one before (a save state was loaded, or the writer started late),
+ //! so a state taken with the svc in memory is put right.
++//!
++//! **Round 81b (docs/ROUND81B_PLAN.md D1-D4): the randomizer hears the same step.** The
++//! randomizer's `NewGameWatch` only sees a New Game when word +0x4 changes, and on Normal +
++//! Classic it does not (docs/RANDOMIZER_INGAME.md section 16). So the trap is also laid while
++//! the randomizer listens (`fates_rando_session::hears_step`: the Fates title id,
++//! `Config::fates_rando`, and the game is Fates itself, not Seal of Flames: the port's frontend
++//! keeps the hooks on for Seal too, F-047, but Seal at the defaults stays as in round 81, no
++//! trap), even with every row at Game's choice. At the
++//! svc the same checks run once: when they hold, "the New Game step was heard" goes to the
++//! randomizer for this frame (`fates_rando_session::heard_step`) whatever the rows; the rows'
++//! pending store is recorded only while a row is set, exactly as before. A refusal, or a trap
++//! that cannot be laid (a stranger word, recompiled code that cannot check itself), is said to
++//! the player once by the randomizer's notice. The randomizer not listening (`Config::fates_rando`
++//! false, or Seal of Flames) with every row at Game's choice: no trap and no guest memory read, as in round 81.
+ 
+ use zakuro_cpu::Bus;
+ 
+@@ -213,6 +227,44 @@ pub struct Pending {
+     pub block: u32,
+ }
+ 
++/// round 81b D1: the trap is wanted while a New Game row is set or the randomizer's hooks are
++/// on (it hears the New Game step there too).
++pub fn trap_wanted(rows: bool, hooks: bool) -> bool {
++    rows || hooks
++}
++
++/// round 81b D2: what one svc at the trap gives, from one run of the checks.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub struct SvcOutcome {
++    /// the rows' pending store: only while a row is set and the checks held (as round 81)
++    pub pending: Option<Pending>,
++    /// the randomizer heard the New Game step: only while its hooks are on and the checks held
++    pub seen: bool,
++    /// the checks refused (nothing written; said by the rows' log line and / or the randomizer)
++    pub refused: Option<Refusal>,
++}
++
++/// round 81b D2: the svc's checks, run once for both listeners. Neither listening (Seal of
++/// Flames at the defaults, or a word a state brought back): no check, no guest memory read.
++pub fn svc_outcome(g: &mut dyn Guest, rows: bool, hooks: bool, thumb: bool, at: u32, lr: u32, r0: u32) -> SvcOutcome {
++    if !rows && !hooks {
++        return SvcOutcome::default();
++    }
++    match svc_checks(g, thumb, at, lr, r0) {
++        Ok(block) => SvcOutcome { pending: rows.then_some(Pending { block }), seen: hooks, refused: None },
++        Err(why) => SvcOutcome { pending: None, seen: false, refused: Some(why) },
++    }
++}
++
++/// round 81b D4: which "the trap cannot be laid" lines to say now, each once per program run.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub struct CannotLay {
++    /// round 81's log line for the New Game rows
++    pub rows: bool,
++    /// the randomizer's notice: Classic New Games cannot be heard
++    pub rando: bool,
++}
++
+ /// what the word step decided this frame.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ pub struct WordStep {
+@@ -237,6 +289,8 @@ pub struct Writer {
+     lib_word: Option<u32>,
+     /// said once: a stranger word, or recompiled code that cannot check itself
+     noted: bool,
++    /// round 81b D4: said once to the randomizer's player: the trap cannot be laid
++    rando_noted: bool,
+     /// New Game writes done since the program started (the log says each one)
+     pub writes: u64,
+ }
+@@ -267,11 +321,22 @@ impl Writer {
+         self.laid = after == TRAP_WORD;
+         WordStep { now: Some(now), write, stranger: want && after != TRAP_WORD }
+     }
++
++    /// round 81b D4: the trap is wanted but cannot be laid (a stranger word, or recompiled code
++    /// that cannot check itself): the rows' line while a row is set, the randomizer's notice
++    /// while its hooks are on, each said once per program run.
++    pub fn cannot_lay(&mut self, rows: bool, hooks: bool) -> CannotLay {
++        let say = CannotLay { rows: rows && !self.noted, rando: hooks && !self.rando_noted };
++        self.noted |= say.rows;
++        self.rando_noted |= say.rando;
++        say
++    }
+ }
+ 
+ /// `kernel::svc::dispatch` for SVC_NUMBER: true when it was the trap's svc at
+-/// START_FROM_BEGINNING (pending recorded when the checks hold and a row is set; the replaced
+-/// push done; the function goes on at +4); false for any other place (an unknown svc, as before).
++/// START_FROM_BEGINNING (pending recorded when the checks hold and a row is set; round 81b: the
++/// step heard by the randomizer when the checks hold and its hooks are on; the replaced push
++/// done; the function goes on at +4); false for any other place (an unknown svc, as before).
+ pub fn on_svc(system: &mut System) -> bool {
+     // the cpu is already past the svc
+     let at = system.cpu.regs[15].wrapping_sub(4);
+@@ -279,17 +344,25 @@ pub fn on_svc(system: &mut System) -> bool {
+         return false;
+     }
+     let Some((sp, words)) = push_words(ORIGINAL_WORD, &system.cpu.regs) else { return false };
+-    if system.is_fates_title() && system.helpers().any_new_game_row() {
+-        let (lr, r0) = (system.cpu.regs[14], system.cpu.regs[0]);
+-        match svc_checks(&mut system.memory, false, at, lr, r0) {
+-            Ok(block) => system.options.pending = Some(Pending { block }),
+-            Err(why) => {
+-                system.options.pending = None;
+-                log::warn!("fates_options: New Game step at frame {} not used: {} (lr {lr:08X}, r0 {r0:08X}); \
+-                            nothing written", system.frames, why.why());
+-            }
++    let rows = system.is_fates_title() && system.helpers().any_new_game_row();
++    let hooks = crate::fates_rando_session::hears_step(system);
++    let (lr, r0) = (system.cpu.regs[14], system.cpu.regs[0]);
++    let heard = svc_outcome(&mut system.memory, rows, hooks, false, at, lr, r0);
++    if rows {
++        system.options.pending = heard.pending;
++    }
++    if let Some(why) = heard.refused {
++        if rows {
++            log::warn!("fates_options: New Game step at frame {} not used: {} (lr {lr:08X}, r0 {r0:08X}); \
++                        nothing written", system.frames, why.why());
++        } else {
++            log::warn!("fates_options: New Game step at frame {} not heard by the randomizer: {} (lr {lr:08X}, \
++                        r0 {r0:08X})", system.frames, why.why());
+         }
+     }
++    if hooks {
++        crate::fates_rando_session::heard_step(system, heard.seen, heard.refused.is_some());
++    }
+     for (addr, value) in words {
+         system.memory.write32(addr, value);
+     }
+@@ -317,13 +390,19 @@ pub fn after_frame(system: &mut System) {
+             }
+         }
+     }
+-    let mut want = helpers.any_new_game_row();
++    let rows = helpers.any_new_game_row();
++    // round 81b D1: the randomizer wants the trap too (Fates only; Seal of Flames at the defaults: none)
++    let hooks = crate::fates_rando_session::hears_step(system);
++    let mut want = trap_wanted(rows, hooks);
+     if want && system.recompiled.as_ref().is_some_and(|lib| !lib.checks_itself()) {
+-        if !system.options.noted {
+-            system.options.noted = true;
++        let say = system.options.cannot_lay(rows, hooks);
++        if say.rows {
+             log::warn!("fates_options: the New Game defaults need the game recompiled again (its code cannot tell a \
+                         changed function); New Games keep the game's own settings");
+         }
++        if say.rando {
++            crate::fates_rando_session::classic_cannot_be_heard(system, "the game's code cannot tell a changed function");
++        }
+         want = false;
+     }
+     let step = system.options.word_step(&mut system.memory, want, jumped);
+@@ -332,10 +411,16 @@ pub fn after_frame(system: &mut System) {
+         system.memory.write32_privileged(START_FROM_BEGINNING, word);
+         log::info!("fates_options: New Game trap {}", if word == TRAP_WORD { "on" } else { "off (the original word back)" });
+     }
+-    if step.stranger && !system.options.noted {
+-        system.options.noted = true;
+-        log::warn!("fates_options: StartFromBeginning's first word is 0x{now:08X}, not the original's; the New Game \
+-                    defaults stay off");
++    if step.stranger {
++        let say = system.options.cannot_lay(rows, hooks);
++        if say.rows {
++            log::warn!("fates_options: StartFromBeginning's first word is 0x{now:08X}, not the original's; the New Game \
++                        defaults stay off");
++        }
++        if say.rando {
++            crate::fates_rando_session::classic_cannot_be_heard(system, &format!(
++                "StartFromBeginning's first word is 0x{now:08X}, not the original's"));
++        }
+     }
+     let Some(now) = Guest::r32(&mut system.memory, START_FROM_BEGINNING) else { return };
+     if now != system.options.lib_word.unwrap_or(ORIGINAL_WORD) {
+@@ -707,6 +792,116 @@ mod tests {
+         assert!(!watch.after_frame(&mut m), "a write before the watch would hide the pick");
+     }
+ 
++    // ------------------------------------------------------------- round 81b: the randomizer hears
++
++    #[test]
++    fn the_trap_is_wanted_for_the_rows_or_the_randomizer() {
++        assert!(!trap_wanted(false, false), "hooks off and no row: no trap (round 81)");
++        assert!(trap_wanted(true, false), "a row set: the trap (round 81)");
++        assert!(trap_wanted(false, true), "the randomizer's hooks on: the trap with no row set");
++        assert!(trap_wanted(true, true));
++        // the hooks follow the randomizer's own switch: Config::fates_rando off = hooks off
++        assert!(!trap_wanted(false, crate::fates_rando_session::hooks_on(Some(crate::fates_rando::TITLE), false)));
++        assert!(trap_wanted(false, crate::fates_rando_session::hooks_on(Some(crate::fates_rando::TITLE), true)));
++        // Seal of Flames (hooks on, F-047) at the defaults: no trap, as in round 81 (plan D1, P7)
++        let seal = crate::fates_rando_session::step_game(Some("seal"));
++        assert!(!trap_wanted(false, seal), "Seal with no row set: no trap");
++        assert!(trap_wanted(true, seal), "Seal with a row set: the rows' trap, as in round 81");
++        assert!(trap_wanted(false, crate::fates_rando_session::step_game(None)), "Fates: the trap");
++    }
++
++    #[test]
++    fn hooks_off_and_no_rows_lay_no_trap_and_touch_no_guest_memory() {
++        let mut w = Writer::default();
++        let mut m = title();
++        m.untouchable = true;
++        for f in 1..200 {
++            let j = w.jumped(f);
++            assert_eq!(w.word_step(&mut m, trap_wanted(false, false), j), WordStep::default());
++        }
++        // a svc there anyway (a state brought the word back): no check, no read, nothing heard
++        assert_eq!(svc_outcome(&mut m, false, false, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK),
++                   SvcOutcome::default());
++        m.untouchable = false;
++        assert_eq!(m.reads, 0);
++        assert!(m.writes.is_empty());
++        assert_eq!(m.word(START_FROM_BEGINNING), ORIGINAL_WORD);
++    }
++
++    #[test]
++    fn the_randomizer_alone_lays_the_trap_and_the_rows_store_stays_empty() {
++        let mut w = Writer::default();
++        let mut m = title();
++        assert!(!Helpers::default().any_new_game_row());
++        assert!(!w.jumped(1));
++        let s = w.word_step(&mut m, trap_wanted(false, true), false);
++        assert_eq!(s, WordStep { now: Some(ORIGINAL_WORD), write: Some(TRAP_WORD), stranger: false });
++        m.set_word(START_FROM_BEGINNING, TRAP_WORD);
++        // the Normal + Classic pick: word +0x4 stays at its reset value; the svc hears the step
++        let before = block_bytes(&m);
++        let heard = svc_outcome(&mut m, false, true, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK);
++        assert_eq!(heard, SvcOutcome { pending: None, seen: true, refused: None });
++        assert!(m.writes.is_empty(), "no guest byte written at the svc");
++        // nothing pending, so the frame's end stores nothing (no "New Game:" line, no byte)
++        assert_eq!(w.pending, None);
++        assert_eq!(block_bytes(&m), before);
++        assert!(Helpers::default().new_game_bytes().is_empty());
++        // the randomizer's hooks off again (and no row): the original word goes back
++        assert!(!w.jumped(2));
++        assert_eq!(w.word_step(&mut m, trap_wanted(false, false), false).write, Some(ORIGINAL_WORD));
++    }
++
++    #[test]
++    fn rows_and_randomizer_share_one_check() {
++        let mut m = title();
++        let ok = |rows, hooks| {
++            let mut m = title();
++            let o = svc_outcome(&mut m, rows, hooks, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK);
++            assert!(m.writes.is_empty());
++            o
++        };
++        assert_eq!(ok(true, false), SvcOutcome { pending: Some(Pending { block: BLOCK }), seen: false, refused: None },
++                   "rows only: exactly round 81's pending, nothing heard");
++        assert_eq!(ok(true, true), SvcOutcome { pending: Some(Pending { block: BLOCK }), seen: true, refused: None });
++        assert_eq!(ok(false, true), SvcOutcome { pending: None, seen: true, refused: None });
++        // a refusal: nothing pending and nothing heard, whoever listens
++        army(&mut m);
++        for (rows, hooks) in [(true, false), (false, true), (true, true)] {
++            let o = svc_outcome(&mut m, rows, hooks, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK);
++            assert_eq!(o, SvcOutcome { pending: None, seen: false, refused: Some(Refusal::ArmyPresent) });
++        }
++        let o = svc_outcome(&mut title(), false, true, false, START_FROM_BEGINNING, CALL_RETURN + 4, BLOCK);
++        assert_eq!(o.refused, Some(Refusal::WrongCaller), "a load never reaches the step: the lr check");
++        assert!(!o.seen);
++        assert!(m.writes.is_empty());
++    }
++
++    #[test]
++    fn a_trap_that_cannot_be_laid_is_said_once_to_each_listener() {
++        // a stranger word with only the randomizer listening: the randomizer's line once, never
++        // the rows' line
++        let mut w = Writer::default();
++        let mut m = title();
++        m.set_word(START_FROM_BEGINNING, 0xE1A0_0000);
++        let s = w.word_step(&mut m, trap_wanted(false, true), false);
++        assert!(s.stranger);
++        assert_eq!(s.write, None);
++        assert_eq!(w.cannot_lay(false, true), CannotLay { rows: false, rando: true });
++        assert_eq!(w.cannot_lay(false, true), CannotLay::default(), "once");
++        // a row set later: round 81's line once too, the randomizer's not again
++        assert_eq!(w.cannot_lay(true, true), CannotLay { rows: true, rando: false });
++        assert_eq!(w.cannot_lay(true, true), CannotLay::default());
++        assert!(m.writes.is_empty());
++        // recompiled code that cannot check itself, both listening at once: each line once
++        let mut w = Writer::default();
++        assert_eq!(w.cannot_lay(true, true), CannotLay { rows: true, rando: true });
++        assert_eq!(w.cannot_lay(true, true), CannotLay::default());
++        // rows only (the randomizer's hooks off): exactly round 81's single line
++        let mut w = Writer::default();
++        assert_eq!(w.cannot_lay(true, false), CannotLay { rows: true, rando: false });
++        assert_eq!(w.cannot_lay(true, false), CannotLay::default());
++    }
++
+     #[test]
+     fn a_load_never_writes() {
+         // a load fills the army (and the block from the save) without StartFromBeginning: no svc,
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 14838c7..39722c6 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -102,6 +102,25 @@ pub struct Session {
+     /// round 74: the names-in-dialogue trap (the full swap's names and quiet voices;
+     /// `fates_rando_names`): the active run's full.txt and the word in Mess::Get
+     pub names: crate::fates_rando_names::Names,
++    /// round 81b D2: the New Game step heard at the StartFromBeginning trap
++    /// (`fates_options::on_svc`), for the end of the frame it was heard in only
++    heard: Option<Heard>,
++    /// round 81b D3: frames since the last mode pick (a second one within SAME_PICK frames is
++    /// the same New Game)
++    since_pick: Option<u32>,
++    /// round 81b D4: "This New Game did not use your seed." said already
++    said_not_your_seed: bool,
++}
++
++/// round 81b D2: the New Game step heard at the trap in one frame.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct Heard {
++    /// the frame number `after_frame` has at that frame's end (`System::frames` + 1 at the svc)
++    frame: u64,
++    /// the checks held: this is the New Game step
++    seen: bool,
++    /// the checks refused
++    refused: bool,
+ }
+ 
+ /// round 61: the run a PLAY RANDOMIZED profile with Nuzlocke on keeps in its own data folder
+@@ -111,10 +130,42 @@ pub const PROFILE_NUZLOCKE: &str = "profile-nuzlocke";
+ /// a mode-word change at most this many frames after a save slot was read is a load.
+ const LOAD_WINDOW: u32 = 2;
+ 
+-fn is_fates(system: &System) -> bool {
++/// round 81b D3: a pick at most this many frames after a pick is the same New Game (the svc
++/// and the mode word's change can fall either side of a frame's end).
++const SAME_PICK: u32 = 2;
++
++/// round 81b D4, Grok's words (docs/collab/ROUND81B_CLASSIC_GROK.md): the New Game step was
++/// heard but refused, and no pick was taken in that frame.
++pub const NOT_YOUR_SEED: &str = "This New Game did not use your seed.";
++/// round 81b D4: the trap cannot be laid, so a New Game on Classic cannot be heard.
++pub const CLASSIC_CANNOT: &str = "Classic New Games cannot start the randomizer in this setup; pick Casual or Phoenix.";
++
++/// the randomizer's hooks are on for this system (`hooks_on`); round 81b: also asked by
++/// `fates_options`, which lays the New Game trap for the randomizer while this holds.
++pub fn is_fates(system: &System) -> bool {
+     hooks_on(system.title.as_ref().map(|t| t.program_id()), system.config.fates_rando)
+ }
+ 
++/// round 81b D1: the randomizer listens for the New Game step (`fates_options` lays the trap
++/// for it, `heard_step` records it) only for Fire Emblem Fates itself (`step_game`). The port's
++/// frontend keeps the hooks on for Seal of Flames too (F-047), but Seal at the defaults stays as
++/// in round 81: no trap, no step heard, no warning (docs/ROUND81B_PLAN.md D1, P7).
++pub fn hears_step(system: &System) -> bool {
++    listens(system.title.as_ref().map(|t| t.program_id()), system.config.fates_rando,
++            system.config.fates_rando_game.as_deref())
++}
++
++/// `hears_step` from its parts: the hooks on (`hooks_on`) and the game Fates itself (`step_game`).
++pub fn listens(program_id: Option<u64>, fates_rando: bool, game: Option<&str>) -> bool {
++    hooks_on(program_id, fates_rando) && step_game(game)
++}
++
++/// round 81b D1: the games whose randomizer hears the New Game step: Fates (`None`, the
++/// default, or "fates"); not a mod sharing the title id ("seal").
++pub fn step_game(game: Option<&str>) -> bool {
++    matches!(game, None | Some("fates"))
++}
++
+ /// the randomizer's hooks run for Fire Emblem Fates only, and only while the frontend
+ /// lets them (`Config::fates_rando`, off for a mod that shares the title id, such as
+ /// Seal of Flames by Laz14): off, every hook returns at once, so no mode-pick watch, no
+@@ -184,17 +235,77 @@ pub enum Pick {
+ }
+ 
+ impl Session {
+-    /// after a frame: the mode pick, and what answers it.
++    /// after a frame: the mode pick, and what answers it (no New Game step heard at the trap).
+     pub fn frame(&mut self, g: &mut dyn Guest) -> Pick {
++        self.frame_heard(g, false, false)
++    }
++
++    /// round 81b D2: the trap's svc heard the New Game step (`seen`: the checks held;
++    /// `refused`: they did not) in the frame whose end `after_frame` will have frame number
++    /// `frame`. Two svcs in one frame add up.
++    pub fn hear(&mut self, frame: u64, seen: bool, refused: bool) {
++        match self.heard.as_mut().filter(|h| h.frame == frame) {
++            Some(h) => {
++                h.seen |= seen;
++                h.refused |= refused;
++            }
++            None => self.heard = Some(Heard { frame, seen, refused }),
++        }
++    }
++
++    /// round 81b D2: (seen, refused) heard in the frame that ends now (frame number `frame`);
++    /// the flag is cleared here, and one left from another frame (a frame jump: a state
++    /// loaded, or a frame whose end never ran) is dropped.
++    pub fn take_heard(&mut self, frame: u64) -> (bool, bool) {
++        match self.heard.take() {
++            Some(h) if h.frame == frame => (h.seen, h.refused),
++            Some(h) => {
++                log::info!("fates_rando: the New Game step heard for frame {} dropped at frame {frame} (not this frame)",
++                           h.frame);
++                (false, false)
++            }
++            None => (false, false),
++        }
++    }
++
++    /// round 81b D3: after a frame, the mode pick: `NewGameWatch` fired (the mode word changed:
++    /// Casual, Phoenix) **or** the trap heard the New Game step in this frame (`seen`; also
++    /// Classic, where the word does not change). At most one pick per frame, and a pick within
++    /// SAME_PICK frames after a pick is the same New Game. The save-read load window stays: no
++    /// pick then. D4: the step heard (or refused at the trap) with no pick taken = the
++    /// player is told once that this New Game did not use the seed.
++    pub fn frame_heard(&mut self, g: &mut dyn Guest, seen: bool, refused: bool) -> Pick {
+         let loaded = self.since_slot_read.is_some_and(|n| n <= LOAD_WINDOW);
+         self.since_slot_read = self.since_slot_read.map(|n| n.saturating_add(1));
+-        if !self.watch.after_frame(g) {
++        let recent = self.since_pick.filter(|&n| n < SAME_PICK);
++        self.since_pick = self.since_pick.map(|n| n.saturating_add(1));
++        let watched = self.watch.after_frame(g);
++        if !watched && !seen {
++            if refused {
++                self.not_your_seed();
++            }
++            return Pick::None;
++        }
++        if let Some(n) = recent {
++            log::info!("fates_rando: a New Game {} {} frame(s) after the mode pick: the same New Game, not a second pick",
++                       if watched { "mode word change" } else { "step heard" }, n + 1);
+             return Pick::None;
+         }
+         if loaded {
+-            log::info!("fates_rando: the mode word changed in the frame a save was read: a load, not a new game");
++            if watched {
++                log::info!("fates_rando: the mode word changed in the frame a save was read: a load, not a new game");
++            }
++            if seen {
++                log::info!("fates_rando: the New Game step was heard within {LOAD_WINDOW} frames of a save read: \
++                            not taken");
++                self.not_your_seed();
++            }
+             return Pick::None;
+         }
++        if seen && !watched {
++            log::info!("fates_rando: the New Game step was heard at the trap; the mode word did not change (Classic)");
++        }
++        self.since_pick = Some(0);
+         // round 61: a new game is picked: the Nuzlocke game of the game before ends here (its
+         // Classic lock must not touch the new game while the page is open); a Nuzlocke run
+         // answered for the new game starts its own (`answer`)
+@@ -264,6 +375,13 @@ impl Session {
+         self.notices.push(text);
+     }
+ 
++    /// round 81b D4: "This New Game did not use your seed.", once per program run.
++    fn not_your_seed(&mut self) {
++        if !std::mem::replace(&mut self.said_not_your_seed, true) {
++            self.note(NOT_YOUR_SEED.to_string());
++        }
++    }
++
+     /// lays a run already made (`<data>/rando/<title>/runs/<id>/patch.txt`): any other run
+     /// put back first, then every GameData cell checked and written (or nothing).
+     pub fn lay(&mut self, g: &mut dyn Guest, data: &Path, id: &str) -> Result<(), String> {
+@@ -436,6 +554,10 @@ impl Session {
+         self.placements.clear();
+         self.waits.clear();
+         self.run = None;
++        // round 81b: a step heard before the state never counts after it
++        self.heard = None;
++        // nor does a pick taken before it swallow a New Game after it (SAME_PICK)
++        self.since_pick = None;
+         // engine round E2: a state of the same run keeps the Nuzlocke game going (its graveyard
+         // is applied from the next frame, so a state never undoes a death); a state file's
+         // sidecar may name another game after this (read_state_sidecar)
+@@ -492,9 +614,28 @@ pub fn after_frame(system: &mut System) {
+     }
+ }
+ 
++/// round 81b D2: `fates_options::on_svc` heard the New Game step (the checks held: `seen`, or
++/// refused) at the StartFromBeginning trap, for the end of this frame only.
++pub fn heard_step(system: &mut System, seen: bool, refused: bool) {
++    if !hears_step(system) {
++        return;
++    }
++    // the svc runs inside the frame; its end (after `end_frame`) has the next frame number
++    let frame = system.frames.wrapping_add(1);
++    system.rando.hear(frame, seen, refused);
++}
++
++/// round 81b D4: the New Game trap cannot be laid (`why`), so a New Game on Classic cannot be
++/// heard: said once on screen and in the log (`fates_options` says it only once).
++pub fn classic_cannot_be_heard(system: &mut System, why: &str) {
++    log::warn!("fates_rando: the New Game trap cannot be laid: {why}");
++    notice(system, CLASSIC_CANNOT.to_string());
++}
++
+ fn after_frame_inner(system: &mut System) {
+     prebuild(system);
+-    match system.rando.frame(&mut system.memory) {
++    let (seen, refused) = system.rando.take_heard(system.frames);
++    match system.rando.frame_heard(&mut system.memory, seen, refused) {
+         Pick::None | Pick::Page => {}
+         Pick::Answer(a) => {
+             let picked = Instant::now();
+@@ -1326,6 +1467,33 @@ mod tests {
+         assert!(crate::Config::default().fates_rando);
+     }
+ 
++    #[test]
++    fn only_fates_itself_hears_the_new_game_step() {
++        // round 81b D1: Fates (the default None, or "fates") hears; Seal of Flames does not
++        assert!(step_game(None));
++        assert!(step_game(Some("fates")));
++        assert!(!step_game(Some("seal")));
++        assert!(!step_game(Some("anything else")));
++        assert!(listens(Some(TITLE), true, None), "Fates with the hooks on: listens");
++        assert!(!listens(Some(TITLE), true, Some("seal")), "Seal (hooks on, F-047): does not");
++        assert!(!listens(Some(TITLE), false, None), "hooks off: does not");
++        assert!(!listens(None, true, None));
++        // a Seal system records nothing at the svc
++        let mut system = System::new(crate::Config { fates_rando_game: Some("seal".into()), ..crate::Config::default() });
++        assert!(!hears_step(&system));
++        heard_step(&mut system, true, false);
++        assert_eq!(system.rando.take_heard(system.frames + 1), (false, false));
++        // a state loaded right after a pick: a New Game after it is a pick of its own
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        assert!(picks(&s.frame_heard(&mut m, true, false)));
++        let data = top("samepickstate");
++        s.restore(&mut m, &data, None);
++        assert!(picks(&s.frame_heard(&mut m, true, false)), "not swallowed as the same pick");
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
+     #[test]
+     fn with_the_randomizer_off_the_hooks_leave_the_system_alone() {
+         let mut system = System::new(crate::Config { fates_rando: false, ..crate::Config::default() });
+@@ -1650,6 +1818,182 @@ end 0
+         let _ = std::fs::remove_dir_all(&data);
+     }
+ 
++    // ----------------------------------------------------------------- round 81b: the step heard
++
++    fn set_mode_word(m: &mut Fake, w: u32) {
++        m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&w.to_le_bytes());
++    }
++
++    fn picks(p: &Pick) -> bool {
++        matches!(p, Pick::Answer(_) | Pick::Page)
++    }
++
++    #[test]
++    fn a_classic_new_game_is_heard_at_the_trap_once() {
++        let answer = r#"{"randomizer": true, "seed": "r81b"}"#;
++        let mut m = game();
++        let mut s = Session::default();
++        assert_eq!(s.frame(&mut m), Pick::None);
++        queue_answer_session(&mut s, answer);
++        assert_eq!(s.frame(&mut m), Pick::None);
++        // Normal + Classic: word +0x4 stays 0x00011E5E; the watch alone misses it (the bug)
++        let mut alone = Session::default();
++        alone.frame(&mut m);
++        assert_eq!(alone.frame_heard(&mut m, false, false), Pick::None, "round 81: no pick on Classic");
++        // the trap heard the step in this frame: exactly one pick, with the queued answer
++        assert_eq!(s.frame_heard(&mut m, true, false), Pick::Answer(Some(answer.to_string())));
++        for _ in 0..10 {
++            assert_eq!(s.frame(&mut m), Pick::None, "never a second pick");
++        }
++        assert_eq!(m.writes, 0, "the pick itself reads only");
++        assert!(s.notices.is_empty(), "no warning on a good pick");
++        // interactive: the page opens once
++        let mut s = Session { interactive: true, ..Session::default() };
++        s.frame(&mut m);
++        assert_eq!(s.frame_heard(&mut m, true, false), Pick::Page);
++        assert!(std::mem::take(&mut s.pending));
++        assert_eq!(s.frame(&mut m), Pick::None);
++        assert!(!s.pending);
++    }
++
++    #[test]
++    fn a_casual_new_game_heard_and_watched_in_one_frame_is_one_pick() {
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        queue_answer_session(&mut s, r#"{"randomizer": false}"#);
++        s.frame(&mut m);
++        // Normal + Casual: the svc hears the step and the word changes in the same frame
++        set_mode_word(&mut m, 0x4001_5EDE);
++        let p = s.frame_heard(&mut m, true, false);
++        assert_eq!(p, Pick::Answer(Some(r#"{"randomizer": false}"#.to_string())));
++        let later: Vec<Pick> = (0..10).map(|_| s.frame(&mut m)).collect();
++        assert!(later.iter().all(|p| *p == Pick::None), "one pick, not two: {later:?}");
++        assert!(s.notices.is_empty());
++    }
++
++    #[test]
++    fn a_watch_after_a_heard_pick_is_the_same_new_game() {
++        for d in 1..=3u32 {
++            let mut m = game();
++            let mut s = Session::default();
++            s.frame(&mut m);
++            queue_answer_session(&mut s, r#"{"randomizer": false}"#);
++            // the svc falls just before a frame's end, the word's change just after it
++            assert!(picks(&s.frame_heard(&mut m, true, false)));
++            for _ in 1..d {
++                assert_eq!(s.frame(&mut m), Pick::None);
++            }
++            set_mode_word(&mut m, 0x4001_5EDE);
++            let p = s.frame(&mut m);
++            if d <= SAME_PICK {
++                assert_eq!(p, Pick::None, "a watch {d} frame(s) after the heard pick is the same New Game");
++            } else {
++                assert!(picks(&p), "the window is {SAME_PICK} frames, not more");
++            }
++        }
++        // the same for a step heard 1-2 frames after a watched pick
++        for d in 1..=2u32 {
++            let mut m = game();
++            let mut s = Session::default();
++            s.frame(&mut m);
++            set_mode_word(&mut m, 0x4001_5EDE);
++            assert!(picks(&s.frame(&mut m)));
++            for _ in 1..d {
++                s.frame(&mut m);
++            }
++            assert_eq!(s.frame_heard(&mut m, true, false), Pick::None);
++            assert!(s.notices.is_empty(), "the same New Game: no warning");
++        }
++    }
++
++    #[test]
++    fn a_load_is_no_pick_and_is_never_heard() {
++        let data = top("heardload");
++        made(&data, "rA", 9);
++        fates_rando::slot_written(&data, "/Chapter0", Some("rA")).unwrap();
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        // a load: the save read and the word changes; no svc (a load never calls the step)
++        s.save_read(&mut m, &data, "/Chapter0", true);
++        set_mode_word(&mut m, 0x4001_5EDE);
++        queue_answer_session(&mut s, r#"{"randomizer": false}"#);
++        assert_eq!(s.frame_heard(&mut m, false, false), Pick::None);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")), "the save's run stays");
++        assert!(s.notices.is_empty(), "a load says nothing");
++        // the load window stays even for a heard step (only by a fault: a load cannot reach it);
++        // nothing is taken and the player is told
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        s.save_read(&mut m, &data, "/Chapter0", true);
++        assert_eq!(s.frame_heard(&mut m, true, false), Pick::None);
++        assert_eq!(s.notices, vec![NOT_YOUR_SEED.to_string()]);
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn the_heard_flag_lives_for_its_own_frame_only() {
++        let mut s = Session::default();
++        assert_eq!(s.take_heard(10), (false, false));
++        s.hear(10, true, false);
++        assert_eq!(s.take_heard(10), (true, false));
++        assert_eq!(s.take_heard(10), (false, false), "cleared at the frame's end");
++        assert_eq!(s.take_heard(11), (false, false));
++        // a frame jump: heard for frame 10, taken at another frame number
++        s.hear(10, true, false);
++        assert_eq!(s.take_heard(5000), (false, false), "dropped after a jump");
++        assert_eq!(s.take_heard(10), (false, false), "and gone");
++        // two svcs in one frame add up; a later frame replaces an untaken one
++        s.hear(7, true, false);
++        s.hear(7, false, true);
++        assert_eq!(s.take_heard(7), (true, true));
++        s.hear(7, true, false);
++        s.hear(8, false, true);
++        assert_eq!(s.take_heard(8), (false, true));
++        // a save state loaded: the flag is gone
++        let data = top("heardstate");
++        let mut m = game();
++        s.hear(9, true, false);
++        s.restore(&mut m, &data, None);
++        assert_eq!(s.take_heard(9), (false, false));
++        // with the randomizer's hooks off (no Fates title here) the svc records nothing
++        let mut system = System::new(crate::Config::default());
++        heard_step(&mut system, true, false);
++        assert_eq!(system.rando.take_heard(system.frames + 1), (false, false));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn a_refusal_is_said_once_and_takes_no_pick() {
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        queue_answer_session(&mut s, r#"{"randomizer": true, "seed": "x"}"#);
++        assert_eq!(s.frame_heard(&mut m, false, true), Pick::None, "refused at the trap: no pick");
++        assert_eq!(s.notices, vec![NOT_YOUR_SEED.to_string()]);
++        for _ in 0..5 {
++            s.frame(&mut m);
++        }
++        assert_eq!(s.frame_heard(&mut m, false, true), Pick::None);
++        assert_eq!(s.notices.len(), 1, "said once");
++        assert!(s.queued.is_some(), "the answer is kept for a real pick");
++        // a refusal in a frame whose pick was still taken (the word changed): no warning
++        let mut m = game();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        set_mode_word(&mut m, 0x4001_5EDE);
++        assert!(picks(&s.frame_heard(&mut m, false, true)));
++        assert!(s.notices.is_empty());
++        // the second warning's words (said once by fates_options::Writer::cannot_lay)
++        let mut system = System::new(crate::Config::default());
++        classic_cannot_be_heard(&mut system, "a stranger word");
++        assert_eq!(system.rando.notices, vec![CLASSIC_CANNOT.to_string()]);
++        assert_eq!(NOT_YOUR_SEED, "This New Game did not use your seed.");
++        assert_eq!(CLASSIC_CANNOT, "Classic New Games cannot start the randomizer in this setup; pick Casual or Phoenix.");
++    }
++
+     #[test]
+     fn the_camera_angle_is_not_the_title() {
+         // round 62: GameConfigData +0xB is the map camera angle option (0, 1 or 2)
+diff --git a/crates/zakuro-core/src/kernel/svc.rs b/crates/zakuro-core/src/kernel/svc.rs
+index 39274ed..389bfd6 100644
+--- a/crates/zakuro-core/src/kernel/svc.rs
++++ b/crates/zakuro-core/src/kernel/svc.rs
+@@ -110,7 +110,8 @@ pub fn dispatch(system: &mut System, number: u32) {
+         // full swap's full.txt is active, else that word is the original's)
+         crate::fates_rando_names::SVC_NUMBER if crate::fates_rando_names::on_svc(system) => {}
+         // round 81: the New Game defaults trap's svc in GameConfigData::StartFromBeginning (only
+-        // while a New Game row is set, else that word is the original's)
++        // while a New Game row is set or, round 81b, the randomizer's hooks are on, else that
++        // word is the original's)
+         crate::fates_options::SVC_NUMBER if crate::fates_options::on_svc(system) => {}
+         _ => {
+             log::warn!(

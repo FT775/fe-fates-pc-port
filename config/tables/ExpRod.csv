@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,40,s8[40],by_level,high,"Unit::GetExpRod 005342F4 adds GetRodDecline(difficulty)[level-1] (s8, index clamped 0..39) to the staff's Item.staff_exp"

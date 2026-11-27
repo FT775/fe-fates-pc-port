@@ -1,0 +1,7 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,2,s8[2],rank_s,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit
+0x02,2,s8[2],rank_a,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit
+0x04,2,s8[2],rank_b,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit
+0x06,2,s8[2],rank_c,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit
+0x08,2,s8[2],rank_d,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit
+0x0A,2,s8[2],rank_e,high,Unit::GetAttack 005342B8 reads WeaponBonus::Get(kind)+rank*2 (s8; rank from WeaponLevel::GetLevel) and Unit::GetHit 00532DC4 reads +rank*2+1; Unit::GetRodHealPower reads the staff row (kind 6) +rank*2,attack|hit

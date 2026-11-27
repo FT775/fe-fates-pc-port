@@ -1,0 +1,15 @@
+offset,size,type,name,confidence,evidence
+0x00,4,str:self,seid,high,record label = this string; EquipSkill::Get(const char*)
+0x04,4,str,mseid_name,high,EquipSkill::GetName 00505FD0 reads +0x4 (MSEID_ message)
+0x08,4,str,mseid_help,high,EquipSkill::GetHelp 00505F08 reads +0x8 (MSEID_H_ message)
+0x0C,4,str,effect,medium,map::SequenceHelper::..::CheerImpl reads +0xC; data: effect names on 71 skills; Paragon 'effect' (fact)
+0x10,2,u16,skill_number,high,read by 79 functions (AIBattleSimulator SkillIndexProvider...); equals the record index (EquipSkill::Get(short))
+0x12,2,s16,sort_order,low,data: -1 on 69 skills else unique; Paragon 'sort_order' (fact)
+0x14,2,u16,icon,high,EquipSkill::GetIcon 00505F80 reads +0x14
+0x16,1,u8,trigger_stat,high,Unit::GetEquipSkillProbability 005324B8 reads +0x16 (stat the activation rate uses; 3 = skl; 5 = lck)
+0x17,1,u8,trigger_factor,high,Unit::GetEquipSkillProbability reads +0x17 (multiplier)
+0x18,1,u8,trigger_divisor,high,Unit::GetEquipSkillProbability reads +0x18 (divisor)
+0x19,1,u8,kind,medium,EquipSkill::IsUnknown 00506034 compares +0x19 with 5 (then looks up the MSEID_ name); GetName/GetHelp/GetIcon and Unit::InheritEquipSkill also branch on it; values 0/1/3/4
+0x1A,2,u16,price,high,Unit::GetLearnFromDictionaryPrice 005329E0 and IsLearnFromDictionary read +0x1A
+0x1C,1,u8,flags_2,medium,Unit::CreateImpl 003D3954 skips a Person skill whose +0x1C has bit 1 (2) when Person.unit_kind == 0 and bit 0 (1) when unit_kind == 1; DeleteEquipSkillUnknownAndEnemyOnlyWithPool / SetDispos read it too
+0x1D,3,pad,pad_1d,high,zero in every record

@@ -1,0 +1,392 @@
+Fire Emblem Fates (Special Edition, USA) - PC port
+==================================================
+
+What this is
+------------
+The source of a PC port of Fire Emblem Fates: tools, patches, tests and
+guides. There is no game and no program in this download. You bring
+your own decrypted copy of Fire Emblem Fates Special Edition (USA), a
+.cci file, and the game program is made on your own PC from it.
+
+You also need Windows 11, Python 3.13 and Git for Windows. Then pick
+one of two roads. Neither has been tried on a clean PC yet.
+
+  Road A, no build: install fearkov's Zakuro and press Recompile on
+    the game once (see "The one-time Recompile" below). PLAY then
+    starts the plain game: ROM check and save backups, but no
+    Randomizer page, Nuzlocke, growth view, True hit or New Game
+    defaults, and no built-in 60 fps / 16:9.
+  Road B, build it: build the program yourself (docs\BUILD.md lists
+    every tool and command). You get everything on this page.
+    First build: 30-60 minutes plus 30-60 minutes to install the
+    tools (both estimates).
+
+The parts below marked "built program only" need Road B.
+
+
+Start here
+----------
+Double-click PLAY.bat in this folder.
+
+It checks a few things, then starts the game straight away (no library
+screen): in the standalone program play\game\Fire Emblem Fates.exe (if
+you built it; see below), else in Zakuro:
+
+  1. Zakuro is where play\config.json says (only needed when the
+     standalone program is not built; empty at first).
+  2. The ROM is your own clean dump of Fire Emblem Fates Special Edition
+     (USA), a .cci file, in the roms folder here (roms\README.txt). Its
+     title and its fingerprint (SHA-256) are checked. An update file (.cia)
+     or another edition there stops PLAY with one plain sentence. (For one
+     release the old place, this main folder, still works, with a note
+     asking you to move it to roms.)
+     The first PLAY reads the whole 2 GiB file once
+     (a few seconds); after that the result is remembered until the file
+     changes.
+  3. No game update (.cia) lies next to the ROM. An update changes the
+     game's code, and everything here is made for the clean game. DLC is
+     fine.
+  4. The game has been recompiled once in Zakuro, so it runs at full
+     speed (not needed for the standalone program).
+
+If something is wrong, the window stays open and says what to do.
+
+The first PLAY writes play\config.json. It holds no path from your PC:
+"rom" empty means the .cci in roms. Open it in Notepad to point it at a
+Zakuro folder or another copy of the ROM.
+
+Want a Desktop icon? Run tools\play\Make Desktop Shortcut.bat once. It puts
+"PLAY Fire Emblem Fates" on your Desktop. Nothing is made until you run it.
+(The shortcut opens PLAY.bat, so it picks the standalone program below by
+itself once that is built.)
+
+
+First start: the Getting ready window
+-------------------------------------
+Double-click PLAY.bat. If everything is already in place, the game
+starts and no extra window appears. If something is missing, the window
+shows "Getting ready" and a short list, then asks only about what is
+missing. Type the key shown, then press Enter.
+
+  - Your copy of the game (the .cci file). This port does not include
+    it. Put it in the roms folder, or let the window find it:
+      1  look in the usual folders (roms, Downloads, Desktop and
+         Documents; up to 3 folders deep, at most 30 seconds; it reads
+         only file names and sizes; a file kept in OneDrive may be
+         skipped: then use 2 or 3)
+      2  choose the file in the Windows file window
+      3  type the path, or drag the file onto the window, then Enter
+    The file is checked once (about 10 seconds). A wrong file gets one
+    sentence saying why, and nothing is saved.
+  - The game program. Either build it once (see "The standalone
+    program" below), or press Z and point to a Zakuro folder that has
+    already recompiled the game. The window never starts a build; Y only
+    checks what a build needs.
+  - The Randomizer (optional). R prepares it once: it reads your game
+    file and writes about 1.8 GB into the extracted folder here.
+  Then: "Ready. Press Enter to play." (Q quits and starts nothing.)
+
+Nothing is copied or moved: the window only remembers where your files
+are, in play\launcher.json (delete that file to be asked again; it never
+changes play\config.json). To see the window again, for example after
+moving the game file, run PLAY.bat --setup.
+
+In a freshly unzipped folder, the standalone program keeps its settings
+and saves inside this folder (play\appdata), so deleting the folder
+removes everything. If you already have a Fates save from Zakuro on this
+PC, PLAY says so once and copies nothing (PLAY.bat --migrate-saves
+to-portable, then PLAY.bat --portable on, brings it here). A folder that
+PLAY has used before keeps its save where it was.
+
+
+The standalone program: Fire Emblem Fates.exe (Road B)
+------------------------------------------------------
+The game is one program of its own, made on your PC from your ROM:
+
+  play\game\Fire Emblem Fates.exe
+
+It is Zakuro with the game's code built in: the window says "Fire Emblem
+Fates", it opens straight into the game, and it needs no Recompile. The
+save, mods, cheats, settings and save states are the same ones Zakuro uses,
+so nothing has to be moved. Esc opens the menu, as in Zakuro.
+
+Making it compiles a lot of code, so it is only done when you say so.
+It needs Rust, the Visual Studio C++ Build Tools, a C compiler (Zig or
+LLVM clang) and an archiver; docs\BUILD.md says where to get each one.
+Then, in a command window in this folder:
+
+  python tools\engine\engine.py fetch
+  python tools\engine\engine.py apply
+  python tools\engine\engine.py port
+
+(30-60 minutes the first time, an estimate; about 5 GB in build\port,
+counted on the project's own PC). "python tools\engine\engine.py port
+--dry-run" only checks that everything it needs is there. PLAY checks
+that the program is the one its build record describes, and stops if it
+is not (PLAY.bat --anyway starts it once anyway).
+
+PLAY.bat starts the standalone program when it is there (still checking
+the ROM and backing up the save first), else Zakuro. The first time it
+starts, it picks 60 fps battles, the 16:9 top screen and 3x size (an
+existing settings file is never changed). To always use Zakuro,
+set "standalone": false in play\config.json.
+
+The program holds the game's code: it is for you only, never share it.
+Delete play\game to go back to Zakuro alone. 3dsrecomp, which the build
+fetches, has no licence file: it is fetched unmodified for your own
+build and is not included here.
+
+
+The Randomizer, Nuzlocke and the growth view (built program only)
+-----------------------------------------------------------------
+These are part of the program you build (Road B). Stock Zakuro (Road A)
+does not have them.
+
+Start a New Game as usual and pick the difficulty. Right after you pick
+Casual or Classic (or Phoenix), a Randomizer page opens over the game.
+Randomizer is off at first: Start game then plays the original game,
+unchanged. Turn it on, type a seed (or keep the one offered) and pick
+what to change: the rows stand under seven headings (Basics, Characters,
+Classes, Growths and stats, Items and shops, Enemies and bosses, Extras),
+and the line at the bottom says what the row under the pointer does.
+"Randomize everything" turns on the safe rows at once. The same seed
+with the same rows always gives the same game, so you can share it.
+
+  - Character shuffle ("keep the face"): someone else plays in each join
+    spot, with that person's class, stats, growths and skills, under the
+    old face and name.
+  - Classes, growths, join stats, skills, children, promotions, starting
+    items, shops, castle rewards, weapons, enemies and bosses, music.
+  - Nuzlocke: a unit that falls stays fallen, even after a reset or a
+    reload; Classic is locked.
+  - How they look: "Keep the face" (the default) or "Full swap": the
+    new person's face, name and head on the battle model show in that
+    spot, including inside story scenes. Story movies and the Private
+    Quarters keep the old person. Corrin, Azura, Gunter, the royals
+    and the children never move, and swaps stay within the same sex.
+  - Spoiler log: off means the readable list of changes (spoiler.txt)
+    is not kept beside the run.
+
+Presets and share code: the Light button changes classes and growths;
+Wild adds enemy classes and weapons, map music and who joins where. A
+preset keeps your seed. The Share code line (Copy and Paste buttons)
+holds the seed and every setting in one line: give it to a friend and
+the same code makes the same game.
+
+Seed guarantees: whatever the seed, someone who can open doors, a healer
+and (where a map needs one) a flier join in time for the maps that need
+them. A healer joins holding a staff. Rarely, a seed still fails the
+randomizer's own safety check (with everything on, too): the page then
+says so. Press Back and pick another seed.
+
+The seed and rows are kept beside each save, so loading that save brings
+the same randomized game back. Esc > Randomizer shows what the current
+game was started with. The page needs Python on the PC; without it the
+page says so and the game plays the original.
+
+Growth view (randomizer on or off): on the map's bottom-screen unit
+panel, press Select (Backspace), Tab or the controller's Back, or touch
+the Growths button, to see each stat's growth chance; press again to go
+back. While that panel is up, Tab switches the view instead of fast
+forward. In Preparations (Pick Units), point at a unit and press Y
+(keyboard A) for a small Growths box; press Y again to hide it.
+
+Before the first randomized game, the Randomizer must read the game's
+files once: PLAY.bat --setup, then R in the Getting ready window (about
+1.8 GB into the extracted folder).
+
+PLAY RANDOMIZED.bat is the older way to play a randomized game: each seed
+gets its own folder (play\randomizer\<seed>) with its own saves. It
+was never tried on a stock Zakuro.
+
+
+Helpers in the Esc menu: True hit and New Game defaults (built program
+only)
+----------------------------------------------------------------------
+Press Esc in the game and look under the Helpers heading.
+
+  - True hit (Off at first). On, the battle forecast also shows the
+    real chance to hit, for example "70 (real 79)". Fates rolls hit
+    chances in a way that makes shown numbers above 50 likelier than
+    they look; the label shows only for a shown 51 to 99. It only
+    paints the screen and never changes a roll.
+  - Faster enemy turns: a help line pointing at the game's own enemy
+    turn skip (Options, and Start during the enemy turn).
+  - New Game defaults: four rows (Battle animations, Map speed, Enemy
+    turn skip, HP bars), each "Game's choice" at first. Your choices
+    go into the game's own Options once, when you start a New Game.
+    A game already going and your old saves are never changed.
+
+
+The one-time Recompile (Zakuro)
+-------------------------------
+Zakuro (github.com/fearkov/zakuro) turns the game's code into PC code
+ahead of time, once per game. This is Road A, and the standalone program
+does not need it. The project uses Zakuro v0.2.32; a newer Zakuro may
+work but was never tried here.
+
+  1. Open Zakuro and add your .cci to its library.
+  2. Press Recompile next to Fire Emblem Fates in the library.
+  3. When it is done, close Zakuro. Run PLAY.bat and, in the Getting
+     ready window, press Z and point it to the Zakuro folder. Use PLAY
+     from then on.
+
+The result is %APPDATA%\3dsrecomp\0004000000179800.dll. PLAY looks for it
+and tells you if it is missing.
+
+
+Where your save is
+------------------
+Zakuro keeps the save here (the same save its library uses):
+
+  %APPDATA%\zakuro\user\savedata\0004000000179800\          (the save files)
+  %APPDATA%\zakuro\user\savedata\0004000000179800.format    (keep with it)
+  %APPDATA%\zakuro\user\extdata\0000000000001794\           (extra data)
+
+Paste %APPDATA%\zakuro into Explorer's address bar to get there.
+(In a freshly unzipped folder the standalone program uses
+play\appdata\zakuro\... here instead; see "First start" above.)
+PLAY.bat --where prints every place (save, mods, settings, log, backups).
+
+
+Backing up your save
+--------------------
+- Automatic: each PLAY zips the save into play\backups\auto-....zip before
+  it starts the game, when the save changed since the last one. The newest
+  20 are kept ("keep_backups" in play\config.json).
+- By hand: PLAY.bat --backup writes play\backups\manual-....zip. Those are
+  never deleted.
+- Or copy the folders and the .format file above while Zakuro is closed.
+
+To restore: close Zakuro, open the .zip, and copy what is inside into
+%APPDATA%\zakuro\user\ (replace the files). The zip holds savedata\... and
+extdata\... in the same layout.
+
+
+Controls (Zakuro's keys; change them in Esc > Settings, "Controls")
+-------------------------------------------------------------------
+  3DS             Keyboard            Gamepad
+  A / B           X / Z               right / bottom face button
+  X / Y           S / A               top / left face button
+  L / R           Q / W               LB / RB (L1 / R1)
+  Start / Select  Enter / Backspace   Start / Back
+  D-pad           Arrow keys          D-pad
+  Circle pad      I / J / K / L       left stick
+  Touch screen    mouse click         -
+
+  Esc             Zakuro's menu over the game (settings, cheats, save states)
+  F1              pause
+  F11             full screen on and off
+  Tab (held)      fast forward (on the map's unit panel: the growth view)
+  F9 / F10        next screen layout / show the other screen alone
+  F5 / F8         save state / load state (Zakuro's, not the game's save;
+                  kept in %APPDATA%\zakuro\states\0004000000179800\)
+
+Fates uses the touch screen a lot (map, menus, My Castle): keep both
+screens shown, or use the mouse on the bottom one.
+
+
+Settings (window, layout, resolution, language)
+-----------------------------------------------
+In the game, press Esc. "Settings" changes everything; "Settings for this
+game" changes only Fates (resolution, screen layout, language, 3D ...).
+Zakuro stores both in
+
+  %APPDATA%\zakuro\settings.toml      (Fates' own part: [per_game.0004000000179800])
+
+60 fps battles and the 16:9 top screen are built into the program you
+build (Road B) as enhancements, on at the first start. The Awakening
+port's "Top-screen extras" block does not appear for Fates.
+
+Two things can also go in play\config.json: "scale" (window size, a whole
+number) and "zakuro_args" (extra Zakuro options, for example ["--mute"]).
+
+
+Where mods go
+-------------
+  %APPDATA%\zakuro\mods\0004000000179800\
+      romfs\         files that replace the game's own (edited data, text,
+                     pictures)
+      romfs_ext\     .ips / .bps patches to the game's files
+      code.ips/.bps  code changes (then press Recompile once again)
+      textures\      Citra/Azahar texture packs
+
+A mod that only changes data needs no Recompile; one that changes code
+does, and PLAY warns when a code mod is newer than the recompiled code. To
+play without mods, move that folder somewhere else.
+
+To make a mod (new names and text, stat changes in a spreadsheet,
+pictures), see docs\MODDING.md: "python tools\mods\mods.py install"
+builds it and puts it in the folder above, "uninstall" takes it out.
+
+
+Option: saves next to the game ("portable saves", off)
+------------------------------------------------------
+You can keep the save in this folder instead, in play\data. To switch,
+with Zakuro closed:
+
+  PLAY.bat --migrate-saves to-portable     copies your save to play\data
+                                          (backs it up first, never
+                                          overwrites, leaves the old one)
+  PLAY.bat --portable on                   PLAY uses play\data from now on
+
+Back: PLAY.bat --migrate-saves to-appdata (only if %APPDATA% holds no save
+for the game any more), then PLAY.bat --portable off. With portable saves
+on, mods go in play\data\mods\0004000000179800\, and starting the game
+from Zakuro's own library uses the other (%APPDATA%) save, so use PLAY.
+
+
+All PLAY options
+----------------
+  PLAY.bat                 check, back up, start the game
+  PLAY.bat --dry-run       check everything, print the command, start nothing
+  PLAY.bat --check         only the checks
+  PLAY.bat --where         where everything lives
+  PLAY.bat --backup        zip the save now
+  PLAY.bat --anyway        start even when a check says stop
+  PLAY.bat --rehash        check the ROM's fingerprint again
+  PLAY.bat --setup         open the Getting ready window again
+  PLAY.bat --help          the full list
+  PLAY.bat -- --mute       anything after -- goes to Zakuro as it is
+
+
+Two editions
+------------
+This is the main edition. Only if your folder has a docs\seal folder
+(an edition for a fan mod, see CREDITS.md): its steps are in
+docs\seal\PLAY_SEAL.md.
+
+
+What you are looking at
+-----------------------
+PLAY.bat             Starts the game. Leave it here.
+PLAY RANDOMIZED.bat  The older randomizer launcher (one folder per seed).
+                     The Randomizer page inside the game is the main way.
+RELEASE.bat          For the project owner: makes a release of the
+                     project (tests, package, local tag; never sends
+                     anything). RELEASE WITH ENGINE BUILD.bat also
+                     rebuilds and installs. You do not need either one
+                     to play. docs\RELEASE.md.
+Read Me First.txt    This note.
+README.md            The project's front page: the two roads, where
+                     things stand, every tool, the guides in docs\.
+LICENSE, CREDITS.md  The licence of the project's own work (scoped MIT)
+                     and who made what the port uses.
+roms                 Your own copy of the game (the .cci). Never shared,
+                     never in git (only the README.txt notes are).
+play                 Made by PLAY: config.json, the ROM-check note
+                     (state.json), backups, play\data with portable saves
+                     on, and play\game with the standalone program.
+                     It is yours: never shared, never in git.
+tools\play           PLAY's program (play.py) and the shortcut maker.
+tools\engine         Builds the standalone program (docs\BUILD.md).
+tools, docs ...      The project: data tools, guides.
+extracted, build,    Made from your own ROM by the project's tools, or
+engine               downloaded engine sources. Never shared.
+
+Zakuro is by fearkov (MIT licence), in its own folder; this project starts
+it, and builds the standalone program from its source with our own patches
+(patches\zakuro). 3dsrecomp, also by fearkov, has no licence file: it is
+not included, and the build fetches it unmodified at a fixed version for
+your own use. The game is by Nintendo and Intelligent Systems. No ROM, save or game file is included
+or shared; the copy you play is your own.

@@ -1,0 +1,42 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,8,flags64:ItemFlag,flags,high,Item::IsMagic 005290B8 / IsHiddenEffect 00528E90 / CanUse 00528F3C test the u64 at +0x0 with ISID_魔法武器 / ISID_暗器 / ISID_使用可能 bits,
+0x08,4,str:self,iid,high,record label = this string; Item::Get(const char*),
+0x0C,4,str,miid_name,high,Item::GetName 00529050 reads +0xC (MIID_ message),
+0x10,4,str,miid_help,high,Item::GetHelp 00528FD0 reads +0x10 (MIID_H_ message),
+0x14,2,u16,item_number,high,Item::GetName/IsDownload read +0x14; equals the record index; unit::Item::New(const Item*) stores it,
+0x16,2,u16,list_position,low,data: near-unique per item; Paragon 'item_list_position' (fact),
+0x18,2,u16,icon,low,data 0..0x1F; Paragon 'icon' (fact),
+0x1A,1,s8,weapon_kind,high,Item::IsWeapon 00529164 / IsMagic read +0x1A (s8); ItemGetKind; Unit::GetHit/GetAttack pass it to ItemSubKind::Get(int): an ItemSubKind index (check.py: < ItemSubKind count),
+0x1B,1,u8,item_subkind,low,data 0..0x12; Paragon 'non_weapon_category' (fact),
+0x1C,1,u8,weapon_rank,high,Unit::CanItemEquip 0052C634 / Unit::WeaponBuildup / handicap::..::CalculateUnitItem read +0x1C; data are weapon-exp thresholds (0x01 0x15 0x33 0x60 0xA1 0xFB = WeaponLevel ranks); Paragon 'required_weapon_exp' (fact),
+0x1D,1,u8,staff_exp,high,Unit::GetExpRod 005342F4 reads Item+0x1D (u8) as the base experience of a staff use (then adds ExpRod/ExpRodHigh/ExpSupport); Paragon 'base_staff_exp' (fact),
+0x1E,1,u8,uses,high,unit::Item::New(const Item*) 00419820 reads +0x1E as the starting durability (UnitItemSetEndurance),
+0x1F,1,u8,might,high,unit::Item::GetPower 0053B4B4 reads +0x1F,
+0x20,2,s16,hit,high,unit::Item::GetHit 0053B2A4 reads +0x20 (s16),
+0x22,2,s16,crit,high,unit::Item::GetCritical 0053AD54 reads +0x22 (s16),
+0x24,2,s16,avoid,high,Unit::GetAvoid 00533524 adds the equipped item's +0x24 (s16; through unit::Item::ToData); Paragon 'avoid' (fact),
+0x26,2,s16,dodge,high,Unit::GetSecure 005345E0 adds the equipped item's +0x26 (s16) (critical avoid); Paragon 'dodge' (fact),
+0x28,1,u8,range_min,high,Unit::GetRangeI / IsItemRangeCanEquip / ArenaData::CalculateEnemy read +0x28; data 0-3; Paragon (fact),
+0x29,1,u8,range_max,high,Unit::GetItemMaxRangeCanEquip / IsItemRangeCanEquip / ArenaData::CalculateEnemy read +0x29; data 0-5 or 0xFF; Paragon (fact),
+0x2A,1,s8,speed_mod_player,high,Unit::GetContinuous 0052E134 = Spd + the item's +0x2A (s8): speed used for follow-up attacks when this unit attacks; Paragon 'effective_speed_player_phase' (fact),
+0x2B,1,s8,speed_mod_enemy,high,Unit::GetUnderContinuous 00530834 reads +0x2B (s8): follow-up speed modifier when this unit is attacked; Paragon (fact),
+0x2C,4,s32,buy_price,high,ItemBuyMenuItem::GetPrice 00528454 / ProcSequence::CreateItemBuyMenu / Transporter GetPrice read +0x2C (u32); Paragon 'buy_price' (fact),
+0x30,4,s32,sell_price,high,unit::Item::GetSellPrice 0053AE8C returns +0x30 (doubled per forge level for weapons; times uses left / Item.uses for other items); ItemGain reads it; Paragon 'sell_price' (fact),
+0x34,2,flags16:JobCategory,effective,high,"map::BattleInfo::Side::CalculateEfficacy 0034899C tests the u16 at +0x34 against the target's Unit::GetCategory() (JCID_ bits, as Job.category); WAS two u8 fields effective_1/effective_2 (Paragon effective_damage_1/2), merged because the code reads one u16",
+0x36,1,s8,mov_bonus,high,Unit::ItemUse 003D7B7C adds +0x36 (s8) to the unit's movement boost (Unit+0x12C; capped at 2); Paragon 'mov' (fact),
+0x37,1,u8,legal_player_weapon,low,data 0-2; Paragon (fact),
+0x38,8,s8[8],stat_bonus,high,Unit::GetStrImpl 0052A80C adds the equipped item's +0x39 (s8) (the other stat getters their element) after the cap; GameHelp CreateCapabilityString reads +0x38[i]; Paragon 'bonuses' (fact),hp|str|mag|skl|spd|lck|def|res
+0x40,8,s8[8],extra_data,high,per-item effect values by stat: anonymous_namespace::GetEnhanceHave 0033A790 adds +0x40[stat] (s8) of every carried item that Unit::IsItemEnhanceHave accepts (ISID_所持強化 items: a bonus while carried); Unit::GetItemHealPower reads +0x40 (heal amount); Unit::ItemUse / SetSeal / EnhanceAfterBattleOne read +0x40[i] (stat boosters; after-battle effects); WAS u8[8] with numbered elements (a 255 now shows as -1),hp|str|mag|skl|spd|lck|def|res
+0x48,1,ref8:ItemRefine,refine_index,high,unit::Item::GetPower 0053B4B4 / GetHit / GetCritical pass +0x48 to ItemRefine::Get(row;level) as the row; Paragon 'forge_table_index' (fact),
+0x49,1,ref8:ItemRefine,unknown_49,medium,unit::Item::GetPower/GetHit/GetCritical pass +0x49 to ItemRefine::Get as the row instead of +0x48 when the unit item's mode bits (unit::Item+0x2 & 0x7F) are 1,
+0x4A,1,u8,skirmish_drop,low,data 0-3; Paragon (fact),
+0x4B,1,u8,unknown_4b,low,1 in every vanilla record,
+0x4C,3,u8[3],dawn_stock,medium,"shop::Data::UpdateStock 00416E54 / ItemEnumeratorInfinityGoods::IsExclusion read Item+0x4C[kind*3 + level - 1]: the item's stock in shop kind 0 at shop level 1-3 (255 = unlimited, 0 = not sold); which shop kind is which comes from Paragon 'dawn_stock' (fact)",lv1|lv2|lv3
+0x4F,3,u8[3],dusk_stock,medium,shop kind 1 of Item+0x4C[kind*3 + level - 1] (shop::Data::UpdateStock); Paragon 'dusk_stock' (fact),lv1|lv2|lv3
+0x52,3,u8[3],rod_stock,medium,shop kind 2 of Item+0x4C[kind*3 + level - 1] (shop::Data::UpdateStock); Paragon 'rod_stock' (fact),lv1|lv2|lv3
+0x55,3,u8[3],staff_stock,medium,shop kind 3 of Item+0x4C[kind*3 + level - 1] (shop::Data::UpdateStock); Paragon 'staff_stock' (fact),lv1|lv2|lv3
+0x58,8,s8[8],pool_rank,high,event::Informal GainItemEnumerator::IsExclusion 004319D8: for item table type 0 the item is in the random-gain pool when +0x58[side] >= 0 and <= the scenario rank; for types 1/2 +0x5A[side] / +0x5C[side] (GetRandomItem 00430E44: side 0 on Birthright; 1 on Conquest; random on Revelation); ItemEnumeratorLottery::IsExclusion 0033AF60: lottery rank (1-5) is +0x5E[origin - 1] (Lottery::CalculateItem); -1 = never; WAS named shop_misc with Paragon's element names (hoshido/nohr event; dawn/dusk lottery; hoshido_1/2; nohr_1/2) which do not match the code: the lottery bytes are the last two,gain0_hoshido|gain0_nohr|gain1_hoshido|gain1_nohr|gain2_hoshido|gain2_nohr|lottery_hoshido|lottery_nohr
+0x60,4,str,com,low,data: 56 records name a script/effect string; Paragon 'com' (fact),
+0x64,2,u16,unknown_64,low,handicap::..::CalculateUnitItem reads +0x64 (u16),
+0x66,1,u8,unknown_66,low,data 0-7,
+0x67,1,u8,weapon_rank_2,low,handicap::..::CalculateUnitItem reads +0x67; same value set as +0x1C,

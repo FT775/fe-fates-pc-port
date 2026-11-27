@@ -1,0 +1,8 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,map_width,high,map::Image::Update 0038F96C copies +0x0 into image byte 0 and loops x below it when it builds the movement-cost grid; data 15..32; Paragon FE14 Terrain.yml Grid (fact)
+0x04,4,u32,map_height,high,map::Image::Update copies +0x4 into image byte 1 and loops y below it; data 15..32; Paragon (fact)
+0x08,4,u32,play_x_min,high,map::Image::Update copies +0x8 into image byte 2; map::Dispos::Data::IsEnable 005278DC and SortiePosition::AddData 00361690 refuse x below it (left edge of the playable area); 1 in every file; Paragon 'border_width' (fact)
+0x0C,4,u32,play_y_min,high,map::Image::Update copies +0xC into image byte 3; IsEnable and SortiePosition::AddData refuse y below it (top edge of the playable area); 1 in every file; Paragon 'border_height' (fact)
+0x10,4,u32,play_x_end,high,map::Image::Update copies +0x10 into image byte 4; IsEnable and SortiePosition::AddData require x below it (playable area ends before this column); map_width - 1 in every file; Paragon 'effective_width' (fact)
+0x14,4,u32,play_y_end,high,map::Image::Update copies +0x14 into image byte 5; IsEnable and SortiePosition::AddData require y below it; map_height - 1 in every file; Paragon 'effective_height' (fact)
+0x18,1024,hex[1024],tiles,high,32x32 bytes; map::Image::Update copies these 0x400 bytes to image+0x408 and map::Dispos::Calculate 0039EF34 reads image+0x408+(x | y << 5) then Terrain::Get(tile): row-major with 32 bytes per row; each byte is a TerrainTile index of the same file (all values < tile_count)

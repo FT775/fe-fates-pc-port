@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence,elements
+0x004,0x2,u16,count,high,"Person::IsDownload 0x0053E080: the block holds person numbers first_number .. first_number + count - 1 (u16 record count of config/tables/tables.csv PersonChapter)",
+0x007,0x1,u8,flag_07,low,"Person::IsDownload 0x0053E094 / 0x0053E0C0 test it (meaning not traced: the block of a download person has it set)",
+0x034,0x2,u16,first_number,high,"Person::IsDownload 0x0053E074: the first record's pid_number (+0x10 + 0x24)",

@@ -1,0 +1,58 @@
+# Round 67 (release part A): the HEAVY unit tests. `tools/release/run_tests.py --core` leaves these out; `--full`
+# and plain `python -m unittest discover -s tests -t .` run them (nothing loses coverage: no test is deleted or
+# weakened, these only move to FULL). One test id per line (fnmatch patterns allowed); '#' starts a comment.
+# The seconds are the measured serial times of 2026-11-23 (build/r67/design/map_tests.json; CPU shared).
+#
+# Each heavy test that has a cheap FIXED stand-in in the core says so ("sample: <test id>"). Samples are fixed lists,
+# never random. The named QUICK-GUARD list (one cheap guard per randomizer track, always in the core) is tests/core.txt.
+
+# 1,328 message archives round-trip (167 s)
+#   sample: tests.test_text_mods.UserFilesTests.test_fixed_sample_archives_round_trip (40 fixed archives, ~5 s)
+tests.test_text_mods.UserFilesTests.test_every_message_archive_round_trips
+
+# character shuffle guards, 50 seeds x 16 option sets (86 s)
+#   sample: tests.test_rando_recruit.RealTables.test_guards_over_2_seeds_every_option_set (r0, r1 x 16, ~4 s)
+tests.test_rando_recruit.RealTables.test_guards_over_50_seeds_every_option_set
+
+# rando cache: six makes, hit byte-identical, changes miss (43 s)
+#   sample: tests.test_rando_cache.RealMake.test_one_seed_hit_is_byte_identical_and_change_misses (1 seed, 3 makes)
+tests.test_rando_cache.RealMake.test_hit_is_byte_identical_and_changes_miss
+
+# growth: every real mode's bounds and the slice-1 guards (36 s)
+#   quick guard kept: tests.test_rando_growth.RealDataGrowthTests.test_real_default_byte_identical
+tests.test_rando_growth.RealDataGrowthTests.test_real_modes_bounds_and_slice1_guards
+
+# in-game patch on memory images: W1 table options, E1 shuffle/music/levels/bosses, recolour lines, everything on
+# (30 + 28 + 27 + 24 s; their makes now run side by side in setUpClass, round 67 goal 2)
+#   kept in the core: test_defaults, test_shops_rewards_only (same check_seed laying), the seed fingerprints
+tests.test_rando_ingame.RealPatchTests.test_w1_table_options
+tests.test_rando_ingame.RealPatchTests.test_e1_shuffle_music_enemy_levels_bosses
+tests.test_rando_ingame.RealPatchTests.test_shuffle_recolour_lines
+tests.test_rando_ingame.RealPatchTests.test_everything_on
+
+# many seeds through every guard: items (25 s), slice 1 (19 s)
+#   quick guards kept: items test_same_seed_same_bytes, randomizer test_byte_identical_and_differs
+tests.test_rando_items.RealDataTests.test_many_seeds_all_guards
+tests.test_randomizer.RealDataTests.test_many_seeds_all_guards
+
+# The Seal edition: everything on, five seeds, all guards green (20 s)
+#   quick guard kept: tests.seal.test_rando_seal.SealPatchTests.test_patch_guards_are_the_mods_bytes; seal/*/1 fingerprints
+tests.seal.test_rando_seal.SealDataTests.test_everything_on_five_seeds_all_guards_green
+
+# tracks combined: everything on (three waves) and do-not-disturb (three waves) (16 + 18 + 13 + 6 + 16 + 10 s)
+#   kept in the core: test_default_byte_identical_to_slice1, test_w1/w2_defaults_change_nothing,
+#   test_mods_tool_accepts_and_check_remakes, fates/everything-on/1 fingerprint
+tests.test_rando_integrate.RealDataTests.test_all_on_guards_and_repeatable
+tests.test_rando_integrate.RealDataTests.test_w1_everything_on_guards_and_repeatable
+tests.test_rando_integrate.RealDataTests.test_w2_everything_on_guards_files_and_check
+tests.test_rando_integrate.RealDataTests.test_tracks_do_not_disturb_each_other
+tests.test_rando_integrate.RealDataTests.test_w1_modules_do_not_disturb_each_other
+tests.test_rando_integrate.RealDataTests.test_w2_modules_do_not_disturb_each_other
+
+# the 5 repeated "mods tool accepts the folder" checks (7-9 s each)
+#   sample: tests.test_rando_integrate.RealDataTests.test_mods_tool_accepts_and_check_remakes (one, integrate)
+tests.test_rando_music.RealDataTests.test_mods_tool_accepts_the_folder
+tests.test_rando_skills.RealDataTests.test_mods_tool_accepts_the_folder
+tests.test_rando_promotions.RealDataTests.test_mods_tool_accepts_the_folder
+tests.test_rando_stats.RealTablesTests.test_mods_tool_accepts_the_folder
+tests.test_rando_integrate.RealDataTests.test_w1_mods_tool_accepts_and_check_remakes

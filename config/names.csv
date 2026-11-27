@@ -1,0 +1,2 @@
+addr,name,library,class,note
+0x00300654,__aeabi_llsl,rvct_clib,,"no symbol in the map; by behaviour: 64-bit shift left of r1:r0 by r2 (read 2026-11-10)"

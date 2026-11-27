@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,4,u8[4],entry,low,data: the 4th byte is 0xFF in every entry (looks like RGBA colours); GameData::Initialize 004E6954 does not read header +0x50 and no other reader was found,r|g|b|a

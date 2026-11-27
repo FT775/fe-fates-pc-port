@@ -1,0 +1,9 @@
+Code-mapping scout (2026-11-10). Awakening readable overrides (281) vs Fates code.bin (.text 0x100000..0x61011C).
+Method: masked match (branch targets + literal pools wildcarded), then also load/store/ALU immediates
+wildcarded, then fuzzy instruction-class 6-gram vote + sequence ratio. Sanity: Awakening vs itself = 281/281.
+Results (281): exact-unique 14, exact-ambiguous 21 (tiny), imm-shifted unique 13, imm-shifted ambiguous 16,
+fuzzy>=0.85 46 (only ~21 long+unique, rest collide or short), fuzzy 0.70-0.85 31, none 140.
+Null (reversed Fates tokens): fuzzy>=0.85 = 2, 0.70-0.85 = 13 -> mid band is ~40% noise.
+Calibration on random 300 Awakening funcs: game 14% exact/imm, molive 90% exact, ctr_sdk ~58% exact.
+Struct shift: Unit x/y ldrsb 0x90/0x91 (Awakening) -> 0xF4/0xF5 (Fates) in ai_forced_unit_stands_at @0x4C8544.
+Big stat getters (unit_strength/magic/defense..., 190-340 words) not found: rewritten in Fates.

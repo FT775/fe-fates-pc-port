@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 18:57:49 -0500
+Subject: [PATCH 14/21] core: Fire Emblem Fates randomizer: a battle save's
+ load is not a New Game
+
+The mode-pick watch fired when GameConfigData's word at +4 changed with +0xB at 1
+now, whatever +0xB was before. A battle save loaded from the title drops +0xB to 0
+for one frame and changes the word as it goes back to 1 (round 58 robot check,
+frames 1266-1267 of every battle-save reload), so it was taken for a New Game:
+headless answered off and the original tables were put back while the units were
+made (randomized battle saves came back with HP cut to the original caps; with a
+window the Randomizer page would have opened). Now +0xB must be 1 in the frame
+before too, as the watch's own comment says.
+---
+ crates/zakuro-core/src/fates_rando.rs | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index a88cf92..250f524 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -325,7 +325,11 @@ impl NewGameWatch {
+             g.read(c.wrapping_add(0xB), &mut b);
+             Some((w, b[0]))
+         });
+-        let fired = matches!((self.last, now), (Some((w0, _)), Some((w1, 1))) if w0 != w1);
++        // +0xB at 1 in the frame before too: a battle save loaded from the title drops it to 0
++        // for one frame (the chapter's placements coming back) and changes the word as it
++        // goes back to 1 (round 58 robot check, frames 1266-1267 of every battle-save reload;
++        // the old rule took that for a New Game and put the original tables back)
++        let fired = matches!((self.last, now), (Some((w0, 1)), Some((w1, 1))) if w0 != w1);
+         self.last = now;
+         fired
+     }
+@@ -765,6 +769,16 @@ p 10 - 4a49445f41 g 100 -\nend 4\n";
+         w.after_frame(&mut m);
+         m.put(0x2300_0000, &cfg(0x4001_5EDE, 0)); // a save loaded (frame 2839 of bt-ch2)
+         assert!(!w.after_frame(&mut m));
++        // a battle save loaded from the title: +0xB 0 for one frame, then the word changes as
++        // it goes back to 1 (round 58, frames 1266-1267): a load, not a pick
++        let mut w = NewGameWatch::default();
++        m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
++        w.after_frame(&mut m);
++        m.put(0x2300_0000, &cfg(0x0001_1E5E, 0));
++        assert!(!w.after_frame(&mut m));
++        m.put(0x2300_0000, &cfg(0x4001_5EDE, 1));
++        assert!(!w.after_frame(&mut m), "a battle save's load is not a New Game");
++        assert!(!w.after_frame(&mut m));
+     }
+ 
+     #[test]

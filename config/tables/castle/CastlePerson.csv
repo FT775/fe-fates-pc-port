@@ -1,0 +1,8 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,person,medium,"File declares the 'output' name: the character's name, equal to the row label (the person ID without PID_) in every row"
+0x4,4,str,cook_title,high,"ProcDining::ExecuteCookingInternal (0017F384) reads row+0x4 and looks the text up as a DiningData_CookTitle row label"
+0x8,1,u8,liked_accessory_slot,medium,"File declares the liked accessory body part"
+0x9,1,u8,disliked_accessory_slot,medium,"File declares the disliked accessory body part"
+0xA,1,u8,hot_spring,medium,"File declares a hot spring setting"
+0xB,1,u8,accessory_reaction,medium,"File declares an accessory reaction setting"
+0xC,4,str,sound_label,high,"castle::CastleSound::ReserveShopEnterVoice (0044EEC4) reads row+0xC and formats a voice name from it"

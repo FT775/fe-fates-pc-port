@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,number,high,ID list: the record's label is the ID name; the number is the bit (flags) or value it stands for (PrivateSkill::Get returns this record; 1<<number is the mask)

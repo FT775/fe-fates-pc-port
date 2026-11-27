@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x0,4,list:AcceActionData_Pose,poses,medium,"The only declared field is a pointer; it points at {u32 count, items} (data)"

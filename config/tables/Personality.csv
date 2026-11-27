@@ -1,0 +1,12 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,4,u32,personality_number,medium,equals the record index in every record (Personality::Get(int) = table+i*0x40); no read seen,
+0x04,4,str,mid_name,medium,data: MID_ name message of the boon/bane in every record; no read seen yet,
+0x08,4,str,mid_help,medium,data: MID_H_ description message in every record; no read seen yet,
+0x0C,8,s8[8],boon_base,high,unit::Edit::GetCapability 0053ABEC reads +0xC[i] (s8); Personality::GetEnhanceCastle 005088C0 picks the stat (1..7) with the largest +0xD..+0x13,hp|str|mag|skl|spd|lck|def|res
+0x14,8,s8[8],boon_growth,high,unit::Edit::GetGrow 0053AC20 and unit::Family::ParentSingle::GetGrow 0053B740 read +0x14[i] (s8),hp|str|mag|skl|spd|lck|def|res
+0x1C,8,s8[8],boon_limit,high,unit::Edit::GetLimit 0053AC54 and unit::Family::GetLimit 0053BDC4 read +0x1C[i] (s8) (maximum-stat modifier),hp|str|mag|skl|spd|lck|def|res
+0x24,8,s8[8],bane_base,high,unit::Edit::GetCapability reads +0x24[i] (s8) next to +0xC[i]; data: no positive values,hp|str|mag|skl|spd|lck|def|res
+0x2C,8,s8[8],bane_growth,high,unit::Edit::GetGrow and unit::Family::ParentSingle::GetGrow read +0x2C[i] (s8),hp|str|mag|skl|spd|lck|def|res
+0x34,8,s8[8],bane_limit,high,unit::Edit::GetLimit and unit::Family::GetLimit read +0x34[i] (s8),hp|str|mag|skl|spd|lck|def|res
+0x3C,1,s8,dual_group,medium,PersonEnhanceDual::GetEdit 0050CADC compares +0x3C (s8) of the boon and the bane personality (-1 = none) before adding pair-up bonuses,
+0x3D,3,u8[3],dual_stats,low,data: stat numbers 1..7 (str..res) in every record but the first; no read found yet,

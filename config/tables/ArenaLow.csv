@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,weight,medium,ArenaData::CalculateEnemy reads entry +0x0 (u32) and subtracts it from a running random number (weighted pick)
+0x04,2,ref16:Job,job,high,ArenaData::CalculateEnemy passes entry +0x4 (u16) to Job::Get(unsigned short) 00341AA4
+0x06,2,ref16:Item,weapon,high,ArenaData::CalculateEnemy passes entry +0x6 (u16) to Item::Get(unsigned short) 003D0EAC and checks the item range (Item+0x28/+0x29)

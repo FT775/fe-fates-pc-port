@@ -1,0 +1,44 @@
+# Never commit Nintendo-owned data: the ROM, anything extracted from it, or build output
+# that contains original bytes.
+*.cci
+*.3ds
+*.cia
+*.cxi
+baserom/
+extracted/
+asm/
+build/
+expected/
+
+# The player's own files (F-048): the game .cci in roms/, the Seal of Flames zip in roms/seal/.
+# Only the two one-line notes are tracked. The old root folder of the unzipped mod is ignored too.
+/roms/*
+!/roms/README.txt
+!/roms/seal/
+/roms/seal/*
+!/roms/seal/README.txt
+/Seal of Flames v6/
+
+# Tooling
+.venv/
+__pycache__/
+*.pyc
+tools/bin/
+tools/config.local.json
+
+# PLAY launcher: per-machine config, ROM-check cache, save backups, portable saves/mods
+/play/
+
+# Mods workspace: mod folders hold spreadsheets made from the game's data (D-003).
+# Only the README and the placeholder are tracked.
+mods/*
+!mods/README.md
+!mods/.gitkeep
+
+# Engine sources (Zakuro, 3dsrecomp, fe-awakening-recomp) cloned at the pins in
+# config/upstream.json by tools/engine/engine.py, and their build output. 3dsrecomp has no
+# licence file: it is never tracked or shared (docs/ENGINE.md).
+/engine/
+
+# Grok scratch clones for the options page
+/tools/zakuro-options/work/

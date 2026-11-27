@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x0,1,u8,id,medium,"File declares Id"
+0x1,1,u8,x,medium,"File declares X"
+0x2,1,u8,y,medium,"File declares Y"
+0x3,1,u8,pad,medium,"File declares Pad"

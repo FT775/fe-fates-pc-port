@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,columns,high,TerrainCost::Get(int) 001A67EC / GetCostFromUnit 001A6708: row stride = this value rounded up to 4; check.py requires it to equal the TerrainCost record size (16)

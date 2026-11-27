@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,40,s8[40],by_level,high,"Unit::GetExpDance 0052BAD0 reads GetDance(difficulty)[level-1] (s8, index clamped 0..39)"

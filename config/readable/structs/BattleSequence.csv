@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence,elements
+0x25C,0x4,u32,forced_map,medium,"map::SequenceBattle ProcSequence::ProcSequence 0x0035D8A0: when this word is not 0 the battle is shown on the map (flags bit 0) without asking the option",
+0x270,0x4,ptr:Unit,unit_a,high,"the ProcSequence constructor 0x0035D8DC passes this word and +0x274 as the two units to GameConfigData::IsDetailBattle / IsDetailSupport",
+0x274,0x4,ptr:Unit,unit_b,high,"the second unit passed to IsDetailBattle / IsDetailSupport (0x0035D8DC)",
+0x280,0x4,u32,flags,medium,"the constructor sets bit 0 (no battle picture: shown on the map) when IsDetailBattle (or, with bit 2 set, IsDetailSupport) answers 0, when forced_map is not 0 or when bit 1 is set; bits 3 .. 5 set from item checks before it (0x0035D7D8 .. 0x0035D898)",

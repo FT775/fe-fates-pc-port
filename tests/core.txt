@@ -1,0 +1,32 @@
+# Round 67 (release part A): the QUICK-GUARD list. One cheap real-data guard per randomizer track (plus the seeds-
+# unchanged layer), always in `tools/release/run_tests.py --core` and never in tests/heavy.txt.
+# run_tests.py --check-lists (and tests/test_run_tests.py) check that every id here exists and is not heavy.
+# Format: <track> <test id>; '#' starts a comment.
+
+slice1-classes      tests.test_randomizer.RealDataTests.test_byte_identical_and_differs
+growth              tests.test_rando_growth.RealDataGrowthTests.test_real_default_byte_identical
+items               tests.test_rando_items.RealDataTests.test_same_seed_same_bytes
+skills              tests.test_rando_skills.RealDataTests.test_every_mode_many_seeds
+enemies             tests.test_rando_enemies.RealData.test_real_seeds_pass_every_guard
+stats               tests.test_rando_stats.RealTablesTests.test_50_seeds_every_guard
+weapons             tests.test_rando_weapons.RealDataTests.test_many_seeds_all_guards
+misc                tests.test_rando_misc.RealData.test_real_seeds_pass_every_guard
+promotions          tests.test_rando_promotions.RealDataTests.test_every_option_many_seeds
+children            tests.test_rando_children.RealDataChildrenTests.test_real_guards_hold_over_50_seeds
+music               tests.test_rando_music.RealDataTests.test_many_seeds_both_modes
+nuzlocke            tests.test_rando_nuzlocke.RealTables.test_rules_on_real_tables
+recruit-shuffle     tests.test_rando_recruit.RealTables.test_guards_over_2_seeds_every_option_set
+colours             tests.test_rando_colours.RealTables.test_seeds
+boss-might          tests.test_rando_boss_might.GameTables.test_fates_runs_shown_might
+r62-growth-floor    tests.test_rando_r62.GrowthFloorTests.test_floor_holds_on_every_total
+seal                tests.seal.test_rando_seal.SealPatchTests.test_patch_guards_are_the_mods_bytes
+seal-bosses         tests.seal.test_rando_seal_bosses.SealDataTests.test_seed_r64sboss2_changes_every_listed_boss
+page-seeds          tests.test_rando_page62b.SeedsUnchangedTests.test_same_answer_text_and_run_id
+ingame-patch        tests.test_rando_ingame.RealPatchTests.test_defaults
+integrate           tests.test_rando_integrate.RealDataTests.test_default_byte_identical_to_slice1
+mods-tool-accepts   tests.test_rando_integrate.RealDataTests.test_mods_tool_accepts_and_check_remakes
+cache               tests.test_rando_cache.RealMake.test_one_seed_hit_is_byte_identical_and_change_misses
+seed-fingerprints   tests.test_seed_fingerprints.RealCheck.test_no_seed_changed_without_notice
+text-mods           tests.test_text_mods.UserFilesTests.test_fixed_sample_archives_round_trip
+guarantees          tests.test_rando_guarantees.RealData.test_sweep_small
+launcher            tests.test_launcher.LauncherTests.test_t08_a_folder_like_yours_stays_silent_and_byte_for_byte   # round 77: PLAY stays silent and byte for byte for a ready folder (all of T1-T13 run in --core)

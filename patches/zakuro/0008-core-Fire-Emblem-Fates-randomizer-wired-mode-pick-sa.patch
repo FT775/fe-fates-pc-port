@@ -1,0 +1,1929 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Fri, 20 Nov 2026 02:42:18 -0500
+Subject: [PATCH 08/21] core: Fire Emblem Fates' randomizer wired: mode pick,
+ saves, states, placement files
+
+The Fates port's owner asked (its docs/DECISIONS.md F-044, engine build
+OK 2026-11-20) for the randomizer settings inside the game, right after
+picking Casual or Classic. Patch 0007 added the writer; this wires it.
+Nothing changes for any other game, or for Fates without a randomized
+run (every hook returns at once).
+
+- New module fates_rando_session: the Session System now carries as
+  system.rando. System::run_frame calls after_frame after end_frame, so
+  window, headless and boot-server runs share it. It only reads memory
+  (NewGameWatch) until the mode pick.
+- With a window the frontend sets system.rando.interactive and answers
+  the pick from its page (take_pending, answer). Otherwise the answer is
+  taken at once: a queued one (boot-server rando-answer FILE), else the
+  file FEF_RANDO_ANSWER names, else Randomizer off.
+- answer() runs the port's tools/randomizer/rando.py make --patch-out
+  hidden (CREATE_NO_WINDOW, stdin null, output piped into the log,
+  killed after 120 s), checks every cell against GameData in memory and
+  lays all or none. The run is kept in
+  <data>/rando/0004000000179800/runs/<seed>-<8hex>/.
+- Saves: every open of a slot file for reading at the title lays that
+  save's run or puts the original tables back (side file
+  slots/<save>.json, written when a slot is written). Save states:
+  state_run, state_restore, and the <state>.rando.json sidecar.
+- Placement files: new module fates_rando_file (LZ13/11, the IS .bin
+  form, optimal LZ11 recompress). A read of romfs:/ that covers a
+  placement file of the active run gets a patched copy when it fits the
+  stored size; when it does not, the cells are checked and laid in
+  memory at the first system call after the game stores the file
+  (kernel::svc::dispatch calls before_svc, a no-op otherwise).
+
+Our own code and words; no game data. Unit tests use fake memory and,
+when the port's files are given by environment, its extracted RomFS.
+---
+ crates/zakuro-core/src/fates_rando.rs         |   13 +-
+ crates/zakuro-core/src/fates_rando_file.rs    |  651 ++++++++++
+ crates/zakuro-core/src/fates_rando_session.rs | 1067 +++++++++++++++++
+ crates/zakuro-core/src/kernel/svc.rs          |    2 +
+ crates/zakuro-core/src/lib.rs                 |    9 +
+ crates/zakuro-core/src/services/fs.rs         |   19 +-
+ 6 files changed, 1757 insertions(+), 4 deletions(-)
+ create mode 100644 crates/zakuro-core/src/fates_rando_file.rs
+ create mode 100644 crates/zakuro-core/src/fates_rando_session.rs
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 7572e00..a88cf92 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -40,8 +40,11 @@
+ //!
+ //! Side files: a randomized game's save files get a small file beside them in the data
+ //! folder (`rando/<title>/slots/<save file>.json`) naming the run they belong to, so a
+-//! later load lays the same run again; `slot_*` below. Wiring into the file service, the
+-//! New Game page and the frame hook are separate steps (docs/RANDOMIZER_INGAME.md).
++//! later load lays the same run again; `slot_*` below. The wiring (frame hook, file
++//! service, saves, save states, the answer) is in `fates_rando_session`; the chapter
++//! placement files are patched inside the game's own read (`fates_rando_file`), because
++//! the game makes a chapter's units in the frame it loads them (round 50, T3), so
++//! `Run::after_frame` (laying them in memory after the frame) is no longer called.
+ 
+ use std::collections::HashSet;
+ use std::fs;
+@@ -412,6 +415,12 @@ impl Run {
+         self.gamedata_at.is_some()
+     }
+ 
++    /// the GameData cells are in memory already (a save state of this run was loaded):
++    /// remembered, nothing written.
++    pub fn assume_applied(&mut self, base: u32) {
++        self.gamedata_at = Some(base);
++    }
++
+     /// lays the GameData cells (Start game with Randomizer on, or a randomized save loaded).
+     pub fn apply_gamedata(&mut self, g: &mut dyn Guest) -> Result<usize, Vec<String>> {
+         if self.gamedata_at.is_some() {
+diff --git a/crates/zakuro-core/src/fates_rando_file.rs b/crates/zakuro-core/src/fates_rando_file.rs
+new file mode 100644
+index 0000000..6ccbfac
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_rando_file.rs
+@@ -0,0 +1,651 @@
++//! Fire Emblem Fates randomizer: chapter placement files patched inside the game's own
++//! read (docs/RANDOMIZER_INGAME.md, section 3b, the "precise hook").
++//!
++//! Round 50's robot test T3 showed the game makes a chapter's units in the same frame it
++//! loads that chapter's placement file (`map::Dispos::Load` 0x0039ED9C ->
++//! `ArchiveFile::ArchiveFile` 0x00193408: open, read, decompress, relocate, all inside one
++//! call), so laying the cells after the frame is too late. Instead the file service hands
++//! the game a patched copy of the file's bytes in the read itself: the game reads its
++//! RomFS through one SelfNCCH file, so a read that covers a placement file's extent gets
++//! the patched bytes there. No game code changes, and nothing at all happens without an
++//! active randomized run.
++//!
++//! The patched copy is made host side from the original stored file:
++//! 1. LZ13/LZ11/LZ10 decompress;
++//! 2. the IS .bin container (header 0x20: file size, data size, relocation count, label
++//!    count; data; relocations; labels; string pool);
++//! 3. the original-byte guard: every cell of the patch must hold its original value (plain
++//!    bytes byte for byte; a pointer cell must be a relocated pointer showing the original
++//!    label text, or a plain null) - one difference and the file is served unchanged;
++//! 4. the cells written in file form: plain bytes in place; a label pointer gets the
++//!    label's offset in this file's string pool (labels the file does not have, the ones
++//!    the patch takes from GameData's pool, are appended to the end of the pool); a slot
++//!    that becomes a pointer gains a relocation entry, one that becomes null loses its
++//!    entry, and every pointer into the string pool moves by the change in the size of
++//!    the relocation list;
++//! 5. LZ11 compressed again (an optimal parse, so it is no bigger than the game's own
++//!    greedy one on nearly the same bytes) in the original's format, and zero-padded to
++//!    the original stored size (the game reads the size its RomFS directory says; bytes
++//!    past the end of an LZ stream are not read, as in the 74 game files that carry some).
++//!    A patched file that does not fit is refused like a guard failure.
++//!
++//! After the game's relocation the patched file is the same as round 50's in-memory apply
++//! of the original (`fates_rando::apply_file`): the same plain bytes, every pointer showing
++//! the same label text (labels from GameData are this file's own copies of the text).
++
++use crate::fates_rando::{FilePatch, Where};
++
++// --------------------------------------------------------------------------- LZ
++
++/// the decompressed bytes and the facts a rebuild needs: the format byte (0x10, 0x11 or
++/// 0x13) and, for 0x13, the outer size.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Lz {
++    pub data: Vec<u8>,
++    pub format: u8,
++    pub outer: u32,
++}
++
++fn lz_header(src: &[u8], pos: usize) -> Result<(usize, usize), String> {
++    let b = src.get(pos..pos + 4).ok_or("LZ: cut header")?;
++    let size = b[1] as usize | (b[2] as usize) << 8 | (b[3] as usize) << 16;
++    if size == 0 {
++        let e = src.get(pos + 4..pos + 8).ok_or("LZ: cut extended header")?;
++        return Ok((u32::from_le_bytes([e[0], e[1], e[2], e[3]]) as usize, pos + 8));
++    }
++    Ok((size, pos + 4))
++}
++
++pub fn lz_decompress(src: &[u8]) -> Result<Lz, String> {
++    let format = *src.first().ok_or("LZ: empty")?;
++    let (outer, mut kind, mut pos) = match format {
++        0x13 => {
++            let (outer, p) = lz_header(src, 0)?;
++            if src.get(p) != Some(&0x11) {
++                return Err("LZ13: inner stream is not LZ11".into());
++            }
++            (outer as u32, 0x11u8, p)
++        }
++        0x10 | 0x11 => (0, format, 0),
++        _ => return Err(format!("not an LZ stream (format byte {format:#04x})")),
++    };
++    let (size, p) = lz_header(src, pos)?;
++    pos = p;
++    if kind == 0x13 {
++        kind = 0x11;
++    }
++    let mut out: Vec<u8> = Vec::with_capacity(size);
++    let byte = |pos: usize| src.get(pos).copied().ok_or_else(|| "LZ: truncated stream".to_string());
++    while out.len() < size {
++        let flags = byte(pos)?;
++        pos += 1;
++        for bit in (0..8).rev() {
++            if out.len() >= size {
++                break;
++            }
++            if flags >> bit & 1 == 0 {
++                out.push(byte(pos)?);
++                pos += 1;
++                continue;
++            }
++            let b0 = byte(pos)? as usize;
++            let (len, disp) = if kind == 0x10 {
++                let b1 = byte(pos + 1)? as usize;
++                pos += 2;
++                ((b0 >> 4) + 3, ((b0 & 15) << 8 | b1) + 1)
++            } else {
++                match b0 >> 4 {
++                    0 => {
++                        let (b1, b2) = (byte(pos + 1)? as usize, byte(pos + 2)? as usize);
++                        pos += 3;
++                        (((b0 & 15) << 4 | b1 >> 4) + 0x11, ((b1 & 15) << 8 | b2) + 1)
++                    }
++                    1 => {
++                        let (b1, b2, b3) = (byte(pos + 1)? as usize, byte(pos + 2)? as usize, byte(pos + 3)? as usize);
++                        pos += 4;
++                        (((b0 & 15) << 12 | b1 << 4 | b2 >> 4) + 0x111, ((b2 & 15) << 8 | b3) + 1)
++                    }
++                    n => {
++                        let b1 = byte(pos + 1)? as usize;
++                        pos += 2;
++                        (n + 1, ((b0 & 15) << 8 | b1) + 1)
++                    }
++                }
++            };
++            if disp > out.len() {
++                return Err("LZ: displacement before the start".into());
++            }
++            for _ in 0..len {
++                out.push(out[out.len() - disp]);
++            }
++        }
++    }
++    if out.len() != size {
++        return Err("LZ: stream overruns its size".into());
++    }
++    Ok(Lz { data: out, format, outer })
++}
++
++const WINDOW: usize = 0x1000;
++const MAX_LEN: usize = 0x10110;
++/// as the game's own compressor ("VRAM-safe"): never a displacement of 1.
++const MIN_DISP: usize = 2;
++const CHAIN: usize = 512;
++
++fn match_bits(len: usize) -> u32 {
++    1 + if len <= 16 { 16 } else if len <= 0x110 { 24 } else { 32 }
++}
++
++/// LZ11 (or LZ13 around LZ11) with an optimal parse. `outer` is the LZ13 outer size.
++pub fn lz11_compress(data: &[u8], format: u8, outer: u32) -> Vec<u8> {
++    let n = data.len();
++    // the longest match (len, disp) at each position, from 3-byte hash chains
++    let mut best = vec![(0usize, 0usize); n];
++    let mut head = vec![usize::MAX; 1 << 16];
++    let mut prev = vec![usize::MAX; n];
++    let hash = |i: usize| ((data[i] as usize) << 8 ^ (data[i + 1] as usize) << 4 ^ data[i + 2] as usize) & 0xFFFF;
++    for i in 0..n {
++        if i + 3 > n {
++            break;
++        }
++        let h = hash(i);
++        let lim = (n - i).min(MAX_LEN);
++        let mut cand = head[h];
++        let mut steps = 0;
++        while cand != usize::MAX && i - cand <= WINDOW && steps < CHAIN {
++            let disp = i - cand;
++            if disp >= MIN_DISP {
++                let mut l = 0;
++                while l < lim && data[cand + l] == data[i + l] {
++                    l += 1;
++                }
++                if l >= 3 && l > best[i].0 {
++                    best[i] = (l, disp);
++                    if l == lim {
++                        break;
++                    }
++                }
++            }
++            cand = prev[cand];
++            steps += 1;
++        }
++        prev[i] = head[h];
++        head[h] = i;
++    }
++    // cheapest parse from each position to the end
++    let mut cost = vec![0u32; n + 1];
++    let mut take = vec![0usize; n]; // 0 = literal, else match length
++    for i in (0..n).rev() {
++        cost[i] = 9 + cost[i + 1];
++        take[i] = 0;
++        let l_max = best[i].0;
++        if l_max >= 3 {
++            let mut try_len = |l: usize| {
++                let c = match_bits(l) + cost[i + l];
++                if c < cost[i] {
++                    cost[i] = c;
++                    take[i] = l;
++                }
++            };
++            for l in 3..=l_max.min(0x110) {
++                try_len(l);
++            }
++            if l_max > 0x110 {
++                try_len(l_max);
++            }
++        }
++    }
++    let mut out = Vec::with_capacity(n / 2 + 16);
++    let header = |out: &mut Vec<u8>, kind: u8, size: usize| {
++        if size < 1 << 24 && size > 0 {
++            out.extend_from_slice(&[kind, size as u8, (size >> 8) as u8, (size >> 16) as u8]);
++        } else {
++            out.extend_from_slice(&[kind, 0, 0, 0]);
++            out.extend_from_slice(&(size as u32).to_le_bytes());
++        }
++    };
++    if format == 0x13 {
++        header(&mut out, 0x13, outer as usize);
++    }
++    header(&mut out, 0x11, n);
++    let mut i = 0;
++    while i < n {
++        let flag_pos = out.len();
++        out.push(0);
++        let mut flags = 0u8;
++        for bit in (0..8).rev() {
++            if i >= n {
++                break;
++            }
++            let l = take[i];
++            if l == 0 {
++                out.push(data[i]);
++                i += 1;
++                continue;
++            }
++            flags |= 1 << bit;
++            let d = best[i].1 - 1;
++            if l <= 16 {
++                out.extend_from_slice(&[((l - 1) << 4 | d >> 8) as u8, d as u8]);
++            } else if l <= 0x110 {
++                let l2 = l - 0x11;
++                out.extend_from_slice(&[(l2 >> 4) as u8, ((l2 & 15) << 4 | d >> 8) as u8, d as u8]);
++            } else {
++                let l2 = l - 0x111;
++                out.extend_from_slice(&[(0x10 | l2 >> 12) as u8, (l2 >> 4) as u8, ((l2 & 15) << 4 | d >> 8) as u8, d as u8]);
++            }
++            i += l;
++        }
++        out[flag_pos] = flags;
++    }
++    out
++}
++
++// --------------------------------------------------------------------------- IS .bin
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct IsBin {
++    pub pad: [u8; 16],
++    pub data: Vec<u8>,
++    pub relocs: Vec<u32>,
++    /// (data offset, name offset in the string pool)
++    pub labels: Vec<(u32, u32)>,
++    pub strtab: Vec<u8>,
++}
++
++fn u32_at(b: &[u8], at: usize) -> Option<u32> {
++    b.get(at..at + 4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
++}
++
++impl IsBin {
++    pub fn parse(d: &[u8]) -> Result<IsBin, String> {
++        let h = |i: usize| u32_at(d, i * 4).ok_or_else(|| "IS bin: cut header".to_string());
++        let (fs, ds, c1, c2) = (h(0)? as usize, h(1)? as usize, h(2)? as usize, h(3)? as usize);
++        let p1 = 0x20 + ds;
++        let p2 = p1 + 4 * c1;
++        let se = p2 + 8 * c2;
++        if fs != d.len() || se > d.len() {
++            return Err("IS bin: sizes do not match the file".into());
++        }
++        let mut pad = [0u8; 16];
++        pad.copy_from_slice(&d[0x10..0x20]);
++        let relocs: Vec<u32> = (0..c1).map(|i| u32_at(d, p1 + 4 * i).unwrap()).collect();
++        if relocs.iter().any(|&r| r as usize + 4 > ds || r & 3 != 0) {
++            return Err("IS bin: a relocation points outside the data".into());
++        }
++        let labels = (0..c2).map(|i| (u32_at(d, p2 + 8 * i).unwrap(), u32_at(d, p2 + 8 * i + 4).unwrap())).collect();
++        Ok(IsBin { pad, data: d[0x20..p1].to_vec(), relocs, labels, strtab: d[se..].to_vec() })
++    }
++
++    /// where the string pool starts, counted from the data start (as the pointers count).
++    pub fn se(&self) -> u32 {
++        (self.data.len() + 4 * self.relocs.len() + 8 * self.labels.len()) as u32
++    }
++
++    pub fn build(&self) -> Vec<u8> {
++        let mut out = Vec::with_capacity(0x20 + self.se() as usize + self.strtab.len());
++        for v in [0u32, self.data.len() as u32, self.relocs.len() as u32, self.labels.len() as u32] {
++            out.extend_from_slice(&v.to_le_bytes());
++        }
++        out.extend_from_slice(&self.pad);
++        out.extend_from_slice(&self.data);
++        for r in &self.relocs {
++            out.extend_from_slice(&r.to_le_bytes());
++        }
++        for (a, b) in &self.labels {
++            out.extend_from_slice(&a.to_le_bytes());
++            out.extend_from_slice(&b.to_le_bytes());
++        }
++        out.extend_from_slice(&self.strtab);
++        let len = out.len() as u32;
++        out[..4].copy_from_slice(&len.to_le_bytes());
++        out
++    }
++
++    pub fn word(&self, off: u32) -> Option<u32> {
++        u32_at(&self.data, off as usize)
++    }
++
++    /// the text a pointer's file value shows (it must point into the string pool).
++    pub fn string_at(&self, value: u32) -> Option<&[u8]> {
++        let o = value.checked_sub(self.se())? as usize;
++        let rest = self.strtab.get(o..)?;
++        let end = rest.iter().position(|&b| b == 0)?;
++        Some(&rest[..end])
++    }
++}
++
++/// the guard on the original file (the same checks `fates_rando::apply_file` makes on
++/// memory, in file form): the cells that do not hold their original value.
++pub fn guard(bin: &IsBin, f: &FilePatch) -> Vec<String> {
++    let mut bad = Vec::new();
++    for v in &f.values {
++        let at = v.off as usize;
++        if bin.data.get(at..at + v.old.len()) != Some(&v.old[..]) {
++            bad.push(format!("{}: v {:#x} does not hold its original bytes", f.rel, v.off));
++        }
++    }
++    let se = bin.se();
++    for p in &f.ptrs {
++        let is_reloc = bin.relocs.contains(&p.off);
++        let cur = bin.word(p.off);
++        let ok = match (&p.old, cur) {
++            (_, None) => false,
++            (None, Some(w)) => !is_reloc && w == 0,
++            (Some(label), Some(w)) => {
++                is_reloc && w >= se && p.old_value == Some(w) && bin.string_at(w) == Some(&label[..])
++            }
++        };
++        if !ok {
++            bad.push(format!("{}: p {:#x} does not show its original label", f.rel, p.off));
++        }
++        if let (Some(label), Some((Where::Own, o))) = (&p.new, p.target) {
++            if bin.string_at(o) != Some(&label[..]) {
++                bad.push(format!("{}: p {:#x}: the new label is not at {o:#x} of the file's own pool", f.rel, p.off));
++            }
++        }
++    }
++    bad
++}
++
++/// writes the patch's cells into the file form (after `guard` found nothing).
++pub fn apply(bin: &mut IsBin, f: &FilePatch) {
++    for v in &f.values {
++        let at = v.off as usize;
++        bin.data[at..at + v.new.len()].copy_from_slice(&v.new);
++    }
++    let se_old = bin.se();
++    // new labels appended to the pool, one copy each (pool offset)
++    let mut appended: Vec<(Vec<u8>, u32)> = Vec::new();
++    // per pointer cell: Some(pool offset) or None (null)
++    let mut targets: Vec<(u32, Option<u32>)> = Vec::new();
++    for p in &f.ptrs {
++        let t = match (&p.new, p.target) {
++            (None, _) | (_, None) => None,
++            (Some(_), Some((Where::Own, o))) => Some(o - se_old),
++            (Some(label), Some((Where::GameData, _))) => {
++                // the file's own copy of the label when it has one, else appended
++                let own = find_label(&bin.strtab, label);
++                Some(match own.or_else(|| appended.iter().find(|(l, _)| l == label).map(|(_, o)| *o)) {
++                    Some(o) => o,
++                    None => {
++                        let o = bin.strtab.len() as u32;
++                        bin.strtab.extend_from_slice(label);
++                        bin.strtab.push(0);
++                        appended.push((label.clone(), o));
++                        o
++                    }
++                })
++            }
++        };
++        targets.push((p.off, t));
++    }
++    // the relocation list: entries dropped for slots that become null, added for slots
++    // that become pointers (the original order otherwise kept)
++    let drop: Vec<u32> = targets.iter().filter(|(_, t)| t.is_none()).map(|(o, _)| *o).collect();
++    bin.relocs.retain(|r| !drop.contains(r));
++    for (off, t) in &targets {
++        if t.is_some() && !bin.relocs.contains(off) {
++            bin.relocs.push(*off);
++        }
++    }
++    let se_new = bin.se();
++    // every other pointer into the pool moves with it
++    let cells: Vec<u32> = targets.iter().map(|(o, _)| *o).collect();
++    for i in 0..bin.relocs.len() {
++        let r = bin.relocs[i];
++        if cells.contains(&r) {
++            continue;
++        }
++        let w = bin.word(r).unwrap();
++        if w >= se_old {
++            let moved = w - se_old + se_new;
++            bin.data[r as usize..r as usize + 4].copy_from_slice(&moved.to_le_bytes());
++        }
++    }
++    for (off, t) in targets {
++        let value = t.map_or(0, |o| se_new + o);
++        bin.data[off as usize..off as usize + 4].copy_from_slice(&value.to_le_bytes());
++    }
++}
++
++/// a whole NUL-terminated string of the pool equal to `label`.
++fn find_label(strtab: &[u8], label: &[u8]) -> Option<u32> {
++    let mut i = 0;
++    while i < strtab.len() {
++        let end = strtab[i..].iter().position(|&b| b == 0).map_or(strtab.len(), |e| i + e);
++        if &strtab[i..end] == label {
++            return Some(i as u32);
++        }
++        i = end + 1;
++    }
++    None
++}
++
++/// the original stored file -> the patched stored file of exactly the same size, or the
++/// reasons nothing is patched.
++pub fn patch_stored(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>> {
++    let one = |e: String| vec![format!("{}: {e}", f.rel)];
++    let lz = lz_decompress(stored).map_err(one)?;
++    let mut bin = IsBin::parse(&lz.data).map_err(one)?;
++    // pointers into the area between the data and the pool would move wrongly
++    for &r in &bin.relocs {
++        let w = bin.word(r).unwrap();
++        if w as usize >= bin.data.len() && w < bin.se() {
++            return Err(one(format!("pointer at {r:#x} points into the relocation or label lists")));
++        }
++    }
++    let bad = guard(&bin, f);
++    if !bad.is_empty() {
++        return Err(bad);
++    }
++    apply(&mut bin, f);
++    let raw = bin.build();
++    let outer = if lz.format == 0x13 {
++        (lz.outer as i64 + raw.len() as i64 - lz.data.len() as i64).max(raw.len() as i64) as u32
++    } else {
++        0
++    };
++    let mut out = lz11_compress(&raw, if lz.format == 0x13 { 0x13 } else { 0x11 }, outer);
++    if lz.format == 0x10 {
++        return Err(one("LZ10 files are not rebuilt".into()));
++    }
++    if out.len() > stored.len() {
++        return Err(one(format!("the patched file ({} bytes) does not fit in the original's {} bytes",
++                               out.len(), stored.len())));
++    }
++    out.resize(stored.len(), 0);
++    Ok(out)
++}
++
++/// the file as the game holds it after its relocation, from its data start: every
++/// relocated pointer = base + its file value (what `ArchiveFile` leaves in memory).
++pub fn relocated(bin: &IsBin, base: u32) -> Vec<u8> {
++    let mut img = bin.build()[0x20..].to_vec();
++    for &r in &bin.relocs {
++        let w = bin.word(r).unwrap().wrapping_add(base);
++        img[r as usize..r as usize + 4].copy_from_slice(&w.to_le_bytes());
++    }
++    img
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::fates_rando::{Patch, Ptr, Value, Kind};
++
++    /// a small placement file: data 0x40 bytes (pointer at 0x8 to "JID_A", a value at
++    /// 0xC, a null slot at 0x10, a data pointer at 0x14 to 0x20, a pointer at 0x18 to
++    /// "IID_X"), one label, pool "PERSON\0JID_A\0IID_X\0".
++    fn sample() -> IsBin {
++        let mut b = IsBin { pad: [0; 16], data: vec![0; 0x40], relocs: vec![0x8, 0x14, 0x18], labels: vec![(0, 0)],
++                            strtab: b"PERSON\0JID_A\0IID_X\0".to_vec() };
++        let se = b.se();
++        b.data[0x8..0xC].copy_from_slice(&(se + 7).to_le_bytes());
++        b.data[0xC] = 3;
++        b.data[0x14..0x18].copy_from_slice(&0x20u32.to_le_bytes());
++        b.data[0x18..0x1C].copy_from_slice(&(se + 13).to_le_bytes());
++        b.data[0x20..0x24].copy_from_slice(b"DATA");
++        b
++    }
++
++    fn patch_for(b: &IsBin) -> FilePatch {
++        let se = b.se();
++        FilePatch {
++            kind: Kind::Dispos,
++            rel: "GameData/Dispos/A/A005.bin.lz".into(),
++            values: vec![Value { off: 0xC, old: vec![3], new: vec![5] }],
++            ptrs: vec![
++                // JID_A -> JID_B (from GameData's pool: not in the file)
++                Ptr { off: 0x8, old: Some(b"JID_A".to_vec()), new: Some(b"JID_B".to_vec()),
++                      target: Some((Where::GameData, 0x110)), old_value: Some(se + 7) },
++                // null -> IID_X (the file's own)
++                Ptr { off: 0x10, old: None, new: Some(b"IID_X".to_vec()), target: Some((Where::Own, se + 13)),
++                      old_value: None },
++                // IID_X -> null
++                Ptr { off: 0x18, old: Some(b"IID_X".to_vec()), new: None, target: None, old_value: Some(se + 13) },
++            ],
++        }
++    }
++
++    fn cstr_in(img: &[u8], base: u32, addr: u32) -> Option<Vec<u8>> {
++        let o = addr.checked_sub(base)? as usize;
++        let rest = img.get(o..)?;
++        Some(rest[..rest.iter().position(|&b| b == 0)?].to_vec())
++    }
++
++    #[test]
++    fn lz_round_trips() {
++        let mut data = Vec::new();
++        for i in 0..5000u32 {
++            data.extend_from_slice(&(i % 37).to_le_bytes());
++            if i % 100 == 0 {
++                data.extend_from_slice(&[0u8; 300]);
++            }
++        }
++        for format in [0x11u8, 0x13] {
++            let z = lz11_compress(&data, format, data.len() as u32 + 8);
++            assert!(z.len() < data.len() / 2);
++            let back = lz_decompress(&z).unwrap();
++            assert_eq!(back.data, data);
++            assert_eq!(back.format, format);
++            if format == 0x13 {
++                assert_eq!(back.outer, data.len() as u32 + 8);
++            }
++        }
++        assert_eq!(lz_decompress(&lz11_compress(&[], 0x11, 0)).unwrap().data, Vec::<u8>::new());
++        assert!(lz_decompress(&[0x11, 9, 0, 0, 0x00, 1]).is_err(), "cut stream");
++        assert!(lz_decompress(b"PK").is_err());
++    }
++
++    #[test]
++    fn is_bin_round_trips() {
++        let b = sample();
++        assert_eq!(IsBin::parse(&b.build()).unwrap(), b);
++        let mut bad = b.build();
++        bad[0] ^= 1;
++        assert!(IsBin::parse(&bad).is_err());
++    }
++
++    /// the placement patch on a buffer: after the game's relocation the patched file shows
++    /// the same plain bytes and the same label text as the in-memory apply would.
++    #[test]
++    fn placement_patch_on_a_buffer_matches_the_in_memory_apply() {
++        let b = sample();
++        let f = patch_for(&b);
++        let stored = lz11_compress(&b.build(), 0x13, b.build().len() as u32);
++        let mut padded = stored.clone();
++        padded.extend_from_slice(&[0u8; 64]); // room for the appended label
++        let out = patch_stored(&padded, &f).unwrap();
++        assert_eq!(out.len(), padded.len(), "the same size as the original");
++        let nb = IsBin::parse(&lz_decompress(&out).unwrap().data).unwrap();
++        let base = 0x3800_0020;
++        let img = relocated(&nb, base);
++        assert_eq!(img[0xC], 5);
++        assert_eq!(cstr_in(&img, base, u32::from_le_bytes(img[0x8..0xC].try_into().unwrap())).unwrap(), b"JID_B");
++        assert_eq!(cstr_in(&img, base, u32::from_le_bytes(img[0x10..0x14].try_into().unwrap())).unwrap(), b"IID_X");
++        assert_eq!(u32::from_le_bytes(img[0x18..0x1C].try_into().unwrap()), 0, "a null stays null after relocation");
++        assert_eq!(u32::from_le_bytes(img[0x14..0x18].try_into().unwrap()), base + 0x20, "data pointers unchanged");
++        assert_eq!(&img[0x20..0x24], b"DATA");
++        assert_eq!(nb.labels, b.labels);
++        assert_eq!(nb.string_at(nb.se() + nb.labels[0].1), Some(&b"PERSON"[..]), "labels keep their names");
++        // every other byte of the data region is the original's
++        let ob = relocated(&b, base);
++        for i in (0..0x40).filter(|i| !(0x8..0x1C).contains(i)) {
++            assert_eq!(img[i], ob[i], "byte {i:#x}");
++        }
++    }
++
++    #[test]
++    fn placement_guard_refuses_and_serves_nothing() {
++        let b = sample();
++        let mut f = patch_for(&b);
++        let stored = {
++            let mut s = lz11_compress(&b.build(), 0x13, b.build().len() as u32);
++            s.extend_from_slice(&[0u8; 64]);
++            s
++        };
++        // another mod changed the value
++        f.values[0].old = vec![4];
++        assert!(patch_stored(&stored, &f).is_err());
++        // a label that is not the original
++        let mut f = patch_for(&b);
++        f.ptrs[0].old = Some(b"JID_Z".to_vec());
++        assert!(patch_stored(&stored, &f).is_err());
++        // a slot said to be null that is a pointer
++        let mut f = patch_for(&b);
++        f.ptrs[1].off = 0x14;
++        assert!(patch_stored(&stored, &f).is_err());
++        // an own-pool label that is not where the patch says
++        let mut f = patch_for(&b);
++        f.ptrs[1].target = Some((Where::Own, b.se()));
++        assert!(patch_stored(&stored, &f).is_err());
++        // too big for the original's place
++        let tight = lz11_compress(&b.build(), 0x13, b.build().len() as u32);
++        let err = patch_stored(&tight, &patch_for(&b)).unwrap_err();
++        assert!(err[0].contains("does not fit"), "{err:?}");
++        // not LZ at all
++        assert!(patch_stored(b"plain", &patch_for(&b)).is_err());
++    }
++
++    /// every placement file of a made patch against the dump's own files, when FEF_RANDO_PATCH
++    /// and FEF_ROMFS (an extracted RomFS) are given; skipped otherwise (game data is never kept
++    /// in the repo).
++    #[test]
++    fn made_patch_fits_the_real_files() {
++        let (Ok(patch), Ok(romfs)) = (std::env::var("FEF_RANDO_PATCH"), std::env::var("FEF_ROMFS")) else { return };
++        let p = Patch::parse(&std::fs::read_to_string(patch).unwrap()).unwrap();
++        let (mut ok, mut refused) = (0, Vec::new());
++        for f in p.files.iter().filter(|f| f.kind == Kind::Dispos) {
++            let stored = std::fs::read(std::path::Path::new(&romfs).join(&f.rel)).unwrap();
++            match patch_stored(&stored, f) {
++                Ok(out) => {
++                    assert_eq!(out.len(), stored.len());
++                    // the relocated result shows every cell's new value
++                    let nb = IsBin::parse(&lz_decompress(&out).unwrap().data).unwrap();
++                    let base = 0x3000_0020;
++                    let img = relocated(&nb, base);
++                    for v in &f.values {
++                        assert_eq!(&img[v.off as usize..v.off as usize + v.new.len()], &v.new[..], "{}", f.rel);
++                    }
++                    for c in &f.ptrs {
++                        let w = u32::from_le_bytes(img[c.off as usize..c.off as usize + 4].try_into().unwrap());
++                        match &c.new {
++                            None => assert_eq!(w, 0, "{}", f.rel),
++                            Some(l) => assert_eq!(cstr_in(&img, base, w).as_ref(), Some(l), "{}", f.rel),
++                        }
++                    }
++                    ok += 1;
++                }
++                Err(e) => refused.push(e.join("; ")),
++            }
++        }
++        eprintln!("placement files patched in the read: {ok} fit, {} refused", refused.len());
++        for r in &refused {
++            eprintln!("  refused: {r}");
++        }
++        // only size may refuse a file of a made patch (those are laid at the next system
++        // call instead); a guard failure on the clean dump would be a real error
++        assert!(refused.iter().all(|r| r.contains("does not fit") && !r.contains(';')), "{refused:?}");
++    }
++}
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+new file mode 100644
+index 0000000..22c0f89
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -0,0 +1,1067 @@
++//! Fire Emblem Fates randomizer: the session glue around `fates_rando` (round 51,
++//! docs/RANDOMIZER_INGAME.md). Everything here does nothing unless the game is Fire
++//! Emblem Fates, and writes nothing to the game unless a randomized run is active: a run
++//! becomes active only by an answer with Randomizer on at the New Game mode pick, or by
++//! loading a save whose side file names one.
++//!
++//! - **after every frame** (`after_frame`, called by `System::run_frame`, so headless runs
++//!   and boot-server get it as well as the window): watches for the mode pick
++//!   (`NewGameWatch`, read only). Interactive (the window set `interactive`): marks a
++//!   pending new game for the page (`take_pending`), which pauses the game and answers
++//!   with `answer`. Not interactive (headless, boot-server): answers at once with the
++//!   queued answer (`queue_answer`: boot-server's `rando-answer FILE`), or the file named
++//!   by `FEF_RANDO_ANSWER`, or "Randomizer off".
++//! - **answer**: Randomizer off = any active run reverted, the original game goes on. On =
++//!   Python (`rando.py make --patch-out`, started hidden: CREATE_NO_WINDOW, its output
++//!   into the log) makes the patch, then every GameData cell is checked and laid (or
++//!   nothing), and the run's files are kept in `<data>/rando/<title>/runs/<id>/`.
++//! - **placement files** are patched inside the game's own read (`overlay_read`,
++//!   `fates_rando_file`).
++//! - **saves**: every open-for-read of a save file (`Chapter0..2`, `Map0.bak`, `Map1.bak`)
++//!   lays that save's run or reverts to the original (`save_opened_for_read`); a write of
++//!   one writes or removes its side file (`save_written`).
++//! - **save states**: `state_run` / `state_restore` and the `<state>.rando.json` sidecar.
++
++use std::collections::{HashMap, HashSet};
++use std::io::{BufRead, BufReader, Read};
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use crate::fates_rando::{self, Guest, NewGameWatch, Patch, Run, TITLE};
++use crate::System;
++
++/// Windows' CREATE_NO_WINDOW: a console program started with it never opens a window.
++pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++/// the longest `rando.py make` may take.
++pub const MAKE_TIMEOUT: Duration = Duration::from_secs(120);
++/// the longest `python --version` may take.
++pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// a placement file of the active run and where it sits in the RomFS the game reads.
++#[derive(Debug)]
++struct Placement {
++    file: usize,
++    /// offset of the stored file from the start of the "romfs:/" file the game reads
++    start: u64,
++    len: u64,
++    /// the patched stored bytes, made at the first read (None inside = refused)
++    served: Option<Option<Arc<Vec<u8>>>>,
++    /// refused only because the patched copy is bigger than the original (it is laid in
++    /// memory at the next system call instead)
++    late: bool,
++}
++
++/// system calls to wait, after a placement read, for the game to store the file.
++const SVC_WAIT: u32 = 20_000;
++
++#[derive(Debug, Default)]
++pub struct Session {
++    /// the window shows the Randomizer page at the mode pick; off (the default), the
++    /// answer comes from `queue_answer` / FEF_RANDO_ANSWER or is "off".
++    pub interactive: bool,
++    watch: NewGameWatch,
++    pending: bool,
++    queued: Option<String>,
++    run: Option<Run>,
++    placements: Vec<Placement>,
++    /// files of the save archives written since they were opened
++    written: HashSet<u32>,
++    /// a placement file read whose patched copy did not fit in the original's size:
++    /// (its name, index in the patch, the data start of the placements in memory at the
++    /// read, system calls left to wait). Laid in memory at the first system call after
++    /// the game stored the new data start (`before_svc`).
++    dispos_wait: Option<(String, usize, Option<u32>, u32)>,
++    pub notices: Vec<String>,
++}
++
++fn is_fates(system: &System) -> bool {
++    system.title.as_ref().is_some_and(|t| t.program_id() == TITLE)
++}
++
++fn data_dir(system: &System) -> PathBuf {
++    system.config.data_dir.clone().unwrap_or_else(|| PathBuf::from("."))
++}
++
++/// `<data>/rando/<title>/runs/<id>/`
++pub fn run_dir(data: &Path, id: &str) -> PathBuf {
++    data.join("rando").join(format!("{TITLE:016X}")).join("runs").join(id)
++}
++
++fn notice(system: &mut System, text: String) {
++    log::warn!("fates_rando: {text}");
++    system.rando.notices.push(text);
++}
++
++/// the run id of an answer: `<seed>-<8 hex of the answer>`.
++pub fn run_id(seed: &str, answer: &str) -> String {
++    format!("{seed}-{:08x}", fnv(answer))
++}
++
++/// a JSON value's text for a top-level key (true/false/number, or a string's contents).
++/// Enough for the page's flat answer object; the whole answer goes to Python as it is.
++pub fn json_field(text: &str, key: &str) -> Option<String> {
++    let at = text.find(&format!("\"{key}\""))?;
++    let rest = text[at + key.len() + 2..].trim_start().strip_prefix(':')?.trim_start();
++    if let Some(s) = rest.strip_prefix('"') {
++        let mut out = String::new();
++        let mut esc = false;
++        for c in s.chars() {
++            match (esc, c) {
++                (true, c) => { out.push(c); esc = false; }
++                (false, '\\') => esc = true,
++                (false, '"') => return Some(out),
++                (false, c) => out.push(c),
++            }
++        }
++        return None;
++    }
++    let end = rest.find([',', '}', '\n', '\r', ' ']).unwrap_or(rest.len());
++    Some(rest[..end].to_string())
++}
++
++fn fnv(text: &str) -> u32 {
++    text.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193))
++}
++
++fn seed_ok(seed: &str) -> bool {
++    (1..=32).contains(&seed.len()) && seed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
++}
++
++/// what the frame hook asks of the program after a frame.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Pick {
++    /// no mode pick this frame
++    None,
++    /// the mode was picked; the page answers (interactive)
++    Page,
++    /// the mode was picked; this answer (None = Randomizer off) is taken at once
++    Answer(Option<String>),
++}
++
++impl Session {
++    /// after a frame: the mode pick, and what answers it.
++    pub fn frame(&mut self, g: &mut dyn Guest) -> Pick {
++        if !self.watch.after_frame(g) {
++            return Pick::None;
++        }
++        if self.interactive {
++            self.pending = true;
++            return Pick::Page;
++        }
++        Pick::Answer(self.queued.take().or_else(|| {
++            let path = std::env::var_os("FEF_RANDO_ANSWER")?;
++            std::fs::read_to_string(&path)
++                .map_err(|e| log::warn!("fates_rando: FEF_RANDO_ANSWER {path:?} could not be read: {e}"))
++                .ok()
++        }))
++    }
++
++    /// the active run's id (None = the original game).
++    pub fn active(&self) -> Option<String> {
++        self.run.as_ref().filter(|r| r.gamedata_applied()).map(|r| r.id.clone())
++    }
++
++    /// the original game: the active run's GameData cells put back.
++    pub fn original(&mut self, g: &mut dyn Guest) {
++        self.placements.clear();
++        let Some(mut run) = self.run.take() else { return };
++        if let Err(bad) = run.revert_gamedata(g) {
++            self.note(format!("{}: the tables could not be put back ({} cells differ, first: {})",
++                              run.id, bad.len(), bad[0]));
++        }
++    }
++
++    fn note(&mut self, text: String) {
++        log::warn!("fates_rando: {text}");
++        self.notices.push(text);
++    }
++
++    /// lays a run already made (`<data>/rando/<title>/runs/<id>/patch.txt`): any other run
++    /// put back first, then every GameData cell checked and written (or nothing).
++    pub fn lay(&mut self, g: &mut dyn Guest, data: &Path, id: &str) -> Result<(), String> {
++        let path = run_dir(data, id).join("patch.txt");
++        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
++        let patch = Patch::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
++        self.original(g);
++        let mut run = Run::new(patch, id);
++        match run.apply_gamedata(g) {
++            Ok(n) => log::info!("fates_rando: {id}: {n} GameData cells laid"),
++            Err(bad) => {
++                return Err(format!("the game's tables are not the original's ({} cells differ, first: {}); \
++                                    nothing was written (another mod or a PLAY RANDOMIZED profile?)",
++                                   bad.len(), bad[0]));
++            }
++        }
++        self.run = Some(run);
++        Ok(())
++    }
++
++    /// the page's answer. Ok(None) = the original game goes on; Ok(Some(id)) = the
++    /// randomized game `id` is laid; Err = nothing was written, and why. `make` makes a run
++    /// that is not made yet (Python: `make_run` in the program).
++    pub fn answer(&mut self, g: &mut dyn Guest, data: &Path, answer: &str,
++                  make: &mut dyn FnMut(&Path, &str, &str, &str) -> Result<PathBuf, String>)
++        -> Result<Option<String>, String>
++    {
++        self.pending = false;
++        if json_field(answer, "randomizer").as_deref() != Some("true") {
++            self.original(g);
++            return Ok(None);
++        }
++        let mut seed = json_field(answer, "seed").unwrap_or_default();
++        if seed.is_empty() {
++            seed = format!("r{:08x}", fnv(&format!("{:?}", std::time::SystemTime::now())));
++        }
++        if !seed_ok(&seed) {
++            return Err(format!("the seed {seed:?} is not 1-32 letters, digits, - or _"));
++        }
++        let id = run_id(&seed, answer);
++        if !run_dir(data, &id).join("patch.txt").is_file() {
++            make(data, &id, &seed, answer)?;
++        }
++        self.lay(g, data, &id)?;
++        Ok(Some(id))
++    }
++
++    /// the game opened save file `path` to read it: that save's run is laid, or the
++    /// original game put back, before the game parses a byte of it. Every open, not only
++    /// the first: the Load list may read every slot while the player browses.
++    ///
++    /// Only while no chapter is going on (`at_title`: GameConfigData's byte +0xB still 1,
++    /// as at the title and the mode pick; round 50, T1): a save menu inside the game may
++    /// read every slot's file to show it, and that must not change the tables of the game
++    /// being played. A load from the title reads the file before the game parses it, so
++    /// the byte is still 1 then; Restart Chapter reads the same game's save inside it.
++    pub fn save_read(&mut self, g: &mut dyn Guest, data: &Path, path: &str, at_title: bool) {
++        if fates_rando::slot_name(path).is_none() || !at_title {
++            return;
++        }
++        let want = fates_rando::slot_run(data, path);
++        if want.is_some() && want == self.active() {
++            return;
++        }
++        match want {
++            None => self.original(g),
++            Some(id) => {
++                if let Err(e) = self.lay(g, data, &id) {
++                    self.original(g);
++                    self.note(format!("{path}: its randomized game {id} could not be laid, so it loads as the \
++                                       original game: {e}"));
++                }
++            }
++        }
++    }
++
++    /// the game wrote save file `path`: its side file names the active run, or is removed.
++    pub fn save_written(&mut self, data: &Path, path: &str) {
++        let run = self.active();
++        if let Err(e) = fates_rando::slot_written(data, path, run.as_deref()) {
++            self.note(format!("{path}: the randomizer side file could not be written: {e}"));
++        }
++    }
++
++    /// a save state of run `id` (None = the original) was loaded: memory already holds its
++    /// tables, so the run is only remembered (nothing written).
++    pub fn restore(&mut self, g: &mut dyn Guest, data: &Path, id: Option<&str>) {
++        self.placements.clear();
++        self.dispos_wait = None;
++        self.run = None;
++        let Some(id) = id else { return };
++        let path = run_dir(data, id).join("patch.txt");
++        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Patch::parse(&t)) {
++            Ok(patch) => {
++                let mut r = Run::new(patch, id);
++                if let Some(base) = fates_rando::gamedata_start(g) {
++                    r.assume_applied(base);
++                }
++                self.run = Some(r);
++            }
++            Err(e) => self.note(format!("the state's randomized game {id} is missing ({e}); its tables stay as saved")),
++        }
++    }
++}
++
++// --------------------------------------------------------------------------- the program's calls
++
++/// placement extents follow the active run.
++fn refresh_placements(system: &mut System) {
++    let want = system.rando.run.as_ref().map(|r| placements(system, &r.patch)).unwrap_or_default();
++    system.rando.placements = want;
++}
++
++/// called by `System::run_frame` after every frame.
++pub fn after_frame(system: &mut System) {
++    if !is_fates(system) {
++        return;
++    }
++    match system.rando.frame(&mut system.memory) {
++        Pick::None | Pick::Page => {}
++        Pick::Answer(a) => {
++            log::info!("fates_rando: New Game mode picked at frame {}; answered {}", system.frames,
++                       if a.is_some() { "from the test hook" } else { "off" });
++            match answer(system, a.as_deref().unwrap_or("{\"randomizer\": false}")) {
++                Ok(Some(id)) => log::info!("fates_rando: randomized game {id} laid"),
++                Ok(None) => {}
++                Err(e) => notice(system, format!("the randomizer was not laid: {e}")),
++            }
++        }
++    }
++}
++
++/// true once, after the frame in which the mode was picked (interactive only): the page
++/// opens and the game waits for `answer`.
++pub fn take_pending(system: &mut System) -> bool {
++    std::mem::take(&mut system.rando.pending)
++}
++
++/// the answer boot-server's `rando-answer FILE` (or a test) gives the next mode pick.
++pub fn queue_answer(system: &mut System, answer: String) {
++    system.rando.queued = Some(answer);
++}
++
++/// the active run's id (None = the original game).
++pub fn active_run(system: &System) -> Option<String> {
++    system.rando.active()
++}
++
++pub fn notices(system: &System) -> Vec<String> {
++    let mut out = system.rando.notices.clone();
++    if let Some(run) = &system.rando.run {
++        out.extend(run.notices.iter().cloned());
++    }
++    out
++}
++
++/// the page's answer (JSON); see `Session::answer`. Python runs here when the run is not
++/// made yet (a few seconds, hidden).
++pub fn answer(system: &mut System, answer: &str) -> Result<Option<String>, String> {
++    let data = data_dir(system);
++    let r = system.rando.answer(&mut system.memory, &data, answer, &mut make_run);
++    refresh_placements(system);
++    r
++}
++
++/// lays a run already made (see `Session::lay`).
++pub fn lay_run(system: &mut System, id: &str) -> Result<(), String> {
++    let data = data_dir(system);
++    let r = system.rando.lay(&mut system.memory, &data, id);
++    refresh_placements(system);
++    r
++}
++
++/// the original game: any active run put back.
++pub fn go_original(system: &mut System) {
++    system.rando.original(&mut system.memory);
++}
++
++fn placements(system: &System, patch: &Patch) -> Vec<Placement> {
++    let Some(title) = system.title.as_ref() else { return Vec::new() };
++    // only the plain RomFS the game reads as "romfs:/"; with mods laid over it (a PLAY
++    // RANDOMIZED profile) the GameData guard has already refused
++    if title.layered.is_some() {
++        return Vec::new();
++    }
++    let Some(romfs) = title.romfs.as_ref() else { return Vec::new() };
++    let mut out = Vec::new();
++    for (i, f) in patch.files.iter().enumerate() {
++        if f.kind != fates_rando::Kind::Dispos {
++            continue;
++        }
++        match romfs.lookup(&f.rel) {
++            Ok(entry) => out.push(Placement {
++                file: i,
++                start: romfs.file_data_offset(&entry) - romfs.base,
++                len: entry.data_size,
++                served: None,
++                late: false,
++            }),
++            Err(e) => log::warn!("fates_rando: {}: not in the RomFS ({e})", f.rel),
++        }
++    }
++    out
++}
++
++// --------------------------------------------------------------------------- placement reads
++
++/// the part of a placement extent (`start`, `len`, its patched `bytes`) that a read of
++/// `data.len()` bytes from `offset` covers, laid over `data`.
++pub fn overlay(offset: u64, data: &mut [u8], start: u64, len: u64, bytes: &[u8]) {
++    let end = offset + data.len() as u64;
++    if start >= end || start + len <= offset {
++        return;
++    }
++    let from = start.max(offset);
++    let to = (start + len).min(end);
++    data[(from - offset) as usize..(to - offset) as usize]
++        .copy_from_slice(&bytes[(from - start) as usize..(to - start) as usize]);
++}
++
++/// a read of the game's RomFS (`romfs:/`, from `offset`) gets the patched bytes of every
++/// placement file of the active run it covers. Nothing at all without an active run.
++pub fn overlay_read(system: &mut System, path: &str, offset: u64, data: &mut [u8]) {
++    if system.rando.placements.is_empty() || path != "romfs:/" || data.is_empty() {
++        return;
++    }
++    let end = offset + data.len() as u64;
++    for k in 0..system.rando.placements.len() {
++        let (start, len) = (system.rando.placements[k].start, system.rando.placements[k].len);
++        if start >= end || start + len <= offset {
++            continue;
++        }
++        if system.rando.placements[k].served.is_none() {
++            let made = make_placement(system, k);
++            system.rando.placements[k].served = Some(made);
++        }
++        match system.rando.placements[k].served.clone() {
++            Some(Some(bytes)) => overlay(offset, data, start, len, &bytes),
++            // too big to hand over in the read: laid in memory at the next system call
++            // once the game has stored it (the data start at +20 changes)
++            _ if system.rando.placements[k].late && system.rando.dispos_wait.is_some() => {
++                // one wait at a time: a second file read while one waits keeps its
++                // original placements, and says so
++                let i = system.rando.placements[k].file;
++                let waiting = system.rando.dispos_wait.as_ref().map(|w| w.1);
++                if waiting != Some(i) {
++                    let rel = system.rando.run.as_ref().map(|r| r.patch.files[i].rel.clone()).unwrap_or_default();
++                    notice(system, format!("{rel}: placements kept original (read while another file waited to be laid)"));
++                    system.rando.placements[k].late = false;
++                }
++            }
++            _ if system.rando.placements[k].late && system.rando.dispos_wait.is_none() => {
++                let i = system.rando.placements[k].file;
++                let Some(name) = system.rando.run.as_ref().map(|r| fates_rando::stem(&r.patch.files[i].rel).to_string())
++                else { continue };
++                let before = fates_rando::dispos_now(&mut system.memory).map(|(_, b)| b);
++                system.rando.dispos_wait = Some((name, i, before, SVC_WAIT));
++            }
++            _ => {}
++        }
++    }
++}
++
++fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
++    let p = &system.rando.placements[k];
++    let run = system.rando.run.as_ref()?;
++    let f = run.patch.files.get(p.file)?.clone();
++    let title = system.title.as_ref()?;
++    let romfs = title.romfs.as_ref()?;
++    let at = (romfs.base + p.start) as usize;
++    let stored = title.shared_image().data().get(at..at + p.len as usize)?.to_vec();
++    match crate::fates_rando_file::patch_stored(&stored, &f) {
++        Ok(bytes) => {
++            log::info!("fates_rando: {} patched in the read ({} cells)", f.rel, f.values.len() + f.ptrs.len());
++            Some(Arc::new(bytes))
++        }
++        Err(bad) if bad.len() == 1 && bad[0].contains("does not fit") => {
++            log::info!("fates_rando: {}; laid in memory at the next system call after the game stores it", bad[0]);
++            system.rando.placements[k].late = true;
++            None
++        }
++        Err(bad) => {
++            notice(system, format!("{}: placements kept original ({} problems, first: {})", f.rel, bad.len(), bad[0]));
++            None
++        }
++    }
++}
++
++/// at every system call (kernel::svc::dispatch); nothing unless a placement file too big
++/// to patch in the read is waiting: once the placement object names it with a new data
++/// start, its cells are checked and laid in memory (round 50's in-memory apply).
++pub fn before_svc(system: &mut System) {
++    let Some((name, i, before, left)) = system.rando.dispos_wait.take() else { return };
++    let now = fates_rando::dispos_now(&mut system.memory);
++    let stored = matches!(&now, Some((n, b)) if n.eq_ignore_ascii_case(&name) && Some(*b) != before);
++    if !stored {
++        if left == 0 {
++            notice(system, format!("{name}: placements kept original (the game made no system call after storing the file)"));
++        } else {
++            system.rando.dispos_wait = Some((name, i, before, left - 1));
++        }
++        return;
++    }
++    let (_, base) = now.unwrap();
++    let Some(gd) = fates_rando::gamedata_start(&mut system.memory) else { return };
++    let Some(f) = system.rando.run.as_ref().and_then(|r| r.patch.files.get(i)).cloned() else { return };
++    match fates_rando::apply_file(&mut system.memory, &f, base, gd, false) {
++        Ok(n) => log::info!("fates_rando: {name}: {n} placement cells laid in memory at a system call after the read (frame {})", system.frames),
++        Err(bad) => notice(system, format!("{name}: placements kept original ({} cells differ, first: {})",
++                                           bad.len(), bad[0])),
++    }
++}
++
++// --------------------------------------------------------------------------- saves
++
++/// no chapter is going on: GameConfigData's byte +0xB is 1 (or GameConfigData is not made
++/// yet).
++pub fn at_title(g: &mut dyn Guest) -> bool {
++    let Some(cfg) = g.r32(fates_rando::GAME_CONFIG).filter(|&c| c != 0) else { return true };
++    let at = cfg.wrapping_add(0xB);
++    if !g.readable(at, 1) {
++        return true;
++    }
++    let mut b = [0u8; 1];
++    g.read(at, &mut b);
++    b[0] == 1
++}
++
++/// the game opened a save file to read it (file service): see `Session::save_read`.
++pub fn save_opened_for_read(system: &mut System, path: &str) {
++    if !is_fates(system) || fates_rando::slot_name(path).is_none() {
++        return;
++    }
++    let data = data_dir(system);
++    let before = system.rando.active();
++    let at_title = at_title(&mut system.memory);
++    system.rando.save_read(&mut system.memory, &data, path, at_title);
++    if system.rando.active() != before {
++        refresh_placements(system);
++    }
++}
++
++/// the game wrote a save file (closed after writing, or renamed onto its name).
++pub fn save_written(system: &mut System, path: &str) {
++    if !is_fates(system) || fates_rando::slot_name(path).is_none() {
++        return;
++    }
++    let data = data_dir(system);
++    system.rando.save_written(&data, path);
++}
++
++/// a write to an open file (file service).
++pub fn file_wrote(system: &mut System, file_id: u32) {
++    if is_fates(system) {
++        system.rando.written.insert(file_id);
++    }
++}
++
++/// a file closed (file service).
++pub fn file_closed(system: &mut System, file_id: u32, path: &str) {
++    if system.rando.written.remove(&file_id) {
++        save_written(system, path);
++    }
++}
++
++// --------------------------------------------------------------------------- save states
++
++/// the run a save state made now belongs to.
++pub fn state_run(system: &System) -> Option<String> {
++    active_run(system)
++}
++
++/// a save state was loaded: see `Session::restore`.
++pub fn state_restore(system: &mut System, run: Option<&str>) {
++    if !is_fates(system) {
++        return;
++    }
++    let data = data_dir(system);
++    system.rando.restore(&mut system.memory, &data, run);
++    refresh_placements(system);
++}
++
++/// `<state file>.rando.json`
++pub fn sidecar_path(state: &Path) -> PathBuf {
++    let mut name = state.as_os_str().to_owned();
++    name.push(".rando.json");
++    PathBuf::from(name)
++}
++
++/// writes (run active) or removes (original game) the sidecar of a state file.
++pub fn write_sidecar(state: &Path, run: Option<&str>) -> std::io::Result<()> {
++    let side = sidecar_path(state);
++    match run {
++        Some(id) => {
++            let tmp = sidecar_path(&side);
++            let id = id.replace('\\', "\\\\").replace('"', "\\\"");
++            std::fs::write(&tmp, format!("{{\"format\": {}, \"run\": \"{id}\"}}\n", fates_rando::FORMAT))?;
++            std::fs::rename(&tmp, &side)
++        }
++        None => match std::fs::remove_file(&side) {
++            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
++            _ => Ok(()),
++        },
++    }
++}
++
++/// the run a state file's sidecar names (None = the original game, or no sidecar).
++pub fn read_sidecar(state: &Path) -> Option<String> {
++    std::fs::read_to_string(sidecar_path(state)).ok().and_then(|t| json_field(&t, "run"))
++}
++
++/// after a state file was saved.
++pub fn write_state_sidecar(system: &System, state: &Path) -> std::io::Result<()> {
++    if !is_fates(system) {
++        return Ok(());
++    }
++    write_sidecar(state, state_run(system).as_deref())
++}
++
++/// after a state file was loaded: the active run from its sidecar (none = original).
++pub fn read_state_sidecar(system: &mut System, state: &Path) {
++    let run = read_sidecar(state);
++    state_restore(system, run.as_deref());
++}
++
++// --------------------------------------------------------------------------- Python
++
++/// how to start Python: the program and the arguments before the script's.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Python {
++    pub program: PathBuf,
++    pub args: Vec<String>,
++}
++
++/// makes `cmd` start without a window (Windows: CREATE_NO_WINDOW); returns the creation
++/// flags it set (0 elsewhere).
++pub fn hide_window(cmd: &mut Command) -> u32 {
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        cmd.creation_flags(CREATE_NO_WINDOW);
++        CREATE_NO_WINDOW
++    }
++    #[cfg(not(windows))]
++    {
++        let _ = cmd;
++        0
++    }
++}
++
++/// a hidden Python command: no window, no input, output piped (to the log). Returns the
++/// creation flags too, for the test.
++pub fn python_command(py: &Python, args: &[&std::ffi::OsStr]) -> (Command, u32) {
++    let mut cmd = Command::new(&py.program);
++    cmd.args(&py.args).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
++    cmd.env("PYTHONIOENCODING", "utf-8").env("PYTHONDONTWRITEBYTECODE", "1");
++    let flags = hide_window(&mut cmd);
++    (cmd, flags)
++}
++
++/// runs a hidden command to its end (killed past `timeout`); every output line goes to
++/// the log (zakuro.log). Returns (exit code, the output's lines).
++pub fn run_hidden(mut cmd: Command, timeout: Duration) -> Result<(i32, Vec<String>), String> {
++    let mut child = cmd.spawn().map_err(|e| format!("could not start {:?}: {e}", cmd.get_program()))?;
++    let pump = |r: Option<Box<dyn Read + Send>>| {
++        std::thread::spawn(move || {
++            let mut lines = Vec::new();
++            if let Some(r) = r {
++                for line in BufReader::new(r).lines().map_while(Result::ok) {
++                    log::info!("rando.py: {line}");
++                    lines.push(line);
++                }
++            }
++            lines
++        })
++    };
++    let out = pump(child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
++    let err = pump(child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>));
++    let started = Instant::now();
++    let status = loop {
++        match child.try_wait() {
++            Ok(Some(status)) => break status,
++            Ok(None) if started.elapsed() > timeout => {
++                let _ = child.kill();
++                let _ = child.wait();
++                return Err(format!("it took longer than {} s and was stopped", timeout.as_secs()));
++            }
++            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
++            Err(e) => return Err(e.to_string()),
++        }
++    };
++    let mut lines = out.join().unwrap_or_default();
++    lines.extend(err.join().unwrap_or_default());
++    Ok((status.code().unwrap_or(-1), lines))
++}
++
++/// FEF_PYTHON, then `py -3`, then `python`: the first that answers `--version` with
++/// Python 3 within 5 s.
++pub fn find_python() -> Result<Python, String> {
++    let mut tries = Vec::new();
++    if let Some(p) = std::env::var_os("FEF_PYTHON") {
++        tries.push(Python { program: p.into(), args: vec![] });
++    }
++    tries.push(Python { program: "py".into(), args: vec!["-3".into()] });
++    tries.push(Python { program: "python".into(), args: vec![] });
++    for py in tries {
++        let (cmd, _) = python_command(&py, &["--version".as_ref()]);
++        if let Ok((0, lines)) = run_hidden(cmd, PROBE_TIMEOUT) {
++            if lines.iter().any(|l| l.starts_with("Python 3")) {
++                return Ok(py);
++            }
++        }
++    }
++    Err("Python 3 was not found; the randomizer needs it".into())
++}
++
++/// the randomizer's folder: FEF_RANDO_TOOL, else `tools/randomizer` in this program's
++/// folder or one above it (the port's `play/game/../../tools/randomizer`).
++pub fn find_tool() -> Result<PathBuf, String> {
++    if let Some(p) = std::env::var_os("FEF_RANDO_TOOL") {
++        let p = PathBuf::from(p);
++        return if p.join("rando.py").is_file() { Ok(p) } else { Err(format!("{}: no rando.py there", p.display())) };
++    }
++    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
++    for dir in exe.ancestors().skip(1).take(7) {
++        let t = dir.join("tools").join("randomizer");
++        if t.join("rando.py").is_file() && t.join("ingame.py").is_file() {
++            return Ok(t);
++        }
++    }
++    Err("the randomizer (tools/randomizer) was not found next to this program".into())
++}
++
++/// what Python runs: `rando.py make` with the page's answer turned into its flags by
++/// `ingame.make_args` (one list, one place), the patch written with `--patch-out`.
++const MAKE_SCRIPT: &str = "import sys, json\n\
++tool, answer, out, patch, seed, options = sys.argv[1:7]\n\
++sys.path.insert(0, tool)\n\
++import rando\n\
++import ingame\n\
++a = json.load(open(answer, encoding='utf-8'))\n\
++a['seed'] = a.get('seed') or seed\n\
++with open(options, 'w', encoding='utf-8') as fh:\n    json.dump(a, fh, sort_keys=True)\n\
++sys.exit(rando.main(['make'] + ingame.make_args(a) + ['--out', out, '--patch-out', patch]))\n";
++
++/// makes run `id` with Python and keeps its files in `<data>/rando/<title>/runs/<id>/`.
++/// Python works in the repo's `build/rando-make/<id>/` (the randomizer refuses to write
++/// inside %APPDATA%, where the owner's data folder is); the files are copied over after.
++pub fn make_run(data: &Path, id: &str, seed: &str, answer: &str) -> Result<PathBuf, String> {
++    let tool = find_tool()?;
++    let py = find_python()?;
++    let root = tool.parent().and_then(Path::parent).ok_or("tools/randomizer has no repo above it")?;
++    let work = root.join("build").join("rando-make").join(id);
++    let _ = std::fs::remove_dir_all(&work);
++    std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
++    let answer_path = work.join("answer.json");
++    std::fs::write(&answer_path, answer).map_err(|e| e.to_string())?;
++    let (out, patch, options) = (work.join("mod"), work.join("patch.txt"), work.join("options.json"));
++    let args: Vec<&std::ffi::OsStr> = vec!["-c".as_ref(), MAKE_SCRIPT.as_ref(), tool.as_os_str(), answer_path.as_os_str(),
++                                            out.as_os_str(), patch.as_os_str(), seed.as_ref(), options.as_os_str()];
++    let (cmd, _) = python_command(&py, &args);
++    log::info!("fates_rando: making {id} with {:?}", py.program);
++    let (code, lines) = run_hidden(cmd, MAKE_TIMEOUT).map_err(|e| format!("the randomizer: {e}"))?;
++    if code != 0 || !patch.is_file() {
++        let tail: Vec<&str> = lines.iter().rev().take(4).rev().map(String::as_str).collect();
++        return Err(format!("the randomizer stopped (exit {code}): {}", tail.join(" | ")));
++    }
++    let dir = run_dir(data, id);
++    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
++    let mut keep = vec![(options.clone(), "options.json".to_string())];
++    let mut found = HashMap::new();
++    find_files(&out, &mut found, 3);
++    for name in ["spoiler.txt", "plan.json"] {
++        if let Some(p) = found.get(name) {
++            keep.push((p.clone(), name.to_string()));
++        }
++    }
++    for (from, name) in keep {
++        let _ = std::fs::copy(&from, dir.join(&name));
++    }
++    // the patch last, written whole then renamed: its presence means the run is complete
++    let tmp = dir.join("patch.txt.tmp");
++    std::fs::copy(&patch, &tmp).map_err(|e| e.to_string())?;
++    std::fs::rename(&tmp, dir.join("patch.txt")).map_err(|e| e.to_string())?;
++    Ok(dir)
++}
++
++fn find_files(dir: &Path, found: &mut HashMap<String, PathBuf>, depth: u32) {
++    let Ok(entries) = std::fs::read_dir(dir) else { return };
++    for e in entries.flatten() {
++        let p = e.path();
++        if p.is_dir() && depth > 0 {
++            find_files(&p, found, depth - 1);
++        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
++            found.entry(name.to_string()).or_insert(p);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn python_starts_without_a_window() {
++        let py = Python { program: "python".into(), args: vec![] };
++        let (cmd, flags) = python_command(&py, &["--version".as_ref()]);
++        if cfg!(windows) {
++            assert_eq!(flags, 0x0800_0000, "CREATE_NO_WINDOW");
++        } else {
++            assert_eq!(flags, 0);
++        }
++        assert_eq!(cmd.get_program(), "python");
++        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
++    }
++
++    #[test]
++    fn answers_are_read_from_the_page_json() {
++        let a = r#"{"randomizer": true, "seed": "r51\"x", "classes": false, "growth_var": 30}"#;
++        assert_eq!(json_field(a, "randomizer").as_deref(), Some("true"));
++        assert_eq!(json_field(a, "seed").as_deref(), Some("r51\"x"));
++        assert_eq!(json_field(a, "classes").as_deref(), Some("false"));
++        assert_eq!(json_field(a, "growth_var").as_deref(), Some("30"));
++        assert_eq!(json_field(r#"{"randomizer":false}"#, "randomizer").as_deref(), Some("false"));
++        assert_eq!(json_field("{}", "randomizer"), None);
++        assert!(seed_ok("r51all") && seed_ok("a-b_C9") && !seed_ok("") && !seed_ok("a b") && !seed_ok(&"x".repeat(33)));
++    }
++
++    #[test]
++    fn state_sidecar_names_the_file() {
++        assert_eq!(sidecar_path(Path::new("build/s/state1.zst")), PathBuf::from("build/s/state1.zst.rando.json"));
++        assert!(run_dir(Path::new("d"), "r51-0000abcd").ends_with("rando/0004000000179800/runs/r51-0000abcd"));
++    }
++
++    // ----------------------------------------------------------------- a fake game
++
++    use crate::fates_rando::{GAMEDATA_ARCHIVE, GAME_CONFIG};
++    use std::collections::BTreeMap;
++
++    #[derive(Default, Clone, PartialEq, Debug)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++        writes: usize,
++    }
++
++    impl Fake {
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++        fn mem(&self) -> BTreeMap<u32, Vec<u8>> {
++            self.blocks.clone()
++        }
++        /// GameConfigData's byte +0xB (1 = no chapter going on)
++        fn set_title(&mut self, title: bool) {
++            self.blocks.get_mut(&0x2300_0000).unwrap()[0xB] = title as u8;
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++            self.writes += 1;
++        }
++    }
++
++    const GD_FILE: u32 = 0x3000_0000;
++
++    /// GameData loaded (value 7 at +0x10 of its data), GameConfigData at the title
++    fn game() -> Fake {
++        let mut m = Fake::default();
++        let mut gd = vec![0u8; 0x80];
++        gd[32 + 0x10] = 7;
++        m.blocks.insert(GD_FILE, gd);
++        let mut arch = vec![0u8; 8];
++        arch[4..8].copy_from_slice(&0x2000_0100u32.to_le_bytes());
++        m.blocks.insert(0x2000_0000, arch);
++        let mut x = vec![0u8; 120];
++        x[112..116].copy_from_slice(&GD_FILE.to_le_bytes());
++        m.blocks.insert(0x2000_0100, x);
++        m.blocks.insert(GAMEDATA_ARCHIVE, 0x2000_0000u32.to_le_bytes().to_vec());
++        let mut cfg = vec![0u8; 16];
++        cfg[4..8].copy_from_slice(&0x0001_1E5Eu32.to_le_bytes());
++        cfg[0xB] = 1;
++        m.blocks.insert(0x2300_0000, cfg);
++        m.blocks.insert(GAME_CONFIG, 0x2300_0000u32.to_le_bytes().to_vec());
++        m
++    }
++
++    fn gd_value(m: &Fake) -> u8 {
++        m.blocks[&GD_FILE][32 + 0x10]
++    }
++
++    fn top(name: &str) -> PathBuf {
++        let t = std::env::temp_dir().join(format!("fates_rando_session_{name}_{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&t);
++        t
++    }
++
++    /// a made run: its patch in runs/<id>/patch.txt (GameData +0x10: 7 -> new)
++    fn made(data: &Path, id: &str, new: u8) {
++        let dir = run_dir(data, id);
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("patch.txt"), format!("fates-rando-patch 1\nseed {id}\noptions {{}}\n\
++gamedata-sha256 00\nfile gamedata GameData/GameData.bin.lz\nv 10 07 {new:02x}\nend 1\n")).unwrap();
++    }
++
++    fn no_make(_: &Path, _: &str, _: &str, _: &str) -> Result<PathBuf, String> {
++        panic!("Python must not run for a run already made")
++    }
++
++    #[test]
++    fn the_test_hook_answers_the_mode_pick_like_the_page() {
++        let data = top("hook");
++        let answer = r#"{"randomizer": true, "seed": "r51t"}"#;
++        let id = run_id("r51t", answer);
++        made(&data, &id, 9);
++        let mut m = game();
++        let before = m.mem();
++        let mut s = Session::default();
++        assert_eq!(s.frame(&mut m), Pick::None, "first look only remembers");
++        queue_answer_session(&mut s, answer);
++        assert_eq!(s.frame(&mut m), Pick::None, "no pick yet");
++        assert_eq!(m.writes, 0, "the watch only reads");
++        // the mode pick (word +4 changes, +0xB still 1)
++        m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&0x4001_5EDEu32.to_le_bytes());
++        let pick = s.frame(&mut m);
++        assert_eq!(pick, Pick::Answer(Some(answer.to_string())));
++        assert_eq!(s.answer(&mut m, &data, answer, &mut no_make), Ok(Some(id.clone())));
++        assert_eq!(gd_value(&m), 9);
++        assert_eq!(s.active(), Some(id));
++        // Randomizer off at the next new game: the original tables back
++        assert_eq!(s.answer(&mut m, &data, r#"{"randomizer": false, "seed": "x"}"#, &mut no_make), Ok(None));
++        assert_eq!(m.blocks[&GD_FILE], before[&GD_FILE]);
++        assert_eq!(s.active(), None);
++        // interactive: the page answers instead
++        let mut s = Session { interactive: true, ..Session::default() };
++        s.frame(&mut m);
++        m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&0x5001_5EDEu32.to_le_bytes());
++        assert_eq!(s.frame(&mut m), Pick::Page);
++        assert!(std::mem::take(&mut s.pending));
++        // no answer at all = off: nothing written
++        let mut s = Session::default();
++        let mut m = game();
++        s.frame(&mut m);
++        m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&0x4001_5EDEu32.to_le_bytes());
++        if std::env::var_os("FEF_RANDO_ANSWER").is_none() {
++            assert_eq!(s.frame(&mut m), Pick::Answer(None));
++        }
++        assert_eq!(m.writes, 0);
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    fn queue_answer_session(s: &mut Session, a: &str) {
++        s.queued = Some(a.to_string());
++    }
++
++    #[test]
++    fn every_save_read_lays_its_own_run_or_the_original() {
++        let data = top("load");
++        made(&data, "rA", 9);
++        made(&data, "rB", 11);
++        fates_rando::slot_written(&data, "/Chapter0", Some("rA")).unwrap();
++        fates_rando::slot_written(&data, "/Chapter2", Some("rB")).unwrap();
++        let mut m = game();
++        let original = m.mem();
++        let mut s = Session::default();
++        // browsing the Load list: every read lays that slot's run, the last read wins
++        s.save_read(&mut m, &data, "/Chapter0", true);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")));
++        s.save_read(&mut m, &data, "/Chapter1", true); // no side file: the original game
++        assert_eq!((gd_value(&m), s.active()), (7, None));
++        assert_eq!(m.blocks, original);
++        s.save_read(&mut m, &data, "/Chapter2", true);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (11, Some("rB")));
++        s.save_read(&mut m, &data, "/Chapter0", true); // run to run: rB put back, rA laid
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")));
++        let writes = m.writes;
++        s.save_read(&mut m, &data, "/Chapter0", true); // the same run again: nothing written
++        assert_eq!(m.writes, writes);
++        // a battle save with its side file
++        fates_rando::slot_written(&data, "ext:/Map0.bak", Some("rB")).unwrap();
++        s.save_read(&mut m, &data, "/Map0.bak", true);
++        assert_eq!(s.active().as_deref(), Some("rB"));
++        // inside a chapter (a save menu reading the slots) nothing changes
++        m.set_title(false);
++        s.save_read(&mut m, &data, "/Chapter1", false);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (11, Some("rB")));
++        assert!(!at_title(&mut m));
++        m.set_title(true);
++        assert!(at_title(&mut m));
++        // files that are not slots are ignored
++        s.save_read(&mut m, &data, "/Global", true);
++        assert_eq!(s.active().as_deref(), Some("rB"));
++        // a side file whose run folder is gone: the original game, and a notice
++        fates_rando::slot_written(&data, "/Chapter1", Some("gone")).unwrap();
++        s.save_read(&mut m, &data, "/Chapter1", true);
++        assert_eq!((gd_value(&m), s.active()), (7, None));
++        assert!(s.notices.iter().any(|n| n.contains("gone")));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn a_save_whose_tables_were_changed_by_another_mod_is_not_laid() {
++        let data = top("guard");
++        made(&data, "rA", 9);
++        fates_rando::slot_written(&data, "/Chapter0", Some("rA")).unwrap();
++        let mut m = game();
++        m.blocks.get_mut(&GD_FILE).unwrap()[32 + 0x10] = 8;
++        let before = m.mem();
++        let mut s = Session::default();
++        s.save_read(&mut m, &data, "/Chapter0", true);
++        assert_eq!(m.writes, 0);
++        assert_eq!(m.blocks, before);
++        assert_eq!(s.active(), None);
++        assert_eq!(s.lay(&mut m, &data, "rA").map_err(|e| e.contains("not the original")), Err(true));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn side_files_round_trip_through_saves_and_states() {
++        let data = top("side");
++        made(&data, "rA", 9);
++        let mut m = game();
++        let mut s = Session::default();
++        s.lay(&mut m, &data, "rA").unwrap();
++        // the game writes slot 2 and its battle save: both name the run
++        s.save_written(&data, "/Chapter2");
++        s.save_written(&data, "/Map1.bak");
++        s.save_written(&data, "/Global");
++        assert_eq!(fates_rando::slot_run(&data, "/Chapter2").as_deref(), Some("rA"));
++        assert_eq!(fates_rando::slot_run(&data, "/Map1.bak").as_deref(), Some("rA"));
++        assert!(!fates_rando::slots_dir(&data).join("Global.json").exists());
++        // a fresh session reading slot 2 lays the same run
++        let mut m2 = game();
++        let mut s2 = Session::default();
++        s2.save_read(&mut m2, &data, "/Chapter2", true);
++        assert_eq!((gd_value(&m2), s2.active().as_deref()), (9, Some("rA")));
++        // the original game overwrites slot 2: its side file goes
++        s.original(&mut m);
++        s.save_written(&data, "/Chapter2");
++        assert_eq!(fates_rando::slot_run(&data, "/Chapter2"), None);
++        // a save state's sidecar
++        let state = data.join("state1.bin");
++        write_sidecar(&state, Some("rA")).unwrap();
++        assert_eq!(read_sidecar(&state).as_deref(), Some("rA"));
++        // loading that state: memory already holds rA's tables, so nothing is written
++        let mut m3 = m2.clone();
++        let writes = m3.writes;
++        let mut s3 = Session::default();
++        s3.restore(&mut m3, &data, read_sidecar(&state).as_deref());
++        assert_eq!((s3.active().as_deref(), m3.writes), (Some("rA"), writes));
++        // and a later load of an original save puts the tables back
++        s3.save_read(&mut m3, &data, "/Chapter2", true);
++        assert_eq!((gd_value(&m3), s3.active()), (7, None));
++        write_sidecar(&state, None).unwrap();
++        assert_eq!(read_sidecar(&state), None);
++        s3.restore(&mut m3, &data, None);
++        assert_eq!(s3.active(), None);
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn reads_in_pieces_get_the_patched_bytes_only_inside_the_file() {
++        let patched: Vec<u8> = (0..100u8).map(|b| b ^ 0xFF).collect();
++        let mut whole = vec![0u8; 400];
++        // the file sits at 150..250 of the RomFS; read in 64-byte pieces
++        for at in (0..400).step_by(64) {
++            let n = 64.min(400 - at);
++            let mut piece = vec![0u8; n];
++            overlay(at as u64, &mut piece, 150, 100, &patched);
++            whole[at..at + n].copy_from_slice(&piece);
++        }
++        assert!(whole[..150].iter().all(|&b| b == 0));
++        assert_eq!(&whole[150..250], &patched[..]);
++        assert!(whole[250..].iter().all(|&b| b == 0));
++    }
++}
+diff --git a/crates/zakuro-core/src/kernel/svc.rs b/crates/zakuro-core/src/kernel/svc.rs
+index b41df00..80fe1d0 100644
+--- a/crates/zakuro-core/src/kernel/svc.rs
++++ b/crates/zakuro-core/src/kernel/svc.rs
+@@ -40,6 +40,8 @@ pub fn in_place(number: u32) -> bool {
+ 
+ /// runs one supervisor call.
+ pub fn dispatch(system: &mut System, number: u32) {
++    // Fire Emblem Fates' randomizer: a placement file waiting to be laid (nothing otherwise)
++    crate::fates_rando_session::before_svc(system);
+     if log::log_enabled!(log::Level::Trace) {
+         let thread = system
+             .kernel
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index dccb653..49d8723 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -5,6 +5,8 @@ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
+ pub mod fates_rando;
++pub mod fates_rando_file;
++pub mod fates_rando_session;
+ pub mod game_ui;
+ pub mod cro;
+ pub mod download_play;
+@@ -238,6 +240,10 @@ pub struct System {
+     /// the ones recompiled code ran, to see how much the library covers.
+     pub interpreted_instructions: u64,
+     pub recompiled_instructions: u64,
++
++    /// Fire Emblem Fates' in-game randomizer (fates_rando_session): reads only, and
++    /// does nothing for any other game, unless a randomized run is active.
++    pub rando: fates_rando_session::Session,
+ }
+ 
+ /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
+@@ -317,6 +323,7 @@ impl System {
+             hints: None,
+             interpreted_instructions: 0,
+             recompiled_instructions: 0,
++            rando: fates_rando_session::Session::default(),
+         }
+     }
+ 
+@@ -373,6 +380,8 @@ impl System {
+         }
+         self.next_frame_boundary = self.cpu.cycles + CYCLES_PER_FRAME;
+         self.end_frame();
++        // the shared after-frame hook (window, headless and boot-server alike)
++        fates_rando_session::after_frame(self);
+         FrameOutcome::Completed
+     }
+ 
+diff --git a/crates/zakuro-core/src/services/fs.rs b/crates/zakuro-core/src/services/fs.rs
+index 0f53120..aa63f0a 100644
+--- a/crates/zakuro-core/src/services/fs.rs
++++ b/crates/zakuro-core/src/services/fs.rs
+@@ -94,6 +94,7 @@ const SELF_NCCH_EXEFS: u32 = 2;
+ const SELF_NCCH_UPDATE_ROMFS: u32 = 5;
+ 
+ /// OpenFile flags.
++const OPEN_WRITE: u32 = 1 << 1;
+ const OPEN_CREATE: u32 = 1 << 2;
+ 
+ /// size of one entry a directory read returns.
+@@ -467,6 +468,9 @@ fn user_command(system: &mut System, buffer: &CommandBuffer, header: Header) ->
+                 }
+             });
+             log::debug!("fs: rename '{source}' -> '{dest}' -> {result:?}");
++            if command == 0x0805 && result.is_ok() {
++                crate::fates_rando_session::save_written(system, &dest);
++            }
+             reply_result(system, buffer, command, result);
+             true
+         }
+@@ -765,6 +769,11 @@ fn open_host_file(
+     let result = host.open_file(&path, flags & OPEN_CREATE != 0);
+     log::debug!("fs: open '{path}' (flags {flags:#X}) -> {:?}", result.as_ref().map(|_| ()));
+     let host_path = result?;
++    // Fire Emblem Fates' randomizer: a save opened to be read gets its own run's tables
++    // (or the original's) before the game parses it; nothing for other games
++    if flags & OPEN_WRITE == 0 {
++        crate::fates_rando_session::save_opened_for_read(system, &path);
++    }
+     Ok(system.services.fs.add_file(OpenFile {
+         path,
+         backing: FileBacking::Host(host_path),
+@@ -842,6 +851,7 @@ fn file_command(
+                 Some(FileBacking::Host(path)) => {
+                     let mut data = vec![0u8; size as usize];
+                     system.memory.read_bytes(source, &mut data);
++                    crate::fates_rando_session::file_wrote(system, file_id);
+                     host_archive::write_at(&path, offset, &data) as u32
+                 }
+                 // anything else is read-only, the ROM image and the
+@@ -883,7 +893,9 @@ fn file_command(
+         }
+         // close
+         0x0808 => {
+-            system.services.fs.files.remove(&file_id);
++            if let Some(file) = system.services.fs.files.remove(&file_id) {
++                crate::fates_rando_session::file_closed(system, file_id, &file.path);
++            }
+             buffer.reply(&mut system.memory, command, &[]);
+             true
+         }
+@@ -1198,7 +1210,10 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
+             };
+             // copying through a temporary keeps the borrow of title from
+             // overlapping the mutable borrow of memory.
+-            let data = slice.to_vec();
++            let mut data = slice.to_vec();
++            // Fire Emblem Fates' randomizer: a chapter placement file of the active run
++            // read with its cells laid (nothing without an active run)
++            crate::fates_rando_session::overlay_read(system, &file.path, offset, &mut data);
+             system.write_from_service(dest, &data);
+             count as u32
+         }

@@ -1,0 +1,7 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,belong_number,high,equals the record index; Belong::Get(int); UnitSetBID reads +0x0
+0x04,4,str,mbid_name,high,Belong::GetName 0053D44C reads +0x4 (MBID_ message)
+0x08,4,str,mbid_help,high,Belong::GetHelp 0053D438 reads +0x8 (MBID_H_ message)
+0x0C,1,u8,kind,medium,Unit::CanCaptured 0052AE20 and Unit::IsInvisible read +0xC; values 0-2
+0x0D,1,u8,icon,medium,ViewerSituation::DrawSituationBelong reads +0xD; Paragon 'icon' (fact)
+0x0E,2,pad,pad_0e,high,zero in every record

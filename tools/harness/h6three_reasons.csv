@@ -1,0 +1,59 @@
+file,function,lines,reason,detail
+# Why no recording reached a line (tools/harness/h6three.py groups the never-reached survivors by this table).,,,,
+# Written by reading the source lines and the notes (docs/harness/H6_SURVIVORS.md C.4 and A/B); not by a script.,,,,
+# The most specific row wins: file+function+lines, then file+function, then file+lines, then file. A survivor no row covers is "not sorted yet".,,,,
+# F-025: do not play a chapter to reach these. None needs a cheat save to describe.,,,,
+support_unit.c,unit_family_child,,child unit (family record),the unit's family record: only child units (paralogue children) have one
+support_unit.c,unit_is_sibling,,child unit (family record),sibling test through both family records
+support_unit.c,unit_is_uncle_aunt,,child unit (family record),grandparent tests through the family records
+support_unit.c,unit_support_level,80-88,child unit (family record),parent-child and sibling support levels
+support_unit.c,unit_support_max_level,105-112,child unit (family record),parent-child and sibling support limits
+support_unit.c,unit_can_support,133,child unit (family record),an uncle or aunt who is also a romance option
+stance_bonus.c,,144-145 156-159 189-193,child unit (family record),family_ready and the family dual-support / double-capability calls
+growth_rates.c,unit_grow,113-118,child unit (family record),a child's growth from both parents
+growth_rates.c,unit_stat_limit,182,child unit (family record),a child's stat limit from the family
+class_change.c,unit_reliance_blocks_class_change,44-45,download (DLC) unit,"state bit ""download only"" set: asks whether the Person is a download one"
+vein_units.c,unit_can_dragon_vein,81-84,download (DLC) unit,"the ""vein: download only"" state bit"
+sheet_unit.c,unit_is_unique,148-149,download (DLC) unit,a possible clone: asks whether the Person is a download one
+support_unit.c,,27 30,download (DLC) unit,is_unique (helper): not unique / possible clone that is a download Person
+vein_tricks.c,,70 72 107 110,"map gimmick type no recording has (cannon, ring, standable)",the standable gimmick (type 29) and the terrain under it
+move_terrain.c,ai_terrain_score,166-169,skill no recorded unit had equipped,an AI unit with the score skill on a hazard tile (the lockpick pairing skill per the notes)
+move_cost.c,unit_is_cost_free,86,skill no recorded unit had equipped,a shooter unit with the free-move skill
+skill_battle.c,battle_side_has_skill,63-67,skill no recorded unit had equipped,the Nohr pair skill: the partner's skill counts too
+sheet_unit.c,unit_range_min,112,skill no recorded unit had equipped,the range skill on a weapon kind 4
+item_unit.c,unit_item_heal_amount,61-62,skill no recorded unit had equipped,the heal skill with a healing item (+50%)
+sheet_stats.c,,158 167,skill no recorded unit had equipped,an absorb skill / a tonic skill in the stat rules
+sheet_stats.c,unit_max_hp,210,skill no recorded unit had equipped,the HP tonic skill
+skill_has.c,unit_has_skill,51,skill no recorded unit had equipped,a skill in the 4th or 5th equip slot
+skill_has.c,job_class_skill,114,skill no recorded unit had equipped,a class's level-35 skill
+move_cost.c,terrain_cost_for_unit,63,skill no recorded unit had equipped,a unit or class flag that switches the terrain cost row
+formula_forecast.c,forecast_hit,51-53 75 81-93,"staff, tome or forged weapon no recorded fight used",a status (hinder) staff aimed at a unit: immune / resist / halved hit
+formula_forecast.c,forecast_strikes,142,"staff, tome or forged weapon no recorded fight used",a staff or no-strike side that also has the follow-up flag
+item_unit.c,unit_range_max,38-39,"staff, tome or forged weapon no recorded fight used",a tome whose range is half the magic (range type MAGIC)
+item_value.c,,49-61,"staff, tome or forged weapon no recorded fight used",with_forge_bonus (helper): a forged weapon's refine bonus; H5 has no line data for the helper
+triangle_tables.c,unit_weapon_exp_limit,88,"staff, tome or forged weapon no recorded fight used",the staff rank floor for persons with the staff-limit flag
+ai_permission.c,ai_attack_permission_for_command,153-169,"AI order, band or item use no recorded chapter has","AI command conditions 3, 6, 7, 8, 9"
+ai_permission.c,ai_command_is_active,70 76,"AI order, band or item use no recorded chapter has",AI command condition -2 or a band number
+ai_permission.c,,192 196,"AI order, band or item use no recorded chapter has",the shared argument helper: a second argument value / a skip value
+ai_area.c,ai_is_escape_position,47-48,"AI order, band or item use no recorded chapter has",an escaping AI unit on the last playable row
+ai_items.c,ai_item_index_doping,,"AI order, band or item use no recorded chapter has",an AI unit holding a stat booster
+ai_items.c,ai_has_heal_rod,128,"AI order, band or item use no recorded chapter has",a heal rod that is also magic for a holder with secret bit 0x08
+ai_think.c,ai_think_is_move_over_at,39-41,"AI order, band or item use no recorded chapter has",the AI move-over state set while this is asked
+growth_exp.c,unit_exp_damage,123-125,"game mode, difficulty or option the recordings do not use",exp decline on difficulty 2 or more
+battle2_rules.c,situation_is_casual,46-48,"game mode, difficulty or option the recordings do not use",the user-mode test answers first in every recording [ours: the recordings play one mode]
+stance_gauge.c,situation_can_dual,53,"game mode, difficulty or option the recordings do not use",the user mode flag 0x8 set
+menu_config.c,,148-156 183 225,"game mode, difficulty or option the recordings do not use",battle / support detail option on settings 2-4 and the flip argument
+sheet_stats.c,,107 172 174 205,"condition or state no recorded unit had","stat loss, mood up / down, HP halved by a condition"
+sheet_stats.c,unit_move,247-250 290-292,"condition or state no recorded unit had",a condition that halves or adds move for flyers
+stance_bonus.c,,78 80 87 89 115,avatar boon/bane and support-rank corner cases,"boon and bane naming the same battle number or none, the 5/3 and 3/5 scaling, Guard Stance +1 at support rank 4 or more"
+support_unit.c,unit_support_points,53-56,support corner cases,the partner keeps the points (reliance not owning its points)
+support_unit.c,unit_spouse_pid,290,support corner cases,a support at rank 4 or more (S): the partner's name string
+support_records.c,reliance_max_level,27,support corner cases,a support whose only reachable rank is C (or none)
+support_records.c,reliance_entry,102,support corner cases,an index past the first record list
+growth_exp.c,,45-46,exp corner cases,target_level (helper): the half-exp modes compare both levels
+growth_exp.c,,120 178,exp corner cases,the foe holds no weapon in exp mode 2 or half
+growth_exp.c,unit_exp_normalize,276-277,exp corner cases,exp gained at the level cap
+item_record.c,,37 41 55,data lookup misses,an item number with no record (missing / zero record)
+skill_has.c,skill_is_unknown,137-141,data lookup misses,a skill record of kind 5 (its name looked up in the ident hash)
+move_occupy.c,deploy_is_fill,88-101,move-range fill modes no recording used,"the deploy's ""pass test"" (bit 4) or ""ally test"" (bit 14) through a tile holding a unit"
+sheet_unit.c,unit_may_not_attack,134-137,unit setting no recorded chapter uses,a unit with a may-not-attack force mask

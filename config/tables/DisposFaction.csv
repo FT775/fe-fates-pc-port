@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence
+0x00,4,str,group,high,data: Player / Enemy / ReinforceNN / EventNN ... group names; the list ends with an all-zero entry
+0x04,4,ptr:DisposUnit,first_unit,high,map::Dispos::Calculate(map::Dispos::Header*;unsigned int) 0039EF34 reads +0x4; every group's units follow the previous group's (185/185 files)
+0x08,4,u32,unit_count,high,map::Dispos::Calculate reads +0x8; first_unit + count x 0x8C reaches the next group / end of data in every file

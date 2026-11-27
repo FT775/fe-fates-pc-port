@@ -1,0 +1,9 @@
+{
+  "_about": [
+    "Allow-list for the stuck-frame watchdog (tools/harness/watchdog.py, docs/tests/WATCHDOGS.md).",
+    "static_ok: screens that are legitimately static while presses go in. Each entry names a route and a frame",
+    "stretch (from/to, boot.exe frames) or a picture hash (sha256 of the top and bottom PPM bytes), and says why.",
+    "Add an entry only after looking at the screen; an entry never excuses a crash, a hang or a soft-lock."
+  ],
+  "static_ok": []
+}

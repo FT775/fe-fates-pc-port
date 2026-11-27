@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 20:30:36 -0500
+Subject: [PATCH 15/21] core: Fire Emblem Fates randomizer: label pointers of
+ placements laid in memory only
+
+A placement file whose patched copy fit the original's size was served patched in
+the read. Its plain bytes came through, but its label pointers (class and item
+labels) were wrong in memory on every such map in the round 58 robot check (A004:
+two units joined with no weapon). Files with label pointers now always take the
+in-memory path (laid at the first system call after the game stores the file),
+which laid every cell of every other file.
+---
+ crates/zakuro-core/src/fates_rando_session.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 59ae7e9..0391ce5 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -516,6 +516,15 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     let p = &system.rando.placements[k];
+     let run = system.rando.run.as_ref()?;
+     let f = run.patch.files.get(p.file)?.clone();
++    // label pointers (class and item labels) are laid in memory after the game stores the
++    // file, never in the read: the round 58 robot check found them wrong in memory on every
++    // map whose file was patched in the read (A004: two units joined with no weapon), while
++    // the in-memory path laid every cell of every other file
++    if !f.ptrs.is_empty() {
++        log::info!("fates_rando: {} has label pointers; laid in memory at the next system call after the game stores it", f.rel);
++        system.rando.placements[k].late = true;
++        return None;
++    }
+     let title = system.title.as_ref()?;
+     let stored = if let Some(layered) = title.layered.as_ref() {
+         let mut buf = vec![0u8; p.len as usize];

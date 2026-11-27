@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x00,10,s8[10],damage_min,high,"Unit::GetExpDamage reads GetBattleThreshold(difficulty)[i] (s8), i = enemy level - 31 clamped to 0..9, and uses it when it is larger than the ExpBattle value"
+0x0A,2,pad,pad_0a,high,zero in every row; index clamped to 9
+0x0C,10,s8[10],defeat_min,high,"Unit::GetExpDestroy 0052E184 reads GetBattleThreshold(difficulty)+0xC[i] (s8), same rule"
+0x16,2,pad,pad_16,high,zero in every row; index clamped to 9

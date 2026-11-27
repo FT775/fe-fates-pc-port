@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 22:02:37 -0500
+Subject: [PATCH 17/21] core: Fire Emblem Fates randomizer: files patched in
+ the read get an in-place LZ13 size
+
+The game decompresses an LZ13 file in place: the stored bytes sit at the end of a
+buffer of the LZ13 outer size and are read forward while the output is written from
+the buffer's start. The game's own outer size is exactly what that needs: for every
+one of the 302 chapter person and placement files of the clean dump, outer = stored
+size + the largest (bytes written - next byte read) over the stream.
+
+A file patched in the read is compressed by our own parse and zero padded to the
+original size, but kept the original outer size, so the writes ran over the unread
+end of the stream. The end of the file is its string pool: in the round 59 smoke a
+song name written into a Seal of Flames chapter person file (S002) read back as other
+bytes, while every cell before the pool was right. Round 58's wrong placement labels
+(Birthright 4: two joiners with no weapon; patch 0015 sends those files to the
+in-memory path) are the same fault: labels live in the pool.
+
+patch_stored now writes the outer size this stream needs (`inplace_margin`), never
+less than the original or the data size. Checked: `cargo test -p zakuro-core --lib`
+181 passed (new patched_lz13_decodes_in_place decodes in place as the game does).
+---
+ crates/zakuro-core/src/fates_rando_file.rs | 137 +++++++++++++++++++++
+ 1 file changed, 137 insertions(+)
+
+diff --git a/crates/zakuro-core/src/fates_rando_file.rs b/crates/zakuro-core/src/fates_rando_file.rs
+index 2e2d120..360d974 100644
+--- a/crates/zakuro-core/src/fates_rando_file.rs
++++ b/crates/zakuro-core/src/fates_rando_file.rs
+@@ -478,6 +478,21 @@ pub fn patch_stored(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>
+     if lz.format == 0x10 {
+         return Err(one("LZ10 files are not rebuilt".into()));
+     }
++    if lz.format == 0x13 {
++        // the game decompresses an LZ13 file in place: the stored bytes sit at the end of a
++        // buffer of the outer size and are read forward while the output is written from its
++        // start (round 59: a song name at the end of a patched Seal of Flames person file read
++        // back as other bytes; round 58's wrong placement labels, patch 0015, are the same
++        // fault: both live in the string pool at the end of the file). The game's own files
++        // carry an outer size that keeps the writes behind the reads; ours compress
++        // differently and are padded, so the outer size is set for this stream: big enough
++        // that no byte is written over before it is read.
++        let need = (stored.len() as i64 + inplace_margin(&out)).max(raw.len() as i64).max(outer as i64);
++        if need >= 1 << 24 {
++            return Err(one("the patched file's in-place size does not fit the LZ13 header".into()));
++        }
++        out[1..4].copy_from_slice(&(need as u32).to_le_bytes()[..3]);
++    }
+     if out.len() > stored.len() {
+         return Err(one(format!("the patched file ({} bytes) does not fit in the original's {} bytes",
+                                out.len(), stored.len())));
+@@ -507,6 +522,58 @@ pub fn patch_plain(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>>
+     Ok(out)
+ }
+ 
++/// for an LZ13 stream (the 4-byte LZ13 header, then LZ11) read from its first byte: the
++/// largest (bytes written so far - index of the next byte to read) over every byte the
++/// decoder reads. Placed at `outer - stored` in a buffer of `outer` bytes, the stream is
++/// decoded in place without a write over an unread byte when `outer >= stored + margin`.
++pub fn inplace_margin(z: &[u8]) -> i64 {
++    let mut worst = 0i64;
++    let at = |w: usize, j: usize, worst: &mut i64| *worst = (*worst).max(w as i64 - j as i64);
++    let mut j = 4; // after the LZ13 header
++    if z.len() < 8 {
++        return 0;
++    }
++    let mut size = u32::from_le_bytes([z[j + 1], z[j + 2], z[j + 3], 0]) as usize;
++    j += 4;
++    if size == 0 {
++        if z.len() < 12 {
++            return 0;
++        }
++        size = u32::from_le_bytes([z[j], z[j + 1], z[j + 2], z[j + 3]]) as usize;
++        j += 4;
++    }
++    let mut w = 0usize;
++    while w < size && j < z.len() {
++        at(w, j, &mut worst);
++        let flags = z[j];
++        j += 1;
++        for bit in (0..8).rev() {
++            if w >= size || j >= z.len() {
++                break;
++            }
++            at(w, j, &mut worst);
++            if flags & (1 << bit) == 0 {
++                j += 1;
++                w += 1;
++                continue;
++            }
++            let ind = z[j] >> 4;
++            let (len, n) = match ind {
++                0 => (((z[j] as usize & 15) << 4 | (z[j + 1] as usize >> 4)) + 0x11, 3),
++                1 => (((z[j] as usize & 15) << 12 | (z[j + 1] as usize) << 4 | (z[j + 2] as usize >> 4)) + 0x111, 4),
++                _ => (ind as usize + 1, 2),
++            };
++            // every byte of the token is read before the copy writes
++            at(w, j + n - 1, &mut worst);
++            j += n;
++            w += len;
++        }
++    }
++    // the last write ends at w; the next "read" position is the end of the stream
++    at(w, j, &mut worst);
++    worst
++}
++
+ /// the file as the game holds it after its relocation, from its data start: every
+ /// relocated pointer = base + its file value (what `ArchiveFile` leaves in memory).
+ pub fn relocated(bin: &IsBin, base: u32) -> Vec<u8> {
+@@ -641,6 +708,76 @@ mod tests {
+         assert_eq!(nb.string_at(nb.word(0x4).unwrap()), Some(&b"STRM_MAP_B2"[..]));
+     }
+ 
++    /// decodes an LZ13 file the way the game does: stored bytes at the end of a buffer of
++    /// the outer size, output written from its start over the same buffer.
++    fn inplace_decode(stored: &[u8]) -> Vec<u8> {
++        let outer = u32::from_le_bytes([stored[1], stored[2], stored[3], 0]) as usize;
++        let size = u32::from_le_bytes([stored[5], stored[6], stored[7], 0]) as usize;
++        let mut buf = vec![0u8; outer.max(stored.len())];
++        let p = buf.len() - stored.len();
++        buf[p..].copy_from_slice(stored);
++        let (mut r, mut w) = (p + 8, 0usize);
++        while w < size {
++            let flags = buf[r];
++            r += 1;
++            for bit in (0..8).rev() {
++                if w >= size {
++                    break;
++                }
++                if flags & (1 << bit) == 0 {
++                    buf[w] = buf[r];
++                    r += 1;
++                    w += 1;
++                    continue;
++                }
++                let ind = buf[r] >> 4;
++                let (len, n) = match ind {
++                    0 => (((buf[r] as usize & 15) << 4 | (buf[r + 1] as usize >> 4)) + 0x11, 3),
++                    1 => (((buf[r] as usize & 15) << 12 | (buf[r + 1] as usize) << 4 | (buf[r + 2] as usize >> 4)) + 0x111, 4),
++                    _ => (ind as usize + 1, 2),
++                };
++                let d = ((buf[r + n - 2] as usize & 15) << 8 | buf[r + n - 1] as usize) + 1;
++                r += n;
++                for _ in 0..len {
++                    buf[w] = buf[w - d];
++                    w += 1;
++                }
++            }
++        }
++        buf.truncate(size);
++        buf
++    }
++
++    /// round 59: a patched LZ13 file (shorter than the original, zero padded) decodes right
++    /// in place with the outer size patch_stored writes (with the original outer it would
++    /// not: the writes run over the unread end, which holds the string pool)
++    #[test]
++    fn patched_lz13_decodes_in_place() {
++        let mut b = sample();
++        b.strtab.extend_from_slice(b"STRM_BOSS_C1\0");
++        b.data = (0..0x400u32).map(|i| (i % 7) as u8).collect();
++        b.relocs = vec![];
++        b.labels = vec![(0, 0)];
++        let se = b.se();
++        let raw = b.build();
++        // the "game's" file: our compressor, then padding the size of a less tight stream
++        let z = lz11_compress(&raw, 0x13, raw.len() as u32);
++        let mut stored = z.clone();
++        stored.extend_from_slice(&[0u8; 200]);
++        let f = FilePatch {
++            kind: Kind::Person,
++            rel: "GameData/Person/C/S002.bin.lz".into(),
++            values: vec![Value { off: se + 19, old: b"STRM_BOSS_C1\0".to_vec(), new: b"STRM_BOSS_A2\0".to_vec() }],
++            ptrs: vec![],
++        };
++        let out = patch_stored(&stored, &f).unwrap();
++        let dec = inplace_decode(&out);
++        let nb = IsBin::parse(&dec).unwrap();
++        assert_eq!(nb.string_at(se + 19), Some(&b"STRM_BOSS_A2"[..]), "the pool at the end decodes right in place");
++        // the margin rule matches a plain decode everywhere
++        assert_eq!(dec, lz_decompress(&out).unwrap().data);
++    }
++
+     #[test]
+     fn is_bin_round_trips() {
+         let b = sample();

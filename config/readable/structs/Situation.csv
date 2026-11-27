@@ -1,0 +1,6 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,u8[4],force_dual,medium,"map::Situation::CanDual(Force::Type) const 0x005281E0 reads the byte at this + force type (1 = stance follow-ups and gauge on for that army) when GameUserData.mode_flags bit 3 is set; only 4 bytes before flags",
+0x004,0x4,u32,flags,medium,"map::Situation::CanDual 0x005281C0: bit 19 (0x80000) set = stances on for every army; bit 0: map HP bars hidden (the script command ChapterSetHideHpGauge 0x003ADBFC sets or clears it, map::Actor::Tick 0x0038D428 tests it); other bits not traced",
+0x008,0x1,u8,force_index,low,"GameConfigData::IsDetailBattle 0x0050AB00 (battle option 3) reads this byte and uses it as an index into force_dual; meaning not traced",
+0x009,0x1,u8,view_force,medium,"map::Image::Danger::Update 0x0038F84C and map::SequenceHelper::DangerTick 0x0035E2F4: the army type whose non-allied units make the danger zone",
+0x017,0x1,u8,no_exp,medium,"map::Situation::CanGainExp(Force::Type) const 0x00527D98 returns 0 when this byte is 1 (no experience on this map); otherwise the answer is force_dual[force] == 1 for forces 0 .. 2",

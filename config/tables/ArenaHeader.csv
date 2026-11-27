@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x00,4,ptr:ArenaLow,low_list,high,Arena::Initialize 0041C67C stores header+0x0; Arena::GetLow returns it; ArenaData::CalculateEnemy 003B9538 reads +0x0 (list)
+0x04,4,u32,low_count,high,ArenaData::CalculateEnemy loops while index < +0x4
+0x08,4,ptr:ArenaHigh,high_list,high,Arena::Initialize stores header+0x8; Arena::GetHigh 0041C6A0 returns it; CalculateEnemy uses it when its level argument is 21 or more
+0x0C,4,u32,high_count,high,ArenaData::CalculateEnemy loop bound (+0x4 of the GetHigh pair)

@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 03:00:00 -0500
+Subject: [PATCH 0023] core: Fire Emblem Fates randomizer: a chapter person file too big for the read is laid in memory
+
+A patched chapter person file that does not fit in the stored size was
+kept original (Seal of Flames R013, R023: 930/921 and 1128/1118 bytes,
+round 59 check). Like a placement file, it is now laid in memory at the
+first system call after the game stored it: found in the Person archive
+list (0x006D3B28: {data start, ArchiveFile*, next}) by its archive name,
+guarded cell by cell (apply_file). Person::Load runs before the chapter's
+placements are read, so the cells are in place before the units are
+made. The single placement wait becomes one wait per file. Round 60,
+track sealfix: docs/tests/SEAL_SAVE.md 8.
+---
+  crates/zakuro-core/src/fates_rando.rs         |  54 +++++++++++++
+  crates/zakuro-core/src/fates_rando_session.rs | 110 ++++++++++++++++----------
+  2 files changed, 121 insertions(+), 43 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 39b9cad..a2c1e04 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -344,6 +344,33 @@ pub fn dispos_now(g: &mut dyn Guest) -> Option<(String, u32)> {
+     Some((name, archive_data_start(g, arch)?))
+ }
+ 
++/// the Person archive list's first node (`Person::Initialize` 0044A04C stores it; GameData's
++/// own block): each node is {data start of the archive, ArchiveFile*, next node}, and
++/// `Person::Load` (0044A808) / `Person::LoadArchive` (0044A388) append a chapter's file at
++/// the end once it is read and relocated.
++pub const PERSON_LIST: u32 = 0x006D_3B28;
++
++/// round 60: the data start of the loaded Person archive named `name` (its first word points
++/// at the archive name, which patch 0018/0022 keep equal to the file stem), or None.
++pub fn person_now(g: &mut dyn Guest, name: &str) -> Option<u32> {
++    let mut node = g.r32(PERSON_LIST)?;
++    for _ in 0..64 {
++        if node == 0 {
++            return None;
++        }
++        let start = g.r32(node)?;
++        if start != 0 {
++            if let Some(ptr) = g.r32(start).filter(|&p| p != 0) {
++                if g.cstr(ptr, 32).is_some_and(|n| n.eq_ignore_ascii_case(name.as_bytes())) {
++                    return Some(start);
++                }
++            }
++        }
++        node = g.r32(node.wrapping_add(8))?;
++    }
++    None
++}
++
+ /// where a resident file of the recolour (Asset, Face) starts in memory now (the data
+ /// start its offsets count from); None = not loaded or not the file the patch names.
+ pub fn resident_start(g: &mut dyn Guest, kind: Kind) -> Option<u32> {
+@@ -926,4 +953,31 @@ p 10 - 4a49445f41 g 100 -\nend 4\n";
+         assert!(slots_dir(&top).ends_with("rando/0004000000179800/slots"));
+         let _ = fs::remove_dir_all(&top);
+     }
++
++    #[test]
++    fn a_chapter_person_archive_is_found_in_the_person_list_by_name() {
++        // the list: GameData's node, then R021's (node = {data start, ArchiveFile*, next})
++        let mut m = Fake::default();
++        let (n0, n1) = (0x2100_0000u32, 0x2100_0100u32);
++        let (b0, b1) = (0x3100_0020u32, 0x3200_0020u32);
++        let mut node = vec![0u8; 12];
++        node[0..4].copy_from_slice(&b0.to_le_bytes());
++        node[8..12].copy_from_slice(&n1.to_le_bytes());
++        m.put(n0, &node);
++        let mut node = vec![0u8; 12];
++        node[0..4].copy_from_slice(&b1.to_le_bytes());
++        m.put(n1, &node);
++        for (b, name) in [(b0, &b"resident\0"[..]), (b1, &b"R021\0"[..])] {
++            let mut blk = vec![0u8; 0x40];
++            blk[0..4].copy_from_slice(&(b + 0x30).to_le_bytes());
++            blk[0x30..0x30 + name.len()].copy_from_slice(name);
++            m.put(b, &blk);
++        }
++        let mut head = vec![0u8; 4];
++        head.copy_from_slice(&n0.to_le_bytes());
++        m.put(PERSON_LIST, &head);
++        assert_eq!(person_now(&mut m, "R021"), Some(b1));
++        assert_eq!(person_now(&mut m, "r021"), Some(b1));
++        assert_eq!(person_now(&mut m, "R023"), None);
++    }
+ }
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 47eeccc..aaa20db 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -81,11 +81,13 @@ pub struct Session {
+     placements: Vec<Placement>,
+     /// files of the save archives written since they were opened
+     written: HashSet<u32>,
+-    /// a placement file read whose patched copy did not fit in the original's size:
+-    /// (its name, index in the patch, the data start of the placements in memory at the
+-    /// read, system calls left to wait). Laid in memory at the first system call after
+-    /// the game stored the new data start (`before_svc`).
+-    dispos_wait: Option<(String, usize, Option<u32>, u32)>,
++    /// placement (and, round 60, chapter person) files read whose patched copy did not fit
++    /// in the original's size: (its name, index in the patch, the file's data start in
++    /// memory at the read, system calls left to wait). Each is laid in memory at the first
++    /// system call after the game stored the file at a new data start (`before_svc`). One
++    /// wait per file (round 59 kept one wait in all; a chapter's person file and its
++    /// placements can both be too big).
++    waits: Vec<(String, usize, Option<u32>, u32)>,
+     /// frames since the game last opened a save slot at the title: a load from the title
+     /// reads its save in the very frame the mode word changes, and a save made before the
+     /// Prologue starts still has GameConfigData's +0xB at 1 then (round 51, robot T5), so
+@@ -333,7 +335,7 @@ impl Session {
+     /// tables, so the run is only remembered (nothing written).
+     pub fn restore(&mut self, g: &mut dyn Guest, data: &Path, id: Option<&str>) {
+         self.placements.clear();
+-        self.dispos_wait = None;
++        self.waits.clear();
+         self.run = None;
+         let Some(id) = id else { return };
+         let path = run_dir(data, id).join("patch.txt");
+@@ -619,23 +621,16 @@ pub fn overlay_read(system: &mut System, path: &str, offset: u64, data: &mut [u8
+             Some(Some(bytes)) => overlay(offset, data, start, len, &bytes),
+             // too big to hand over in the read: laid in memory at the next system call
+             // once the game has stored it (the data start at +20 changes)
+-            _ if system.rando.placements[k].late && system.rando.dispos_wait.is_some() => {
+-                // one wait at a time: a second file read while one waits keeps its
+-                // original placements, and says so
++            // a file already waiting (read again in pieces) keeps its one wait
++            _ if system.rando.placements[k].late
++                && !system.rando.waits.iter().any(|w| w.1 == system.rando.placements[k].file) =>
++            {
+                 let i = system.rando.placements[k].file;
+-                let waiting = system.rando.dispos_wait.as_ref().map(|w| w.1);
+-                if waiting != Some(i) {
+-                    let rel = system.rando.run.as_ref().map(|r| r.patch.files[i].rel.clone()).unwrap_or_default();
+-                    notice(system, format!("{rel}: placements kept original (read while another file waited to be laid)"));
+-                    system.rando.placements[k].late = false;
+-                }
+-            }
+-            _ if system.rando.placements[k].late && system.rando.dispos_wait.is_none() => {
+-                let i = system.rando.placements[k].file;
+-                let Some(name) = system.rando.run.as_ref().map(|r| fates_rando::stem(&r.patch.files[i].rel).to_string())
++                let Some((name, kind)) = system.rando.run.as_ref()
++                    .map(|r| (fates_rando::stem(&r.patch.files[i].rel).to_string(), r.patch.files[i].kind))
+                 else { continue };
+-                let before = fates_rando::dispos_now(&mut system.memory).map(|(_, b)| b);
+-                system.rando.dispos_wait = Some((name, i, before, SVC_WAIT));
++                let before = stored_at(&mut system.memory, kind, &name);
++                system.rando.waits.push((name, i, before, SVC_WAIT));
+             }
+             _ => {}
+         }
+@@ -650,9 +645,13 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     // file, never in the read: the round 58 robot check found them wrong in memory on every
+     // map whose file was patched in the read (A004: two units joined with no weapon), while
+     // the in-memory path laid every cell of every other file
+-    // (engine round E1) chapter person files and map settings have no in-memory path: they
+-    // are laid in the read or not at all, and say so
++    // (engine round E1) map settings have no in-memory path: they are laid in the read or
++    // not at all, and say so
+     let placement = f.kind == fates_rando::Kind::Dispos;
++    // round 60: a chapter person file too big for the read is laid in memory like a
++    // placement file (round 59 check: Seal of Flames R013 and R023, a few bytes over: "chapter
++    // people kept original"); found in the Person archive list by its name (patch 0018)
++    let late_ok = placement || (f.kind == fates_rando::Kind::Person && f.ptrs.is_empty());
+     if !f.ptrs.is_empty() && !placement {
+         notice(system, format!("{}: kept original (label pointers are laid only in placement files)", f.rel));
+         return None;
+@@ -679,7 +678,7 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+             log::info!("fates_rando: {} patched in the read ({} cells, frame {})", f.rel, f.values.len() + f.ptrs.len(), system.frames);
+             Some(Arc::new(bytes))
+         }
+-        Err(bad) if placement && bad.len() == 1 && bad[0].contains("does not fit") => {
++        Err(bad) if late_ok && bad.len() == 1 && bad[0].contains("does not fit") => {
+             log::info!("fates_rando: {}; laid in memory at the next system call after the game stores it", bad[0]);
+             system.rando.placements[k].late = true;
+             None
+@@ -696,28 +695,53 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     }
+ }
+ 
+-/// at every system call (kernel::svc::dispatch); nothing unless a placement file too big
+-/// to patch in the read is waiting: once the placement object names it with a new data
+-/// start, its cells are checked and laid in memory (round 50's in-memory apply).
++/// where the file `name` of this kind sits in memory now (its data start): the placement
++/// object's file for a placement file, the Person archive list's for a chapter person file.
++fn stored_at(g: &mut dyn fates_rando::Guest, kind: fates_rando::Kind, name: &str) -> Option<u32> {
++    match kind {
++        fates_rando::Kind::Person => fates_rando::person_now(g, name),
++        _ => fates_rando::dispos_now(g).filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, b)| b),
++    }
++}
++
++/// at every system call (kernel::svc::dispatch); nothing unless a file too big to patch in
++/// the read is waiting: once the game holds it at a new data start (the placement object
++/// names it, or, round 60, the Person archive list has it), its cells are checked and laid
++/// in memory (round 50's in-memory apply).
+ pub fn before_svc(system: &mut System) {
+-    let Some((name, i, before, left)) = system.rando.dispos_wait.take() else { return };
+-    let now = fates_rando::dispos_now(&mut system.memory);
+-    let stored = matches!(&now, Some((n, b)) if n.eq_ignore_ascii_case(&name) && Some(*b) != before);
+-    if !stored {
+-        if left == 0 {
+-            notice(system, format!("{name}: placements kept original (the game made no system call after storing the file)"));
+-        } else {
+-            system.rando.dispos_wait = Some((name, i, before, left - 1));
+-        }
++    if system.rando.waits.is_empty() {
+         return;
+     }
+-    let (_, base) = now.unwrap();
+-    let Some(gd) = fates_rando::gamedata_start(&mut system.memory) else { return };
+-    let Some(f) = system.rando.run.as_ref().and_then(|r| r.patch.files.get(i)).cloned() else { return };
+-    match fates_rando::apply_file(&mut system.memory, &f, base, gd, false) {
+-        Ok(n) => log::info!("fates_rando: {name}: {n} placement cells laid in memory at a system call after the read (frame {})", system.frames),
+-        Err(bad) => notice(system, format!("{name}: placements kept original ({} cells differ, first: {})",
+-                                           bad.len(), bad[0])),
++    for (name, i, before, left) in std::mem::take(&mut system.rando.waits) {
++        let Some(f) = system.rando.run.as_ref().and_then(|r| r.patch.files.get(i)).cloned() else { continue };
++        let what = if f.kind == fates_rando::Kind::Person { "chapter people" } else { "placements" };
++        let now = stored_at(&mut system.memory, f.kind, &name);
++        let base = match now {
++            Some(b) if Some(b) != before => b,
++            _ => {
++                if left == 0 {
++                    notice(system, format!("{name}: {what} kept original (the game made no system call after storing the file)"));
++                } else {
++                    system.rando.waits.push((name, i, before, left - 1));
++                }
++                continue;
++            }
++        };
++        let Some(gd) = fates_rando::gamedata_start(&mut system.memory) else {
++            if left == 0 {
++                notice(system, format!("{name}: {what} kept original (GameData was not found in memory)"));
++            } else {
++                system.rando.waits.push((name, i, before, left - 1));
++            }
++            continue;
++        };
++        match fates_rando::apply_file(&mut system.memory, &f, base, gd, false) {
++            // the round-59 wording for placement files is kept (robots read it)
++            Ok(n) => log::info!("fates_rando: {name}: {n} {} cells laid in memory at a system call after the read (frame {})",
++                                if f.kind == fates_rando::Kind::Person { "chapter people" } else { "placement" }, system.frames),
++            Err(bad) => notice(system, format!("{name}: {what} kept original ({} cells differ, first: {})",
++                                               bad.len(), bad[0])),
++        }
+     }
+ }
+ 
+-- 
+

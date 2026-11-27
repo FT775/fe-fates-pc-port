@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr:BattleInfo,info,high,"map::BattleCalculator::InitializeProgress 0x00362830 and CalculateAttackSingle 0x00363354 read the four sides through it",
+0x004,0x10,s32[4],hp,high,"InitializeProgress 0x00362838 copies each side unit's current HP (Unit +0xF3) here",side_0|side_1|side_2|side_3
+0x014,0x10,s32[4],gauge,high,"InitializeProgress 0x00362844 copies each side unit's guard_gauge here; CalculateAttackSingle 0x00364530.. updates it per strike; ProcSequence::UpdateHp stores it back",side_0|side_1|side_2|side_3
+0x024,0x10,u32[4],side_flags,medium,"CalculateAttackSingle 0x00363810 and 0x003648A8 set per-strike flags of each side here (0x2200 on a pair block); meaning per bit not traced",side_0|side_1|side_2|side_3

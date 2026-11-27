@@ -1,0 +1,7 @@
+offset,size,type,name,confidence,evidence
+0x00,4,str:self,tutid,high,record label = this string (TUTID_); Tutorial::Get(const char*) 004F33FC
+0x04,2,s16,tutorial_number,high,anonymous_namespace::TutorialSetFlag / TutorialShow / sortie::CreateTopMenu read +0x4 (s16; the tutorial-seen flag number); equals the record index
+0x06,2,s16,variant,medium,Tutorial::GetFileName 00546B00 and GetMessage 0054699C read +0x6 (s16): 1..3 pick a file-name suffix from game settings; values 0-3
+0x08,4,str,mtutid_name,high,Tutorial::GetName 00546C88 reads +0x8 (MTUTID_ message)
+0x0C,4,str,mtutid_help,high,Tutorial::GetHelp 00546C60 / GetMessage / GetPageNum read +0xC (MTUTID_H_ message; pages)
+0x10,4,str,file_name,high,Tutorial::GetFileName reads +0x10 (picture file base name)

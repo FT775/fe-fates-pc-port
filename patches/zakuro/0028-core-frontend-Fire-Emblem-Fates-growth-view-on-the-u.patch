@@ -1,0 +1,1040 @@
+From 60bd55f3935c5d828e7cdc40ddfe47f9a67abec2 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Sat, 21 Nov 2026 19:35:07 -0500
+Subject: [PATCH 28/28] core: frontend: Fire Emblem Fates: growth view on the
+ unit panel; the save-read and New Game gates are the army, not the camera
+ byte
+
+Growth view (F-049): on the bottom screen's unit panel (ViewerUnitStatus, shown
+by ProcGameInfo), Select (Back on a pad; Tab in the window, instead of fast
+forward while the panel is shown) or a touch on the panel's Growths button
+swaps the eight stat numbers for the unit's total growth percents (personal,
+with an avatar's boon/bane and a child's parent average, + class; no Aptitude),
+read from the tables in memory, so a randomized game shows its laid values.
+The full page gets the percents in place of its numbers; the short ("Rating")
+page gets a small table. Painted into the host's copy of the bottom picture
+only (read_screen_scaled; the window takes the panel from the pixels while it
+is shown); nothing writes guest memory. Select and the button's touch are kept
+from the game only while the panel is shown. Fates and mods on its title id
+(Seal of Flames), randomizer on or off.
+
+Camera gate (goal 7): fates_rando_session::at_title and NewGameWatch read
+GameConfigData +0xB, which is the map camera angle option. at_title is now "no
+player army" (fates_nuzlocke::in_game); NewGameWatch fires when the mode word
+changes with no army in this frame and the one before and the rest of the
+options block unchanged in this frame and the one before (a battle save's load
+changes the block a frame before its word). Each save read logs which way it
+went. Applies after 0027.
+---
+ crates/zakuro-core/src/fates_growth_view.rs   | 607 ++++++++++++++++++
+ crates/zakuro-core/src/fates_rando.rs         | 100 +--
+ crates/zakuro-core/src/fates_rando_session.rs |  83 ++-
+ crates/zakuro-core/src/lib.rs                 |  39 ++
+ crates/zakuro/src/lib.rs                      |  12 +-
+ 5 files changed, 783 insertions(+), 58 deletions(-)
+ create mode 100644 crates/zakuro-core/src/fates_growth_view.rs
+
+diff --git a/crates/zakuro-core/src/fates_growth_view.rs b/crates/zakuro-core/src/fates_growth_view.rs
+new file mode 100644
+index 0000000..d96ca26
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_growth_view.rs
+@@ -0,0 +1,607 @@
++//! Fire Emblem Fates: the growth view on the unit panel (round 62, owner pick F-049).
++//!
++//! On the bottom screen's unit panel (`ViewerUnitStatus`), Select (Tab on the keyboard, Back on
++//! a pad; the frontend calls `toggle`) or a touch on the panel's Growths button swaps the eight
++//! stat numbers for the unit's total growth percents (personal + class) and back. Move does not
++//! grow and keeps its number. It works for Fire Emblem Fates and for a mod on its title id (Seal
++//! of Flames), with the randomizer on or off: the percents are read from the tables in memory,
++//! so a randomized game shows its laid values.
++//!
++//! Nothing here writes guest memory. While the panel is not shown, Select and touches reach the
++//! game unchanged. Select and a touch on the Growths button are kept from the game only while the
++//! panel is shown (the game's own code never reads Select there: no recorded route presses it).
++//! The numbers are painted into the host's copy of the bottom picture (`System::read_screen_scaled`),
++//! only when the picture shows the panel (its book and grid buttons, checked pixel by pixel). On the
++//! full page the stat numbers are replaced in place; on the short ("Rating") page, which draws no
++//! stat numbers, a small table of the eight percents goes over the portrait's lower part.
++//!
++//! Game facts (ARM code of the game, read only, round 62 core track):
++//! - `ProcGameInfo` lives at `*0x006D526C` (`ProcGameInfo::Create` 0x001BBD90). Its byte +0x30 is the
++//!   viewer shown (`ProcGameInfo::ChangeViewer` 0x001BB7FC; `GetCurrentUnit` 0x001BBA4C): 1 = the
++//!   unit panel at +0x34, 2 = a second unit panel at +0x7E8, 3 = the situation view, 0 = none.
++//!   `ProcGameInfo::Tick` 0x001BBC68 skips every viewer while its words +0x1058 or +0x105C are above 0.
++//! - `ViewerUnitStatus::SetUnit` 0x001F5BC0 keeps the unit at +0x8 of the panel.
++//! - `Unit::GetGrow` 0x005330B4: Person (+0x9C) growth +0x40[s]; avatar (+0xB0 Edit): + boon
++//!   growth (Personality(+0x1A) +0x14[s]) + bane growth (Personality(+0x1B) +0x2C[s]); child
++//!   (+0xB4 Family, both records set, Person.family_index +0x2A set): (rate + parent's rate) / 2
++//!   toward zero (`unit::Family::GetGrow` 0x0053B6CC, `ParentSingle::GetGrow` 0x0053B740); then
++//!   + Job (+0xA0) growth +0x24[s] when Person.unit_kind (+0x34) is 1, else enemy growth +0x2C[s];
++//!   + 10 with the Aptitude skill (not shown here: the owner's view is personal + class).
++//! - `Personality::Get` 0x001A0B1C: `*0x006D3B98 + 0x40 * i`. `Person::Get(u16)` 0x0044A6F8: the
++//!   block list at `*0x006D3B28`. `Person::IsFemale` 0x0053ED90: Person's first 8 bytes and the
++//!   mask cached at 0x006D3B70 (made once, guard bit 0 of 0x006D3B2C).
++
++use crate::fates_rando::Guest;
++use crate::services::hid::{InputState, PadState};
++
++pub const PROC_GAME_INFO: u32 = 0x006D_526C;
++const PERSONALITY: u32 = 0x006D_3B98;
++const PERSON_LIST: u32 = 0x006D_3B28;
++const FEMALE_GUARD: u32 = 0x006D_3B2C;
++const FEMALE_MASK: u32 = 0x006D_3B70;
++
++/// the stat order of the game: hp, str, mag, skl, spd, lck, def, res.
++pub const STATS: usize = 8;
++
++/// where each stat's number is on the bottom screen (native 320x240): (left, top, right, bottom),
++/// right-aligned digits. HP is the big current-HP number.
++const HP_BOX: (u32, u32, u32, u32) = (149, 25, 227, 52);
++const SMALL: [(u32, u32); 7] = [
++    // (column right edge, row top) for str, mag, skl, spd, lck, def, res
++    (52, 163), (52, 180), (52, 197), (102, 163), (102, 180), (102, 197), (102, 214),
++];
++/// the Growths button (native): left, top, right, bottom.
++pub const BUTTON: (u16, u16, u16, u16) = (2, 146, 50, 159);
++
++const CREAM: [u8; 3] = [255, 233, 167];
++
++#[derive(Debug, Default)]
++pub struct GrowthView {
++    /// the view is on: the panel shows growths
++    pub on: bool,
++    select_held: bool,
++    touch_held: bool,
++    /// times the view was switched (for tests and the robot's log)
++    pub toggles: u32,
++}
++
++/// the unit on the panel while the game shows the unit panel, or None.
++pub fn panel_unit(g: &mut dyn Guest) -> Option<u32> {
++    let info = g.r32(PROC_GAME_INFO).filter(|&p| p != 0)?;
++    if !g.readable(info.wrapping_add(0x30), 1) {
++        return None;
++    }
++    let mut kind = [0u8; 1];
++    g.read(info.wrapping_add(0x30), &mut kind);
++    let viewer = match kind[0] {
++        1 => info.wrapping_add(0x34),
++        2 => info.wrapping_add(0x7E8),
++        _ => return None,
++    };
++    let busy = |g: &mut dyn Guest, off: u32| g.r32(info.wrapping_add(off)).map(|v| v as i32 > 0).unwrap_or(true);
++    if busy(g, 0x1058) || busy(g, 0x105C) {
++        return None;
++    }
++    let unit = g.r32(viewer.wrapping_add(8)).filter(|&u| u != 0)?;
++    // a unit has its person and its class
++    g.r32(unit.wrapping_add(0x9C)).filter(|&p| p != 0)?;
++    g.r32(unit.wrapping_add(0xA0)).filter(|&j| j != 0)?;
++    Some(unit)
++}
++
++fn s8(g: &mut dyn Guest, addr: u32) -> Option<i32> {
++    if !g.readable(addr, 1) {
++        return None;
++    }
++    let mut b = [0u8; 1];
++    g.read(addr, &mut b);
++    Some(b[0] as i8 as i32)
++}
++
++fn u8_(g: &mut dyn Guest, addr: u32) -> Option<u32> {
++    s8(g, addr).map(|v| v as u8 as u32)
++}
++
++fn u16_(g: &mut dyn Guest, addr: u32) -> Option<u32> {
++    if !g.readable(addr, 2) {
++        return None;
++    }
++    let mut b = [0u8; 2];
++    g.read(addr, &mut b);
++    Some(u16::from_le_bytes(b) as u32)
++}
++
++fn personality(g: &mut dyn Guest, i: u32) -> Option<u32> {
++    g.r32(PERSONALITY).filter(|&t| t != 0).map(|t| t.wrapping_add(i << 6))
++}
++
++/// `Person::Get(u16)`: the record of index i in the block list (the first block's first record
++/// when no block holds it, as the game).
++pub fn person_get(g: &mut dyn Guest, i: u32) -> Option<u32> {
++    let head = g.r32(PERSON_LIST).filter(|&h| h != 0)?;
++    let mut node = head;
++    for _ in 0..64 {
++        let block = g.r32(node)?;
++        let first = u16_(g, block.wrapping_add(0x34))?;
++        let count = u16_(g, block.wrapping_add(4))?;
++        if i >= first && i < first + count {
++            return Some(block.wrapping_add(0x10 + 0x98 * (i - first)));
++        }
++        match g.r32(node.wrapping_add(8)) {
++            Some(next) if next != 0 => node = next,
++            _ => break,
++        }
++    }
++    g.r32(head).map(|b| b.wrapping_add(0x10))
++}
++
++/// `Person::IsFemale`: None when the game has not made its mask yet.
++fn is_female(g: &mut dyn Guest, person: u32) -> Option<bool> {
++    let guard = g.r32(FEMALE_GUARD)?;
++    if guard & 1 == 0 {
++        return None;
++    }
++    let lo = g.r32(FEMALE_MASK)?;
++    let hi = g.r32(FEMALE_MASK + 4)?;
++    let a = g.r32(person)?;
++    let b = g.r32(person.wrapping_add(4))?;
++    Some(a & lo != 0 || b & hi != 0)
++}
++
++/// `unit::Family::ParentSingle::GetGrow`: one parent record's rate for stat s (never below 0).
++fn parent_single(g: &mut dyn Guest, rec: u32, s: u32) -> Option<i32> {
++    let p = g.r32(rec)?;
++    if p == 0 {
++        return Some(0);
++    }
++    let (bi, ni) = (u8_(g, rec.wrapping_add(5))?, u8_(g, rec.wrapping_add(4))?);
++    let bane = personality(g, bi)?;
++    let boon = personality(g, ni)?;
++    let mut v = s8(g, boon + 0x14 + s)? + s8(g, p + 0x40 + s)? + s8(g, bane + 0x2C + s)?;
++    let (g1, g2) = (g.r32(rec.wrapping_add(8))?, g.r32(rec.wrapping_add(12))?);
++    let fidx = u16_(g, p + 0x2A)?;
++    if g1 != 0 && g2 != 0 && fidx != 0 {
++        if let Some(fixed) = person_get(g, fidx) {
++            let gp = if is_female(g, fixed)? { g1 } else { g2 };
++            let x = s8(g, gp + 0x40 + s)? + v;
++            v = x / 2; // toward zero, as the game's (x + (x >>> 31)) >> 1
++        }
++    }
++    Some(v.max(0))
++}
++
++/// the unit's total growth for stat s: personal (with the avatar's boon and bane, and a child's
++/// parent average) + class, as `Unit::GetGrow` without the Aptitude skill.
++pub fn total_growth(g: &mut dyn Guest, unit: u32, s: u32) -> Option<i32> {
++    let person = g.r32(unit.wrapping_add(0x9C)).filter(|&p| p != 0)?;
++    let job = g.r32(unit.wrapping_add(0xA0)).filter(|&j| j != 0)?;
++    let mut rate = s8(g, person + 0x40 + s)?;
++    let edit = g.r32(unit.wrapping_add(0xB0))?;
++    if edit != 0 {
++        let (ni, bi) = (u8_(g, edit + 0x1A)?, u8_(g, edit + 0x1B)?);
++        let boon = personality(g, ni)?;
++        let bane = personality(g, bi)?;
++        rate += s8(g, boon + 0x14 + s)? + s8(g, bane + 0x2C + s)?;
++    }
++    let fam = g.r32(unit.wrapping_add(0xB4))?;
++    if fam != 0 {
++        let (r0, r1) = (g.r32(fam)?, g.r32(fam + 0x14)?);
++        let fidx = u16_(g, person + 0x2A)?;
++        if r0 != 0 && r1 != 0 && fidx != 0 {
++            if let Some(fixed) = person_get(g, fidx) {
++                let rec = if is_female(g, fixed)? { fam } else { fam + 0x14 };
++                let x = parent_single(g, rec, s)? + rate;
++                rate = x / 2;
++            }
++        }
++    }
++    let kind = u8_(g, person + 0x34)?;
++    rate += s8(g, job + if kind == 1 { 0x24 } else { 0x2C } + s)?;
++    Some(rate)
++}
++
++/// all eight totals of the unit.
++pub fn totals(g: &mut dyn Guest, unit: u32) -> Option<[i32; STATS]> {
++    let mut out = [0; STATS];
++    for (s, v) in out.iter_mut().enumerate() {
++        *v = total_growth(g, unit, s as u32)?;
++    }
++    Some(out)
++}
++
++fn in_button((x, y): (u16, u16)) -> bool {
++    x >= BUTTON.0 && x <= BUTTON.2 && y >= BUTTON.1 && y <= BUTTON.3
++}
++
++impl GrowthView {
++    /// switches the view (the frontend's Tab); true when the panel is shown and it switched.
++    pub fn toggle(&mut self, g: &mut dyn Guest) -> bool {
++        if panel_unit(g).is_none() {
++            return false;
++        }
++        self.on = !self.on;
++        self.toggles += 1;
++        log::info!("growth view {}", if self.on { "on" } else { "off" });
++        true
++    }
++
++    /// the input the game gets: while the panel is shown, a Select press or a touch on the
++    /// Growths button switches the view and is kept from the game (held until let go).
++    pub fn filter_input(&mut self, g: &mut dyn Guest, input: &mut InputState) {
++        let select = input.buttons.contains(PadState::SELECT);
++        let touch_in = input.touch.is_some_and(in_button);
++        let fresh_select = select && !self.select_held;
++        let fresh_touch = touch_in && !self.touch_held && input.touch.is_some();
++        let wanted = (select && self.select_held) || (input.touch.is_some() && self.touch_held) || fresh_select || fresh_touch;
++        if !wanted {
++            self.select_held = false;
++            self.touch_held = false;
++            return;
++        }
++        if fresh_select || fresh_touch {
++            if self.toggle(g) {
++                self.select_held |= fresh_select;
++                self.touch_held |= fresh_touch;
++            }
++        }
++        if !select {
++            self.select_held = false;
++        }
++        if input.touch.is_none() {
++            self.touch_held = false;
++        }
++        if self.select_held {
++            input.buttons.remove(PadState::SELECT);
++        }
++        if self.touch_held {
++            input.touch = None;
++        }
++    }
++
++    /// paints the Growths button, and the percents while the view is on, into the bottom
++    /// picture (RGBA, `width` x `height`, a whole multiple of 320 x 240), only when the picture
++    /// shows the panel's stat block. True when it painted.
++    pub fn paint(&self, g: &mut dyn Guest, pixels: &mut [u8], width: u32, height: u32) -> bool {
++        let scale = width / 320;
++        if scale == 0 || height / 240 != scale || pixels.len() < (width * height * 4) as usize {
++            return false;
++        }
++        let Some(unit) = panel_unit(g) else { return false };
++        let mut pic = Pic { px: pixels, width, scale };
++        if !pic.shows_frame() {
++            return false;
++        }
++        let full = pic.shows_panel();
++        if self.on && !full {
++            // the short page (the game's "Rating" page draws no stat numbers): a small table of
++            // the eight percents over the portrait's lower part
++            let Some(t) = totals(g, unit) else { return false };
++            pic.table(&t);
++        } else if self.on {
++            let Some(t) = totals(g, unit) else { return false };
++            // HP: the big number, as "NN%"
++            pic.clear(HP_BOX, 148);
++            let text = format!("{}%", t[0]);
++            pic.text(&text, HP_BOX.2 - 2, HP_BOX.1 + 3, 3, CREAM, true);
++            for (i, &(right, top)) in SMALL.iter().enumerate() {
++                let left = right - 18;
++                pic.clear((left, top, right, top + 11), left);
++                pic.text(&t[i + 1].to_string(), right - 1, top + 2, 1, CREAM, true);
++            }
++        }
++        pic.button(self.on);
++        true
++    }
++}
++
++struct Pic<'a> {
++    px: &'a mut [u8],
++    width: u32,
++    scale: u32,
++}
++
++impl Pic<'_> {
++    fn at(&self, x: u32, y: u32) -> [u8; 3] {
++        let (x, y) = (x * self.scale + self.scale / 2, y * self.scale + self.scale / 2);
++        let i = ((y * self.width + x) * 4) as usize;
++        [self.px[i], self.px[i + 1], self.px[i + 2]]
++    }
++
++    fn set(&mut self, x: u32, y: u32, c: [u8; 3]) {
++        if x >= 320 || y >= 240 {
++            return;
++        }
++        for dy in 0..self.scale {
++            for dx in 0..self.scale {
++                let i = (((y * self.scale + dy) * self.width + x * self.scale + dx) * 4) as usize;
++                self.px[i..i + 3].copy_from_slice(&c);
++                self.px[i + 3] = 255;
++            }
++        }
++    }
++
++    /// the unit panel's frame: its book button and its grid button (both pages, every unit;
++    /// measured on robot pictures of round 62, Fates and Seal of Flames).
++    fn shows_frame(&self) -> bool {
++        let near = |c: [u8; 3], w: [u8; 3]| c.iter().zip(w).all(|(&a, b)| a.abs_diff(b) <= 14);
++        [((296, 222), [141, 75, 17]), ((316, 236), [145, 62, 13]), ((300, 218), [255, 223, 157]),
++         ((312, 224), [255, 233, 165]), ((306, 228), [249, 200, 142]), ((20, 222), [245, 179, 129]),
++         ((30, 228), [230, 172, 123]), ((14, 218), [161, 79, 21])]
++            .iter()
++            .all(|&((x, y), w)| near(self.at(x, y), w))
++    }
++
++    /// the eight percents as a table (the short page): HP Str Mag Skl | Spd Lck Def Res.
++    fn table(&mut self, t: &[i32; STATS]) {
++        let (l, top, r, b) = (2u32, 161u32, 108u32, 209u32);
++        for y in top..=b {
++            for x in l..=r {
++                let edge = y == top || y == b || x == l || x == r;
++                self.set(x, y, if edge { CREAM } else { [92, 52, 24] });
++            }
++        }
++        let names = ["HP", "Str", "Mag", "Skl", "Spd", "Lck", "Def", "Res"];
++        for (i, name) in names.iter().enumerate() {
++            let (col, row) = ((i / 4) as u32, (i % 4) as u32);
++            let y = top + 4 + 11 * row;
++            self.text(name, l + 4 + 53 * col, y, 1, CREAM, false);
++            self.text(&t[i].to_string(), l + 50 + 53 * col, y, 1, CREAM, true);
++        }
++    }
++
++    /// the panel's stat block: its labels' cream strokes and its boxes' orange (both stay the
++    /// same for every unit; measured on robot pictures of rounds 60-61).
++    fn shows_panel(&self) -> bool {
++        let cream = |c: [u8; 3]| c[0] >= 235 && c[1] >= 200 && c[2] >= 130 && c[2] <= 200;
++        let orange = |c: [u8; 3]| c[0] >= 170 && c[0] <= 225 && c[1] >= 95 && c[1] <= 140 && c[2] <= 75;
++        let labels = [(10, 164), (58, 215), (59, 215), (7, 185), (12, 185), (58, 198), (59, 198)];
++        let boxes = [(30, 168), (80, 168), (30, 202), (80, 219), (30, 185), (80, 185)];
++        labels.iter().all(|&(x, y)| cream(self.at(x, y))) && boxes.iter().all(|&(x, y)| orange(self.at(x, y)))
++    }
++
++    /// fills each line of the box with the colour at its column `from` (the box's own shading).
++    fn clear(&mut self, (l, t, r, b): (u32, u32, u32, u32), from: u32) {
++        for y in t..=b {
++            let c = self.at(from, y);
++            for x in l..=r {
++                self.set(x, y, c);
++            }
++        }
++    }
++
++    /// text at the given right edge (or left when !right) and top, in 5x7 glyphs grown by `big`.
++    fn text(&mut self, s: &str, x: u32, top: u32, big: u32, c: [u8; 3], right: bool) {
++        let w = (s.chars().count() as u32 * 6).saturating_sub(1) * big;
++        let mut cx = if right { x + 1 - w } else { x };
++        for ch in s.chars() {
++            let rows = glyph(ch);
++            for (ry, row) in rows.iter().enumerate() {
++                for rx in 0..5 {
++                    if row & (0x10 >> rx) != 0 {
++                        for by in 0..big {
++                            for bx in 0..big {
++                                self.set(cx + rx * big + bx, top + ry as u32 * big + by, c);
++                            }
++                        }
++                    }
++                }
++            }
++            cx += 6 * big;
++        }
++    }
++
++    fn button(&mut self, on: bool) {
++        let (l, t, r, b) = (BUTTON.0 as u32, BUTTON.1 as u32, BUTTON.2 as u32, BUTTON.3 as u32);
++        let fill = if on { [196, 113, 39] } else { [92, 52, 24] };
++        for y in t..=b {
++            for x in l..=r {
++                let edge = y == t || y == b || x == l || x == r;
++                self.set(x, y, if edge { CREAM } else { fill });
++            }
++        }
++        self.text("Growths", l + 4, t + 3, 1, CREAM, false);
++    }
++}
++
++/// 5x7 glyphs, one byte per row, bit 4 = left column.
++fn glyph(c: char) -> [u8; 7] {
++    match c {
++        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
++        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
++        '2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
++        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
++        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
++        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
++        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
++        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
++        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
++        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
++        '%' => [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03],
++        '-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
++        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
++        'r' => [0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10],
++        'o' => [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E],
++        'w' => [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A],
++        't' => [0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06],
++        'h' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11],
++        's' => [0x00, 0x00, 0x0E, 0x10, 0x0E, 0x01, 0x1E],
++        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
++        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
++        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
++        'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
++        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
++        'D' => [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C],
++        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
++        'a' => [0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F],
++        'g' => [0x00, 0x0F, 0x11, 0x11, 0x0F, 0x01, 0x0E],
++        'k' => [0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12],
++        'l' => [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
++        'p' => [0x00, 0x00, 0x1E, 0x11, 0x1E, 0x10, 0x10],
++        'd' => [0x01, 0x01, 0x0D, 0x13, 0x11, 0x11, 0x0F],
++        'c' => [0x00, 0x00, 0x0E, 0x10, 0x10, 0x11, 0x0E],
++        'e' => [0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0E],
++        'f' => [0x06, 0x09, 0x08, 0x1C, 0x08, 0x08, 0x08],
++        _ => [0; 7],
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn w32(&mut self, at: u32, v: u32) {
++            self.write(at, &v.to_le_bytes());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++        }
++    }
++
++    const INFO: u32 = 0x3000_0000;
++    const UNIT: u32 = 0x3100_0000;
++    const PERSON: u32 = 0x3200_0000;
++    const JOB: u32 = 0x3300_0000;
++    const PERS: u32 = 0x3400_0000;
++    const EDIT: u32 = 0x3500_0000;
++
++    /// a game with the unit panel up (kind 1), a playable unit (unit_kind 1)
++    fn game() -> Fake {
++        let mut m = Fake::default();
++        m.put(0x006D_3000, &vec![0; 0x3000]); // globals 0x006D3000..0x006D6000
++        m.put(INFO, &vec![0; 0x1100]);
++        m.put(UNIT, &vec![0; 0x140]);
++        m.put(PERSON, &vec![0; 0x98]);
++        m.put(JOB, &vec![0; 0x100]);
++        m.put(PERS, &vec![0; 0x40 * 9]);
++        m.put(EDIT, &vec![0; 0x40]);
++        m.w32(PROC_GAME_INFO, INFO);
++        m.write(INFO + 0x30, &[1]);
++        m.w32(INFO + 0x34 + 8, UNIT);
++        m.w32(UNIT + 0x9C, PERSON);
++        m.w32(UNIT + 0xA0, JOB);
++        m.write(PERSON + 0x34, &[1]);
++        m.write(PERSON + 0x40, &[45, 50, 0, 40, 45, 45, 35, 25]);
++        m.write(JOB + 0x24, &[10, 15, 0, 10, 10, 5, 10, 5]);
++        m.write(JOB + 0x2C, &[60, 60, 60, 60, 60, 60, 60, 60]);
++        m.w32(PERSONALITY, PERS);
++        m
++    }
++
++    #[test]
++    fn the_total_is_personal_plus_class() {
++        let mut m = game();
++        assert_eq!(panel_unit(&mut m), Some(UNIT));
++        assert_eq!(totals(&mut m, UNIT), Some([55, 65, 0, 50, 55, 50, 45, 30]));
++        // an enemy (unit_kind 0) takes the class's enemy growths
++        m.write(PERSON + 0x34, &[0]);
++        assert_eq!(totals(&mut m, UNIT).unwrap()[2], 60);
++    }
++
++    #[test]
++    fn the_avatar_adds_boon_and_bane() {
++        let mut m = game();
++        m.w32(UNIT + 0xB0, EDIT);
++        m.write(EDIT + 0x1A, &[2]); // boon 2
++        m.write(EDIT + 0x1B, &[3]); // bane 3
++        m.write(PERS + 2 * 0x40 + 0x14 + 1, &[15]); // boon +15 str
++        m.write(PERS + 3 * 0x40 + 0x2C + 1, &[-5i8 as u8]); // bane -5 str
++        assert_eq!(total_growth(&mut m, UNIT, 1), Some(75));
++    }
++
++    #[test]
++    fn no_panel_no_view() {
++        let mut m = game();
++        m.write(INFO + 0x30, &[3]);
++        assert_eq!(panel_unit(&mut m), None);
++        m.write(INFO + 0x30, &[2]);
++        assert_eq!(panel_unit(&mut m), None); // the second panel holds no unit here
++        m.w32(INFO + 0x7E8 + 8, UNIT);
++        assert_eq!(panel_unit(&mut m), Some(UNIT));
++        m.w32(INFO + 0x1058, 1);
++        assert_eq!(panel_unit(&mut m), None);
++        let mut v = GrowthView::default();
++        assert!(!v.toggle(&mut m));
++        assert!(!v.on);
++    }
++
++    #[test]
++    fn select_switches_once_per_press_and_is_kept_from_the_game_only_on_the_panel() {
++        let mut m = game();
++        let mut v = GrowthView::default();
++        let press = |b: PadState| InputState { buttons: b, ..Default::default() };
++        let mut i = press(PadState::SELECT | PadState::A);
++        v.filter_input(&mut m, &mut i);
++        assert!(v.on);
++        assert_eq!(i.buttons, PadState::A);
++        let mut i = press(PadState::SELECT);
++        v.filter_input(&mut m, &mut i); // still held: no second switch
++        assert!(v.on);
++        assert!(i.buttons.is_empty());
++        let mut i = press(PadState::empty());
++        v.filter_input(&mut m, &mut i);
++        let mut i = press(PadState::SELECT);
++        v.filter_input(&mut m, &mut i);
++        assert!(!v.on);
++        assert_eq!(v.toggles, 2);
++        // no panel: Select reaches the game, nothing switches
++        let mut i = press(PadState::empty());
++        v.filter_input(&mut m, &mut i);
++        m.write(INFO + 0x30, &[0]);
++        let mut i = press(PadState::SELECT);
++        v.filter_input(&mut m, &mut i);
++        assert_eq!(i.buttons, PadState::SELECT);
++        assert!(!v.on);
++    }
++
++    #[test]
++    fn the_button_switches_and_its_touch_is_kept_from_the_game() {
++        let mut m = game();
++        let mut v = GrowthView::default();
++        let mut i = InputState { touch: Some((20, 150)), ..Default::default() };
++        v.filter_input(&mut m, &mut i);
++        assert!(v.on);
++        assert_eq!(i.touch, None);
++        // a touch elsewhere reaches the game
++        let mut i = InputState::default();
++        v.filter_input(&mut m, &mut i);
++        let mut i = InputState { touch: Some((200, 150)), ..Default::default() };
++        v.filter_input(&mut m, &mut i);
++        assert_eq!(i.touch, Some((200, 150)));
++        assert!(v.on);
++    }
++
++    #[test]
++    fn paints_only_over_the_panel() {
++        let mut m = game();
++        let v = GrowthView { on: true, ..Default::default() };
++        let mut px = vec![0u8; 320 * 240 * 4];
++        assert!(!v.paint(&mut m, &mut px, 320, 240)); // a black picture is not the panel
++        assert!(px.iter().all(|&b| b == 0));
++    }
++}
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 1c064b4..5a108e6 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -409,12 +409,23 @@ fn is_resident(kind: Kind) -> bool {
+ pub const GAME_CONFIG: u32 = 0x006D_A0F8;
+ 
+ /// Watches for the New Game mode pick: the frame in which `GameConfigData`'s word at +4
+-/// changes while its byte at +0xB stays 1. Robot runs of round 50 (docs/RANDOMIZER_INGAME.md,
+-/// T1): a new game (Casual) changes the word at frame 4019 of the recorded route with +0xB
+-/// still 1; loading a save changes the same word in the same frame as +0xB goes to 0.
++/// (`StartFromBeginning`) changes while no game is loaded (the unit pool holds no player army,
++/// `fates_nuzlocke::in_game`, in this frame and the one before) and the rest of the options block
++/// (+0x8 .. +0x17) stayed the same in this frame and the one before.
++///
++/// Round 62: rounds 50-61 used the block's byte +0xB as "no chapter going on", but that byte is
++/// the map camera angle option (`CameraBase::GetGameConfigAngle` 0x003E06E0; `GameConfigData::Reset`
++/// sets it to 1), so a game played with the default angle looked like the title. Robot runs of
++/// round 50 (docs/RANDOMIZER_INGAME.md, T1): a new game (Casual) changes the word at frame 4019 of
++/// the recorded route; loading a save changes it as the save's block is read. A battle save loaded
++/// from the title changes the rest of the block one frame before its word (round 58, frames
++/// 1266-1267 of every battle-save reload): that is a load, not a pick, whatever the camera angle.
+ #[derive(Debug, Default)]
+ pub struct NewGameWatch {
+-    last: Option<(u32, u8)>,
++    /// the frame before: (word +4, bytes +0x8..+0x18, a game loaded)
++    last: Option<(u32, [u8; 16], bool)>,
++    /// whether the rest of the block changed between the two frames before
++    rest_moved: bool,
+ }
+ 
+ impl NewGameWatch {
+@@ -422,18 +433,21 @@ impl NewGameWatch {
+     pub fn after_frame(&mut self, g: &mut dyn Guest) -> bool {
+         let now = g.r32(GAME_CONFIG).filter(|&c| c != 0).and_then(|c| {
+             let w = g.r32(c.wrapping_add(4))?;
+-            let mut b = [0u8; 1];
+-            if !g.readable(c.wrapping_add(0xB), 1) {
++            if !g.readable(c.wrapping_add(8), 16) {
+                 return None;
+             }
+-            g.read(c.wrapping_add(0xB), &mut b);
+-            Some((w, b[0]))
++            let mut rest = [0u8; 16];
++            g.read(c.wrapping_add(8), &mut rest);
++            Some((w, rest, crate::fates_nuzlocke::in_game(g)))
+         });
+-        // +0xB at 1 in the frame before too: a battle save loaded from the title drops it to 0
+-        // for one frame (the chapter's placements coming back) and changes the word as it
+-        // goes back to 1 (round 58 robot check, frames 1266-1267 of every battle-save reload;
+-        // the old rule took that for a New Game and put the original tables back)
+-        let fired = matches!((self.last, now), (Some((w0, 1)), Some((w1, 1))) if w0 != w1);
++        let fired = match (self.last, now) {
++            (Some((w0, r0, false)), Some((w1, r1, false))) => w0 != w1 && r0 == r1 && !self.rest_moved,
++            _ => false,
++        };
++        self.rest_moved = match (self.last, now) {
++            (Some((_, r0, _)), Some((_, r1, _))) => r0 != r1,
++            _ => false,
++        };
+         self.last = now;
+         fired
+     }
+@@ -917,36 +931,48 @@ p 10 - 4a49445f41 g 100 -\nend 4\n";
+     fn new_game_watch_fires_once_on_the_pick_and_not_on_a_load() {
+         let mut m = Fake::default();
+         let cfg = |w: u32, b: u8| {
+-            let mut v = vec![0u8; 16];
++            let mut v = vec![0u8; 0x18];
+             v[4..8].copy_from_slice(&w.to_le_bytes());
+             v[0xB] = b;
+             v
+         };
+         m.put(GAME_CONFIG, &0x2300_0000u32.to_le_bytes());
+         m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
+-        let mut w = NewGameWatch::default();
+-        assert!(!w.after_frame(&mut m), "first look only remembers");
+-        assert!(!w.after_frame(&mut m));
+-        m.put(0x2300_0000, &cfg(0x4001_5EDE, 1)); // new game (frame 4019 of bt-prologue)
+-        assert!(w.after_frame(&mut m));
+-        assert!(!w.after_frame(&mut m));
+-        m.put(0x2300_0000, &cfg(0x4001_5EDE, 0)); // the chapter starts later
+-        assert!(!w.after_frame(&mut m));
+-        let mut w = NewGameWatch::default();
+-        m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
+-        w.after_frame(&mut m);
+-        m.put(0x2300_0000, &cfg(0x4001_5EDE, 0)); // a save loaded (frame 2839 of bt-ch2)
+-        assert!(!w.after_frame(&mut m));
+-        // a battle save loaded from the title: +0xB 0 for one frame, then the word changes as
+-        // it goes back to 1 (round 58, frames 1266-1267): a load, not a pick
+-        let mut w = NewGameWatch::default();
+-        m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
+-        w.after_frame(&mut m);
+-        m.put(0x2300_0000, &cfg(0x0001_1E5E, 0));
+-        assert!(!w.after_frame(&mut m));
+-        m.put(0x2300_0000, &cfg(0x4001_5EDE, 1));
+-        assert!(!w.after_frame(&mut m), "a battle save's load is not a New Game");
+-        assert!(!w.after_frame(&mut m));
++        // the unit pool: no army (every force empty)
++        m.put(crate::fates_nuzlocke::UNIT_POOL + 4, &0x2400_0000u32.to_le_bytes());
++        m.put(0x2400_0000, &[0u8; 120]);
++        let army = |m: &mut Fake, on: bool| m.write(0x2400_0000, &(if on { 0x2500_0000u32 } else { 0 }).to_le_bytes());
++        for angle in [0u8, 1, 2] {
++            // the camera angle option (+0xB) plays no part
++            let mut w = NewGameWatch::default();
++            m.put(0x2300_0000, &cfg(0x0001_1E5E, angle));
++            assert!(!w.after_frame(&mut m), "first look only remembers");
++            assert!(!w.after_frame(&mut m));
++            m.put(0x2300_0000, &cfg(0x4001_5EDE, angle)); // new game (frame 4019 of bt-prologue)
++            assert!(w.after_frame(&mut m), "angle {angle}");
++            assert!(!w.after_frame(&mut m));
++            army(&mut m, true); // Corrin joins; the chapter starts later
++            assert!(!w.after_frame(&mut m));
++            // in a game: the word changing is never a pick, nor is the angle changed in Options
++            m.put(0x2300_0000, &cfg(0x0001_1E5E, angle ^ 1));
++            assert!(!w.after_frame(&mut m));
++            m.put(0x2300_0000, &cfg(0x4001_5EDE, angle ^ 1));
++            assert!(!w.after_frame(&mut m));
++            army(&mut m, false);
++        }
++        // a battle save loaded from the title: the rest of the block changes one frame before
++        // the word (round 58, frames 1266-1267): a load, not a pick, at any angle
++        for angle in [0u8, 1, 2] {
++            let mut w = NewGameWatch::default();
++            m.put(0x2300_0000, &cfg(0x0001_1E5E, 1));
++            w.after_frame(&mut m);
++            w.after_frame(&mut m);
++            m.put(0x2300_0000, &cfg(0x0001_1E5E, 0));
++            assert!(!w.after_frame(&mut m));
++            m.put(0x2300_0000, &cfg(0x4001_5EDE, angle));
++            assert!(!w.after_frame(&mut m), "a battle save's load is not a New Game");
++            assert!(!w.after_frame(&mut m));
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 65f3405..fcfe1e9 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -375,11 +375,12 @@ impl Session {
+     /// original game put back, before the game parses a byte of it. Every open, not only
+     /// the first: the Load list may read every slot while the player browses.
+     ///
+-    /// Only while no chapter is going on (`at_title`: GameConfigData's byte +0xB still 1,
+-    /// as at the title and the mode pick; round 50, T1): a save menu inside the game may
+-    /// read every slot's file to show it, and that must not change the tables of the game
+-    /// being played. A load from the title reads the file before the game parses it, so
+-    /// the byte is still 1 then; Restart Chapter reads the same game's save inside it.
++    /// Only while no game is loaded (`at_title`: no player army, as at the title and the mode
++    /// pick; round 62, before it GameConfigData's byte +0xB, the camera angle): a save menu
++    /// inside the game may read every slot's file to show it, and that must not change the
++    /// tables of the game being played. A load from the title reads the file before the game
++    /// parses it, so the army is still empty then; Restart Chapter reads the same game's save
++    /// inside it.
+     pub fn save_read(&mut self, g: &mut dyn Guest, data: &Path, path: &str, at_title: bool) {
+         if fates_rando::slot_name(path).is_none() || !at_title {
+             return;
+@@ -866,17 +867,13 @@ pub fn before_svc(system: &mut System) {
+ 
+ // --------------------------------------------------------------------------- saves
+ 
+-/// no chapter is going on: GameConfigData's byte +0xB is 1 (or GameConfigData is not made
+-/// yet).
++/// no game is loaded: the unit pool holds no player army (`fates_nuzlocke::in_game`; the game
++/// empties every force in `ProcSequence::GameReset` before each title, a New Game puts Corrin in
++/// the army and a load fills it after its save is read). Round 62: rounds 50-61 read
++/// GameConfigData's byte +0xB here, which is the map camera angle option, so with the default
++/// angle a save menu inside a game looked like the title.
+ pub fn at_title(g: &mut dyn Guest) -> bool {
+-    let Some(cfg) = g.r32(fates_rando::GAME_CONFIG).filter(|&c| c != 0) else { return true };
+-    let at = cfg.wrapping_add(0xB);
+-    if !g.readable(at, 1) {
+-        return true;
+-    }
+-    let mut b = [0u8; 1];
+-    g.read(at, &mut b);
+-    b[0] == 1
++    !crate::fates_nuzlocke::in_game(g)
+ }
+ 
+ /// the game opened a save file to read it (file service): see `Session::save_read`.
+@@ -887,6 +884,9 @@ pub fn save_opened_for_read(system: &mut System, path: &str) {
+     let data = data_dir(system);
+     let before = system.rando.active();
+     let at_title = at_title(&mut system.memory);
++    // round 62: which way each slot read went (the camera-angle gate fix's robot check reads it)
++    log::info!("fates_rando: save {path} opened for read at frame {}: {}", system.frames,
++               if at_title { "no game loaded (its run is laid)" } else { "inside a game (nothing changes)" });
+     system.rando.save_read(&mut system.memory, &data, path, at_title);
+     if system.rando.active() != before {
+         refresh_placements(system);
+@@ -1378,9 +1378,10 @@ mod tests {
+         fn mem(&self) -> BTreeMap<u32, Vec<u8>> {
+             self.blocks.clone()
+         }
+-        /// GameConfigData's byte +0xB (1 = no chapter going on)
++        /// at the title: no player army (round 62; the unit pool's force 0 empty or not)
+         fn set_title(&mut self, title: bool) {
+-            self.blocks.get_mut(&0x2300_0000).unwrap()[0xB] = title as u8;
++            let head: u32 = if title { 0 } else { 0x2500_0000 };
++            self.blocks.get_mut(&0x2400_0000).unwrap()[0..4].copy_from_slice(&head.to_le_bytes());
+         }
+     }
+ 
+@@ -1414,10 +1415,13 @@ mod tests {
+         x[112..116].copy_from_slice(&GD_FILE.to_le_bytes());
+         m.blocks.insert(0x2000_0100, x);
+         m.blocks.insert(GAMEDATA_ARCHIVE, 0x2000_0000u32.to_le_bytes().to_vec());
+-        let mut cfg = vec![0u8; 16];
++        let mut cfg = vec![0u8; 0x18];
+         cfg[4..8].copy_from_slice(&0x0001_1E5Eu32.to_le_bytes());
+         cfg[0xB] = 1;
+         m.blocks.insert(0x2300_0000, cfg);
++        // the unit pool, every force empty (no game loaded)
++        m.blocks.insert(crate::fates_nuzlocke::UNIT_POOL + 4, 0x2400_0000u32.to_le_bytes().to_vec());
++        m.blocks.insert(0x2400_0000, vec![0u8; 120]);
+         m.blocks.insert(GAME_CONFIG, 0x2300_0000u32.to_le_bytes().to_vec());
+         m
+     }
+@@ -1486,7 +1490,7 @@ end 0
+         queue_answer_session(&mut s, answer);
+         assert_eq!(s.frame(&mut m), Pick::None, "no pick yet");
+         assert_eq!(m.writes, 0, "the watch only reads");
+-        // the mode pick (word +4 changes, +0xB still 1)
++        // the mode pick (word +4 changes, no army)
+         m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&0x4001_5EDEu32.to_le_bytes());
+         let pick = s.frame(&mut m);
+         assert_eq!(pick, Pick::Answer(Some(answer.to_string())));
+@@ -1593,6 +1597,47 @@ end 0
+         let _ = std::fs::remove_dir_all(&data);
+     }
+ 
++    #[test]
++    fn the_camera_angle_is_not_the_title() {
++        // round 62: GameConfigData +0xB is the map camera angle option (0, 1 or 2)
++        let mut m = game();
++        for angle in [0u8, 1, 2] {
++            m.blocks.get_mut(&0x2300_0000).unwrap()[0xB] = angle;
++            m.set_title(true);
++            assert!(at_title(&mut m), "angle {angle}: no army is the title");
++            m.set_title(false);
++            assert!(!at_title(&mut m), "angle {angle}: a game is loaded");
++        }
++        // a save menu inside a game with the default angle reads another game's slot: the
++        // tables stay those of the game being played
++        let data = top("camera");
++        made(&data, "rA", 9);
++        made(&data, "rB", 11);
++        fates_rando::slot_written(&data, "/Chapter0", Some("rA")).unwrap();
++        fates_rando::slot_written(&data, "/Chapter1", Some("rB")).unwrap();
++        let mut m = game();
++        let mut s = Session::default();
++        let t = at_title(&mut m);
++        s.save_read(&mut m, &data, "/Chapter0", t);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")));
++        m.set_title(false);
++        m.blocks.get_mut(&0x2300_0000).unwrap()[0xB] = 1;
++        let writes = m.writes;
++        let t = at_title(&mut m);
++        s.save_read(&mut m, &data, "/Chapter1", t);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")));
++        assert_eq!(m.writes, writes);
++        // the angle changed in Options inside the game: no New Game, nothing laid
++        queue_answer_session(&mut s, r#"{"randomizer": false}"#);
++        s.frame(&mut m);
++        m.blocks.get_mut(&0x2300_0000).unwrap()[0xB] = 2;
++        assert_eq!(s.frame(&mut m), Pick::None);
++        m.blocks.get_mut(&0x2300_0000).unwrap()[4..8].copy_from_slice(&0x4001_5EDEu32.to_le_bytes());
++        assert_eq!(s.frame(&mut m), Pick::None);
++        assert_eq!((gd_value(&m), s.active().as_deref()), (9, Some("rA")));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
+     #[test]
+     fn a_save_read_before_gamedata_is_loaded_does_nothing() {
+         let data = top("boot");
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 21b6f54..52e171c 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -4,6 +4,7 @@
+ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
++pub mod fates_growth_view;
+ pub mod fates_nuzlocke;
+ pub mod fates_rando;
+ pub mod fates_rando_file;
+@@ -257,6 +258,9 @@ pub struct System {
+     /// Fire Emblem Fates' in-game randomizer (fates_rando_session): reads only, and
+     /// does nothing for any other game, unless a randomized run is active.
+     pub rando: fates_rando_session::Session,
++    /// Fire Emblem Fates' growth view on the unit panel (round 62, fates_growth_view): reads
++    /// only; Select and its button are kept from the game only while the panel is shown.
++    pub growth: fates_growth_view::GrowthView,
+ }
+ 
+ /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
+@@ -337,6 +341,7 @@ impl System {
+             interpreted_instructions: 0,
+             recompiled_instructions: 0,
+             rando: fates_rando_session::Session::default(),
++            growth: fates_growth_view::GrowthView::default(),
+         }
+     }
+ 
+@@ -953,9 +958,28 @@ impl System {
+     /// what the buttons, circle pad and touch screen are doing, which HID
+     /// reports from the next frame on.
+     pub fn set_input(&mut self, input: InputState) {
++        let mut input = input;
++        if self.is_fates_title() {
++            self.growth.filter_input(&mut self.memory, &mut input);
++        }
+         self.services.hid.input = input;
+     }
+ 
++    /// Fire Emblem Fates' title id (the game, or a mod on it such as Seal of Flames).
++    pub fn is_fates_title(&self) -> bool {
++        self.title.as_ref().map(|t| t.program_id()) == Some(fates_rando::TITLE)
++    }
++
++    /// round 62: the unit panel is shown (Fire Emblem Fates): the growth view can switch.
++    pub fn growth_panel_shown(&mut self) -> bool {
++        self.is_fates_title() && fates_growth_view::panel_unit(&mut self.memory).is_some()
++    }
++
++    /// round 62: switches the growth view (the frontend's Tab); true when it switched.
++    pub fn growth_toggle(&mut self) -> bool {
++        self.is_fates_title() && self.growth.toggle(&mut self.memory)
++    }
++
+     // -- GPU plumbing -------------------------------------------------------
+ 
+     pub fn gpu_read_register(&mut self, offset: u32) -> u32 {
+@@ -1102,6 +1126,21 @@ impl System {
+     }
+ 
+     fn read_scaled(&mut self, screen: zakuro_common::Screen, right: bool) -> Screen {
++        let picture = self.read_scaled_game(screen, right);
++        // round 62: the growth view's button and percents over the unit panel (Fire Emblem
++        // Fates), painted into this copy of the picture only; guest memory is not touched
++        if screen == zakuro_common::Screen::Bottom && !right && self.growth_panel_shown() {
++            let (pixels, width, height) = picture;
++            let mut own = pixels.as_ref().clone();
++            if self.growth.paint(&mut self.memory, &mut own, width, height) {
++                return (std::sync::Arc::new(own), width, height);
++            }
++            return (pixels, width, height);
++        }
++        picture
++    }
++
++    fn read_scaled_game(&mut self, screen: zakuro_common::Screen, right: bool) -> Screen {
+         let (width, height) = (screen.width(), screen.height());
+         let scale = self.gpu.scale();
+         if let Some(scaled) = self.scaled_screen(screen, right) {
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 904d384..0a47d74 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -1021,7 +1021,12 @@ impl App {
+             }
+             return;
+         }
+-        if code == KeyCode::Tab && !event.repeat && !self.settings.keys.binds(KeyCode::Tab) {
++        // round 62: on Fire Emblem Fates' unit panel, Tab switches the growth view (as Select
++        // does) instead of fast forward
++        let growth_tab = code == KeyCode::Tab && pressed && !event.repeat && !self.settings.keys.binds(KeyCode::Tab)
++            && !self.menus.over_game()
++            && self.game.as_mut().is_some_and(|game| game.system.growth_toggle());
++        if code == KeyCode::Tab && !event.repeat && !self.settings.keys.binds(KeyCode::Tab) && !growth_tab {
+             // fast forward while it is held
+             self.fast_forward_key = pressed && self.game.is_some();
+         }
+@@ -2836,7 +2841,10 @@ fn download_play_view(guest: &zakuro_core::download_play::Guest, members: &[zaku
+ /// the renderer's device and the GPU drew what the screen shows, else its
+ /// pixels.
+ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<GpuScreen>) {
+-    if let Some(gpu) = system.gpu_screen(screen) {
++    // round 62: Fire Emblem Fates' unit panel goes up from the picture's pixels, where the
++    // growth view paints its button and percents (zakuro_core::fates_growth_view)
++    let growth = screen == Screen::Bottom && system.growth_panel_shown();
++    if let Some(gpu) = system.gpu_screen(screen).filter(|_| !growth) {
+         let scale = system.gpu.scale();
+         return ((std::sync::Arc::new(Vec::new()), screen.width() * scale, screen.height() * scale), Some(gpu));
+     }
+-- 
+2.55.0.windows.5
+

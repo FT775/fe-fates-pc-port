@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x00C,0x4,ptr,bits,high,"FlagManager::Get(int) const 0x00508584: byte (index asr 3) of the array this word points to, bit (index & 7)",

@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence,elements
+0x00C,0x4,u32,held,high,"Pad::iTick(const KeyData*) 0x0010F4F8 stores the buttons of the new KeyData here (after copying the old value to +0x10); the 3DS key bits (A 0x1, B 0x2, Start 0x8, L 0x200, X 0x400) [medium for the key names]",
+0x010,0x4,u32,previous,high,"Pad::iTick 0x0010F4F0 copies the old held word here first",
+0x014,0x4,u32,pressed,medium,"Pad::iTick 0x0010F584 computes held AND NOT the old word and stores from +0x14 on (the keys pressed this frame); GameConfigData::IsSkipInput 0x0050AA54 tests 0xA (B or Start), map::SequenceHelper::DangerTick 0x0035E2D8 tests 0x400 (X)",

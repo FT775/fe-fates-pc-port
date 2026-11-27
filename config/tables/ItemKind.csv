@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence
+0x00,4,u32,kind_number,high,equals the record index (ItemKind::Get(int) = table+i*0xC); castle::cut::CanBattle reads +0x0
+0x04,4,str,mikid_name,medium,data: MIKID_ name message in every record; no read seen yet
+0x08,4,str,mikid_help,high,ItemKind::GetHelp 005460A4 reads +0x8 (MIKID_H_ message)

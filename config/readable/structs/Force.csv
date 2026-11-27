@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr:Unit,first_unit,high,"UnitPool::GetFirst(unsigned int) 0x004F62EC returns this word of the first force in the mask whose word is not 0",
+0x008,0x1,u8,type,high,"Force::IsAllied(Force::Type) const 0x0053C3E0 compares this byte with the other force type; Unit::GetNext 0x00533224 starts its scan at type + 1",

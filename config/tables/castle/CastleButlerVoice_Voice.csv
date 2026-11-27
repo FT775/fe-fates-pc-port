@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x0,1,u8,weight,high,"castle::ButlerVoice::GetVoiceID (0044E98C) sums item+0x0 bytes and draws a weighted random item"
+0x1,3,hex[3],pad,low,"Zero in every item (data)"
+0x4,4,u32,value,low,"Zero in every item (data); not read by GetVoiceID"
+0x8,4,str,voice,high,"castle::ButlerVoice::GetVoiceID (0044E98C) returns item+0x8 (a VOICE_ label)"

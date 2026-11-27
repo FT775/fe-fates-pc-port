@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,job,low,"A class name (data); no reader traced"
+0x4,4,hex[4],data,low,"Four bytes, the same in every item (data); not traced"

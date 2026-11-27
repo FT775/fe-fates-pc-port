@@ -1,0 +1,1155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 03:23:00 -0500
+Subject: [PATCH 0024] core: Fire Emblem Fates randomizer: Nuzlocke (graveyard, fallen kept fallen, Classic locked)
+
+A run made with Nuzlocke on carries nuzlocke.json beside its patch. A new
+game of such a run starts a Nuzlocke game (new game id). Each frame of
+play: a player unit that falls (force 4) is written at once to
+<data>/rando/<title>/nuzlocke/<game id>.json (the Python Ledger format;
+Corrin is never written); a graveyard person found in force 0 or 3 with
+no map actor (Unit +0xB8 == 0) is moved back to force 4 the way
+Unit::TransferImpl(unit, 4, 1) does it; Casual or Phoenix is switched
+back to Classic at New Game and in My Castle, with a log line. People
+are keyed by their labels' cp932 bytes (label_key, Python pid_key). The
+slot side file and the state sidecar name the game id; a state of the
+same run keeps its game. Without nuzlocke.json nothing new reads or
+writes memory or files (Session.nuz stays None; the side file is
+byte-identical to before).
+
+Round 60 track e2 (docs/rando/NUZLOCKE.md section 6), merged on top of
+0022 and 0023 in the assemble step.
+---
+ crates/zakuro-core/src/fates_nuzlocke.rs      | 873 ++++++++++++++++++
+ crates/zakuro-core/src/fates_rando.rs         |  16 +-
+ crates/zakuro-core/src/fates_rando_session.rs |  93 +-
+ crates/zakuro-core/src/lib.rs                 |   1 +
+ 4 files changed, 979 insertions(+), 4 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_nuzlocke.rs b/crates/zakuro-core/src/fates_nuzlocke.rs
+new file mode 100644
+index 0000000..aa282cc
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_nuzlocke.rs
+@@ -0,0 +1,873 @@
++//! Fire Emblem Fates randomizer: Nuzlocke (engine round E2, round 60; docs/rando/NUZLOCKE.md,
++//! the rules in tools/randomizer/nuzlocke.py, Grok's picks in docs/collab/NUZLOCKE_E2_GROK.md).
++//!
++//! Nothing here runs unless the active randomized run was made with Nuzlocke on (its run
++//! folder holds `nuzlocke.json`, written by `rando.py make`) and a Nuzlocke game is active
++//! (started at the New Game mode pick, or loaded from a save / save state whose side file
++//! names its game id). With Nuzlocke off this module reads and writes nothing.
++//!
++//! Once per frame, while a game is going on (GameConfigData +0xB is not 1), it reads the
++//! army lists of the unit pool (`UnitPool` 0x006D9F40 +4: 12-byte forces, +0 first, +4
++//! last, +8 index; units linked by +0x10 prev / +0x14 next, +0xA4 their force, +0x9C their
++//! Person, whose +0x8 is the PID_ label):
++//!
++//! 1. **A death is written at once.** Force 4 holds the player's fallen (`Unit::TransferImpl`
++//!    0x003D5308 runs `unit::Enhance::Dead` only for force 4). Every person seen there who is
++//!    not in the graveyard yet is written to `<data>/rando/<title>/nuzlocke/<game id>.json`
++//!    (temp file + rename) in the frame it is seen, before the game can write any save.
++//!    Never written: the people in the rules' `game_over_not_recorded` (Corrin: that death
++//!    ends the game, and the chapter is replayed as usual).
++//! 2. **The fallen stay fallen.** Every person in the graveyard who is found in force 0 (the
++//!    army) or 3 (the army off the map, My Castle) is moved to force 4 exactly as
++//!    `Unit::TransferImpl(unit, 4, last=1)` does it (unit flags, `Enhance::Dead`,
++//!    `Force::Remove`, `Force::JoinLast`), so a reset, a reload, an older save, a battle save
++//!    or a save state never brings them back. Only a unit with no map actor (+0xB8 == 0) is
++//!    moved: a unit already drawn on a map waits (said once in the log) until it has none.
++//! 3. **Classic is locked.** GameUserData +0x28 bits 0x4 (Casual) and 0x8 (Phoenix) are
++//!    cleared whenever they are seen set: the New Game's pick and My Castle's mode switch
++//!    are both undone to Classic, and the log says so (the run is never voided).
++
++use std::collections::HashSet;
++use std::path::{Path, PathBuf};
++
++use crate::fates_rando::{Guest, GAME_CONFIG, TITLE};
++
++/// the rules file `rando.py make` writes beside the run's patch.
++pub const RULES_FILE: &str = "nuzlocke.json";
++/// the graveyard format (tools/randomizer/nuzlocke.py `Ledger`, LEDGER_VERSION / TOOL).
++pub const LEDGER_VERSION: u32 = 1;
++pub const LEDGER_TOOL: &str = "rando-nuzlocke-v1";
++
++/// `G_UnitPool`; +4 the forces (12 bytes each).
++pub const UNIT_POOL: u32 = 0x006D_9F40;
++/// `G_GameUserData`; +0x28 the mode flags, +0xC the chapter row.
++pub const GAME_USER_DATA: u32 = 0x006D_A248;
++pub const FORCE_PLAYER: u8 = 0;
++pub const FORCE_RESERVE: u8 = 3;
++pub const FORCE_DEAD: u8 = 4;
++/// GameUserData +0x28: Casual (DifficultyIsCasual 0x003AC324) and Phoenix (0x003AC820).
++pub const MODE_NOT_CLASSIC: u32 = 0x4 | 0x8;
++/// Unit +0x8: a unit the game sends to force 9 instead of 3 or more (never recorded).
++pub const UNIT_GUEST: u32 = 0x4_0000;
++/// Unit::TransferImpl's mask for Unit +0x8 on the way to force 4 (the word at 0x003D5478).
++pub const DEAD_STATE_MASK: u32 = 0xF824_81DE;
++const MAX_UNITS: u32 = 512;
++
++/// one written death.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Dead {
++    pub pid: String,
++    pub chapter: String,
++    pub cause: String,
++    pub at: String,
++}
++
++/// one line of the log.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Event {
++    pub at: String,
++    pub what: String,
++    pub detail: String,
++}
++
++/// one Nuzlocke game: its rules, graveyard and log.
++#[derive(Debug, Clone)]
++pub struct Nuz {
++    pub gid: String,
++    pub run: String,
++    pub path: PathBuf,
++    /// the rules file's text (kept whole in the graveyard file)
++    rules: String,
++    pub recruits: String,
++    pub never_recorded: Vec<String>,
++    pub started: String,
++    pub dead: Vec<Dead>,
++    pub events: Vec<Event>,
++    /// people whose re-kill waits for their map actor to go (said once each)
++    waiting: HashSet<String>,
++    /// counters for the log and tests
++    pub kills: u32,
++    pub mode_undone: u32,
++}
++
++/// `<data>/rando/<title>/nuzlocke/<game id>.json`
++pub fn ledger_path(data: &Path, gid: &str) -> PathBuf {
++    data.join("rando").join(format!("{TITLE:016X}")).join("nuzlocke").join(format!("{gid}.json"))
++}
++
++/// a game id is 1-32 lower-case hex digits.
++pub fn gid_ok(gid: &str) -> bool {
++    (1..=32).contains(&gid.len()) && gid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++/// a new game's id: 16 hex digits from the OS's per-process random keys and the clock
++/// (never the game's own dice).
++pub fn new_gid() -> String {
++    use std::hash::{BuildHasher, Hasher};
++    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
++    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
++    h.write_u128(now);
++    h.write_u32(std::process::id());
++    format!("{:016x}", h.finish())
++}
++
++fn now() -> String {
++    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
++}
++
++fn esc(s: &str) -> String {
++    let mut out = String::with_capacity(s.len() + 2);
++    for c in s.chars() {
++        match c {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
++            c => out.push(c),
++        }
++    }
++    out
++}
++
++/// a string or bare value of a top-level key of a flat JSON object.
++pub fn field(text: &str, key: &str) -> Option<String> {
++    crate::fates_rando_session::json_field(text, key)
++}
++
++/// the text between the `[` after `"key"` and its matching `]` (strings may not hold brackets).
++fn array_text<'a>(text: &'a str, key: &str) -> Option<&'a str> {
++    let at = text.find(&format!("\"{key}\""))?;
++    let rest = &text[at + key.len() + 2..];
++    let open = rest.find('[')?;
++    if !rest[..open].trim().trim_start_matches(':').trim().is_empty() {
++        return None;
++    }
++    let body = &rest[open + 1..];
++    let (mut depth, mut in_str, mut esc_next) = (0i32, false, false);
++    for (i, c) in body.char_indices() {
++        if in_str {
++            match (esc_next, c) {
++                (true, _) => esc_next = false,
++                (false, '\\') => esc_next = true,
++                (false, '"') => in_str = false,
++                _ => {}
++            }
++            continue;
++        }
++        match c {
++            '"' => in_str = true,
++            '[' => depth += 1,
++            ']' if depth == 0 => return Some(&body[..i]),
++            ']' => depth -= 1,
++            _ => {}
++        }
++    }
++    None
++}
++
++/// the strings of a JSON array of strings under `key`.
++pub fn str_list(text: &str, key: &str) -> Vec<String> {
++    let Some(body) = array_text(text, key) else { return Vec::new() };
++    let mut out = Vec::new();
++    let mut rest = body;
++    while let Some(s) = rest.find('"') {
++        let mut cur = String::new();
++        let mut esc_next = false;
++        let mut end = None;
++        for (i, c) in rest[s + 1..].char_indices() {
++            match (esc_next, c) {
++                (true, c) => { cur.push(c); esc_next = false; }
++                (false, '\\') => esc_next = true,
++                (false, '"') => { end = Some(s + 1 + i + 1); break; }
++                (false, c) => cur.push(c),
++            }
++        }
++        let Some(e) = end else { break };
++        out.push(cur);
++        rest = &rest[e..];
++    }
++    out
++}
++
++/// the objects (`{...}`, not nested) of a JSON array under `key`, as texts.
++fn objects(text: &str, key: &str) -> Vec<String> {
++    let Some(body) = array_text(text, key) else { return Vec::new() };
++    let mut out = Vec::new();
++    let (mut start, mut in_str, mut esc_next, mut depth) = (None, false, false, 0);
++    for (i, c) in body.char_indices() {
++        if in_str {
++            match (esc_next, c) {
++                (true, _) => esc_next = false,
++                (false, '\\') => esc_next = true,
++                (false, '"') => in_str = false,
++                _ => {}
++            }
++            continue;
++        }
++        match c {
++            '"' => in_str = true,
++            '{' => {
++                if depth == 0 {
++                    start = Some(i);
++                }
++                depth += 1;
++            }
++            '}' => {
++                depth -= 1;
++                if depth == 0 {
++                    if let Some(s) = start.take() {
++                        out.push(body[s..=i].to_string());
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++    out
++}
++
++/// the rules of a run made with Nuzlocke on (None: no rules file = Nuzlocke off).
++pub fn read_rules(run_dir: &Path) -> Option<Result<String, String>> {
++    let path = run_dir.join(RULES_FILE);
++    let text = match std::fs::read_to_string(&path) {
++        Ok(t) => t,
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
++        Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
++    };
++    if field(&text, "nuzlocke").as_deref() != Some("true") {
++        return Some(Err(format!("{}: not a Nuzlocke rules file", path.display())));
++    }
++    Some(Ok(text))
++}
++
++impl Nuz {
++    fn from_rules(path: PathBuf, gid: &str, run: &str, rules: String) -> Nuz {
++        let recruits = field(&rules, "recruits").unwrap_or_else(|| "all".into());
++        // the labels as the game holds them (cp932 bytes), as keys (`label_key`); a rules file
++        // without the keys list (hand-made, ASCII labels) gives its plain list
++        let mut never_recorded = str_list(&rules, "game_over_not_recorded_keys");
++        if never_recorded.is_empty() {
++            never_recorded = str_list(&rules, "game_over_not_recorded");
++        }
++        Nuz {
++            gid: gid.to_string(), run: run.to_string(), path, rules, recruits, never_recorded,
++            started: now(), dead: Vec::new(), events: Vec::new(), waiting: HashSet::new(), kills: 0, mode_undone: 0,
++        }
++    }
++
++    /// a new Nuzlocke game of run `run` (the New Game mode pick): a new id and an empty
++    /// graveyard, written at once.
++    pub fn new_game(data: &Path, run: &str, rules: String) -> Result<Nuz, String> {
++        let gid = new_gid();
++        let mut n = Nuz::from_rules(ledger_path(data, &gid), &gid, run, rules);
++        n.event("new game", &format!("run {run}, recruits={}", n.recruits));
++        n.save().map_err(|e| format!("{}: {e}", n.path.display()))?;
++        Ok(n)
++    }
++
++    /// the Nuzlocke game `gid` of run `run` (a save or a save state named it). A missing
++    /// graveyard starts empty (and says so) with the run's rules.
++    pub fn load(data: &Path, gid: &str, run: &str, rules: Option<String>) -> Result<Nuz, String> {
++        if !gid_ok(gid) {
++            return Err(format!("the Nuzlocke game id {gid:?} is not 1-32 hex digits"));
++        }
++        let path = ledger_path(data, gid);
++        let text = match std::fs::read_to_string(&path) {
++            Ok(t) => t,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++                let rules = rules.ok_or_else(|| format!("{}: missing, and the run has no rules file", path.display()))?;
++                let mut n = Nuz::from_rules(path, gid, run, rules);
++                n.event("graveyard missing", "started again empty (the file was not found)");
++                n.save().map_err(|e| format!("{}: {e}", n.path.display()))?;
++                return Ok(n);
++            }
++            Err(e) => return Err(format!("{}: {e}", path.display())),
++        };
++        if field(&text, "version").as_deref() != Some(&LEDGER_VERSION.to_string())
++            || field(&text, "tool").as_deref() != Some(LEDGER_TOOL)
++        {
++            return Err(format!("{}: not a {LEDGER_TOOL} graveyard", path.display()));
++        }
++        let rules_text = rules_object(&text).or(rules).unwrap_or_else(|| "{\"nuzlocke\": true}".into());
++        let mut n = Nuz::from_rules(path, gid, field(&text, "run").as_deref().unwrap_or(run), rules_text);
++        n.started = field(&text, "started").unwrap_or_else(now);
++        for o in objects(&text, "dead") {
++            if let Some(pid) = field(&o, "pid") {
++                n.dead.push(Dead {
++                    pid,
++                    chapter: field(&o, "chapter").unwrap_or_default(),
++                    cause: field(&o, "cause").unwrap_or_else(|| "battle".into()),
++                    at: field(&o, "at").unwrap_or_default(),
++                });
++            }
++        }
++        for o in objects(&text, "events") {
++            n.events.push(Event {
++                at: field(&o, "at").unwrap_or_default(),
++                what: field(&o, "what").unwrap_or_default(),
++                detail: field(&o, "detail").unwrap_or_default(),
++            });
++        }
++        Ok(n)
++    }
++
++    pub fn is_dead(&self, pid: &str) -> bool {
++        self.dead.iter().any(|d| d.pid == pid)
++    }
++
++    fn event(&mut self, what: &str, detail: &str) {
++        self.events.push(Event { at: now(), what: what.into(), detail: detail.into() });
++    }
++
++    /// the graveyard file in tools/randomizer/nuzlocke.py's `Ledger` format (that tool's
++    /// `log` command prints it), written whole then renamed.
++    pub fn save(&self) -> std::io::Result<()> {
++        let mut s = String::new();
++        s.push_str("{\n");
++        s.push_str(&format!(" \"dead\": [{}],\n", self.dead.iter().map(|d| format!(
++            "\n  {{\"at\": \"{}\", \"cause\": \"{}\", \"chapter\": \"{}\", \"name\": \"\", \"pid\": \"{}\", \"turn\": 0}}",
++            esc(&d.at), esc(&d.cause), esc(&d.chapter), esc(&d.pid))).collect::<Vec<_>>().join(",")));
++        s.push_str(&format!(" \"events\": [{}],\n", self.events.iter().map(|e| format!(
++            "\n  {{\"at\": \"{}\", \"detail\": \"{}\", \"what\": \"{}\"}}", esc(&e.at), esc(&e.detail), esc(&e.what)))
++            .collect::<Vec<_>>().join(",")));
++        s.push_str(" \"first_recruit\": {},\n");
++        s.push_str(&format!(" \"game_id\": \"{}\",\n", esc(&self.gid)));
++        s.push_str(" \"joined\": [],\n");
++        s.push_str(&format!(" \"rules\": {},\n", self.rules.trim()));
++        s.push_str(&format!(" \"run\": \"{}\",\n", esc(&self.run)));
++        s.push_str(&format!(" \"started\": \"{}\",\n", esc(&self.started)));
++        s.push_str(&format!(" \"tool\": \"{LEDGER_TOOL}\",\n"));
++        s.push_str(&format!(" \"version\": {LEDGER_VERSION},\n"));
++        s.push_str(" \"voided\": null\n}\n");
++        let dir = self.path.parent().unwrap_or(Path::new("."));
++        std::fs::create_dir_all(dir)?;
++        let mut tmp = self.path.as_os_str().to_owned();
++        tmp.push(".tmp");
++        let tmp = PathBuf::from(tmp);
++        std::fs::write(&tmp, s)?;
++        std::fs::rename(&tmp, &self.path)
++    }
++
++    /// after a frame while a game is going on: deaths written, the fallen kept fallen,
++    /// Classic kept. Returns lines for the log (problems only); writes the graveyard when
++    /// something changed.
++    pub fn frame(&mut self, g: &mut dyn Guest) -> Vec<String> {
++        let mut notes = Vec::new();
++        let mut changed = false;
++        // 3. Classic
++        if let Some(gud) = g.r32(GAME_USER_DATA).filter(|&a| a != 0) {
++            if let Some(flags) = g.r32(gud.wrapping_add(0x28)) {
++                if flags & MODE_NOT_CLASSIC != 0 {
++                    g.write(gud.wrapping_add(0x28), &(flags & !MODE_NOT_CLASSIC).to_le_bytes());
++                    self.mode_undone += 1;
++                    let was = if flags & 0x8 != 0 { "Phoenix" } else { "Casual" };
++                    self.event("classic kept", &format!("{was} was picked; switched back to Classic"));
++                    log::info!("fates_rando: Nuzlocke: {was} switched back to Classic");
++                    changed = true;
++                }
++            }
++        }
++        let Some(pool) = g.r32(UNIT_POOL + 4).filter(|&p| p != 0) else {
++            if changed {
++                let _ = self.save();
++            }
++            return notes;
++        };
++        // 1. deaths
++        let chapter = chapter(g);
++        for unit in force_units(g, pool, FORCE_DEAD) {
++            let Some(pid) = unit_pid(g, unit) else { continue };
++            if self.is_dead(&pid) || self.never_recorded.contains(&pid) {
++                continue;
++            }
++            log::info!("fates_rando: Nuzlocke: {pid} fell in {chapter}: written to the graveyard");
++            self.dead.push(Dead { pid: pid.clone(), chapter: chapter.clone(), cause: "battle".into(), at: now() });
++            self.event("death", &format!("{pid} in {chapter}, turn 0 (battle)"));
++            changed = true;
++        }
++        // 2. the fallen stay fallen
++        for force in [FORCE_PLAYER, FORCE_RESERVE] {
++            for unit in force_units(g, pool, force) {
++                let Some(pid) = unit_pid(g, unit) else { continue };
++                if !self.is_dead(&pid) {
++                    continue;
++                }
++                match kill(g, pool, unit) {
++                    Ok(()) => {
++                        self.kills += 1;
++                        self.waiting.remove(&pid);
++                        log::info!("fates_rando: Nuzlocke: {pid} is in the graveyard: moved to the fallen again");
++                        self.event("dead again", &format!("{pid} was alive in the loaded game (force {force}): fallen again"));
++                        changed = true;
++                    }
++                    Err(why) => {
++                        if self.waiting.insert(pid.clone()) {
++                            notes.push(format!("Nuzlocke: {pid} is in the graveyard but {why}; it is moved as soon as it can be"));
++                        }
++                    }
++                }
++            }
++        }
++        if changed {
++            if let Err(e) = self.save() {
++                notes.push(format!("Nuzlocke: the graveyard {} could not be written: {e}", self.path.display()));
++            }
++        }
++        notes
++    }
++
++    /// the readable log (the Esc page's "This run").
++    pub fn text(&self) -> String {
++        let mut out = format!("Nuzlocke game {} (run {}), started {}\nGraveyard ({}):\n", self.gid, self.run,
++                              self.started, self.dead.len());
++        for d in &self.dead {
++            out.push_str(&format!("  {}: {} ({})\n", d.pid, d.chapter, d.at));
++        }
++        out
++    }
++}
++
++/// the `rules` object of a graveyard file, as text.
++fn rules_object(text: &str) -> Option<String> {
++    let at = text.find("\"rules\"")?;
++    let rest = &text[at + 7..];
++    let open = rest.find('{')?;
++    let body = &rest[open..];
++    let (mut depth, mut in_str, mut esc_next) = (0i32, false, false);
++    for (i, c) in body.char_indices() {
++        if in_str {
++            match (esc_next, c) {
++                (true, _) => esc_next = false,
++                (false, '\\') => esc_next = true,
++                (false, '"') => in_str = false,
++                _ => {}
++            }
++            continue;
++        }
++        match c {
++            '"' => in_str = true,
++            '{' => depth += 1,
++            '}' => {
++                depth -= 1;
++                if depth == 0 {
++                    return Some(body[..=i].to_string());
++                }
++            }
++            _ => {}
++        }
++    }
++    None
++}
++
++fn r8(g: &mut dyn Guest, addr: u32) -> Option<u8> {
++    if !g.readable(addr, 1) {
++        return None;
++    }
++    let mut b = [0u8; 1];
++    g.read(addr, &mut b);
++    Some(b[0])
++}
++
++fn w8(g: &mut dyn Guest, addr: u32, v: u8) {
++    g.write(addr, &[v]);
++}
++
++fn w32(g: &mut dyn Guest, addr: u32, v: u32) {
++    g.write(addr, &v.to_le_bytes());
++}
++
++/// the units of one force, first to last.
++pub fn force_units(g: &mut dyn Guest, pool: u32, force: u8) -> Vec<u32> {
++    let mut out = Vec::new();
++    let mut unit = g.r32(pool.wrapping_add(12 * force as u32)).unwrap_or(0);
++    while unit != 0 && (out.len() as u32) < MAX_UNITS {
++        if !g.readable(unit, 0xC0) || out.contains(&unit) {
++            break;
++        }
++        out.push(unit);
++        unit = g.r32(unit.wrapping_add(0x14)).unwrap_or(0);
++    }
++    out
++}
++
++/// a label's key: its bytes as the game holds them (cp932), printable ASCII kept and every
++/// other byte (and `%`, `"`, `\`) as `%HH`, so two labels never share a key
++/// (tools/randomizer/nuzlocke.py `pid_key` makes the same from the tables).
++pub fn label_key(bytes: &[u8]) -> String {
++    let mut out = String::with_capacity(bytes.len());
++    for &b in bytes {
++        if b.is_ascii_graphic() && b != b'%' && b != b'"' && b != b'\\' {
++            out.push(b as char);
++        } else {
++            out.push_str(&format!("%{b:02X}"));
++        }
++    }
++    out
++}
++
++/// a unit's person key (Unit +0x9C Person, Person +0x8 its PID_ label, `label_key`).
++pub fn unit_pid(g: &mut dyn Guest, unit: u32) -> Option<String> {
++    let person = g.r32(unit.wrapping_add(0x9C)).filter(|&p| p != 0)?;
++    let label = g.r32(person.wrapping_add(0x8)).filter(|&p| p != 0)?;
++    let bytes = g.cstr(label, 64)?;
++    if bytes.is_empty() {
++        return None;
++    }
++    Some(label_key(&bytes))
++}
++
++/// the chapter being played (GameUserData +0xC row, its label after "CID_"), or "?".
++pub fn chapter(g: &mut dyn Guest) -> String {
++    let Some(gud) = g.r32(GAME_USER_DATA).filter(|&a| a != 0) else { return "?".into() };
++    let Some(row) = g.r32(gud.wrapping_add(0xC)).filter(|&a| a != 0) else { return "?".into() };
++    let Some(s) = g.r32(row).filter(|&a| a != 0) else { return "?".into() };
++    match g.cstr(s, 64) {
++        Some(b) if b.len() > 4 => String::from_utf8_lossy(&b[4..]).into_owned(),
++        _ => "?".into(),
++    }
++}
++
++/// moves `unit` (force 0 or 3, no map actor) to force 4 as `Unit::TransferImpl(unit, 4, 1)`
++/// does: from force 0 the dead path (Unit +0xC &= ~0xA8, +0x8 &= DEAD_STATE_MASK,
++/// `unit::Enhance::Dead` on Unit +0x28, +0x12D and +0x135 cleared); from force 3 the list
++/// move only (TransferImpl skips the dead path for a unit off the map); then
++/// `Force::Remove` from its force and `Force::JoinLast` into force 4.
++pub fn kill(g: &mut dyn Guest, pool: u32, unit: u32) -> Result<(), String> {
++    let force = g.r32(unit.wrapping_add(0xA4)).filter(|&f| f != 0).ok_or("it has no force")?;
++    let idx = r8(g, force.wrapping_add(8)).ok_or("its force is unreadable")?;
++    if idx != FORCE_PLAYER && idx != FORCE_RESERVE {
++        return Err(format!("it is in force {idx}"));
++    }
++    if force != pool.wrapping_add(12 * idx as u32) {
++        return Err("its force is not the pool's".into());
++    }
++    let state = g.r32(unit.wrapping_add(0x8)).ok_or("it is unreadable")?;
++    if state & UNIT_GUEST != 0 {
++        return Err("it is a guest (the game never records a guest's death)".into());
++    }
++    if g.r32(unit.wrapping_add(0xB8)).unwrap_or(1) != 0 {
++        return Err("it is drawn on the map now".into());
++    }
++    let dead = pool.wrapping_add(12 * FORCE_DEAD as u32);
++    if r8(g, dead.wrapping_add(8)) != Some(FORCE_DEAD) {
++        return Err("force 4 is not where it should be".into());
++    }
++    if idx == FORCE_PLAYER {
++        let c = g.r32(unit.wrapping_add(0xC)).unwrap_or(0);
++        w32(g, unit.wrapping_add(0xC), c & !0xA8);
++        w32(g, unit.wrapping_add(0x8), state & DEAD_STATE_MASK);
++        let e = unit.wrapping_add(0x28);
++        let b4 = r8(g, e + 4).unwrap_or(0);
++        w8(g, e + 4, b4 & !0x03);
++        let b2 = r8(g, e + 2).unwrap_or(0);
++        w8(g, e + 2, b2 & !0x80);
++        w8(g, e + 3, 0);
++        let b0 = r8(g, e).unwrap_or(0);
++        w8(g, e, b0 & 0x01);
++        g.write(e + 16, &[0u8; 7]);
++        w8(g, unit.wrapping_add(0x12D), 0);
++        w8(g, unit.wrapping_add(0x135), 0);
++    }
++    // Force::Remove(force, unit) 0x0041C840
++    let prev = g.r32(unit.wrapping_add(0x10)).unwrap_or(0);
++    let next = g.r32(unit.wrapping_add(0x14)).unwrap_or(0);
++    if next != 0 {
++        w32(g, next.wrapping_add(0x10), prev);
++    } else {
++        w32(g, force.wrapping_add(4), prev);
++        if prev != 0 {
++            w32(g, prev.wrapping_add(0x14), 0);
++        }
++    }
++    if prev != 0 {
++        w32(g, prev.wrapping_add(0x14), next);
++    } else {
++        w32(g, force, next);
++        if next != 0 {
++            w32(g, next.wrapping_add(0x10), 0);
++        }
++    }
++    w32(g, unit.wrapping_add(0x10), 0);
++    w32(g, unit.wrapping_add(0x14), 0);
++    // Force::JoinLast(dead, unit) 0x0041C894
++    w32(g, unit.wrapping_add(0xA4), dead);
++    let last = g.r32(dead.wrapping_add(4)).unwrap_or(0);
++    if last == 0 {
++        w32(g, dead, unit);
++    } else {
++        w32(g, last.wrapping_add(0x14), unit);
++        w32(g, unit.wrapping_add(0x10), last);
++    }
++    w32(g, dead.wrapping_add(4), unit);
++    Ok(())
++}
++
++/// GameConfigData +0xB is not 1: a game is going on (the title and the mode pick have 1).
++pub fn in_game(g: &mut dyn Guest) -> bool {
++    let Some(cfg) = g.r32(GAME_CONFIG).filter(|&c| c != 0) else { return false };
++    matches!(r8(g, cfg.wrapping_add(0xB)), Some(b) if b != 1)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++        }
++    }
++
++    const POOL: u32 = 0x3000_0000; // the forces (12 x 10)
++    const UNITS: u32 = 0x3100_0000; // unit i at UNITS + 0x200 * i
++    const PERSONS: u32 = 0x3200_0000; // person i at PERSONS + 0x100 * i, label at +0x80
++    const GUD: u32 = 0x3300_0000;
++    const CFG: u32 = 0x3400_0000;
++
++    fn unit(i: u32) -> u32 {
++        UNITS + 0x200 * i
++    }
++
++    /// a game: GameConfigData +0xB = 0 (playing), GameUserData Casual, chapter "CID_A007",
++    /// persons PID_0..PID_5, units 0..2 in force 0, 3 in force 3, 4 in force 4.
++    fn game() -> Fake {
++        let mut m = Fake::default();
++        m.put(UNIT_POOL, &[0; 8]);
++        m.put(GAME_USER_DATA, &GUD.to_le_bytes());
++        m.put(GAME_CONFIG, &CFG.to_le_bytes());
++        let mut cfg = vec![0u8; 0x20];
++        cfg[0xB] = 0;
++        m.put(CFG, &cfg);
++        let mut gud = vec![0u8; 0x40];
++        gud[0xC..0x10].copy_from_slice(&(GUD + 0x30).to_le_bytes());
++        gud[0x28..0x2C].copy_from_slice(&0x4u32.to_le_bytes());
++        gud[0x30..0x34].copy_from_slice(&(GUD + 0x38).to_le_bytes());
++        m.put(GUD, &gud);
++        m.put(GUD + 0x38, b"CID_A007\0");
++        let mut pool = vec![0u8; 120];
++        for f in 0..10u8 {
++            pool[12 * f as usize + 8] = f;
++        }
++        m.put(POOL, &pool);
++        m.put(UNIT_POOL + 4, &POOL.to_le_bytes());
++        m.put(UNIT_POOL, &[0; 4]);
++        for i in 0..6u32 {
++            let mut p = vec![0u8; 0x100];
++            p[8..12].copy_from_slice(&(PERSONS + 0x100 * i + 0x80).to_le_bytes());
++            let label = format!("PID_{i}\0");
++            p[0x80..0x80 + label.len()].copy_from_slice(label.as_bytes());
++            m.put(PERSONS + 0x100 * i, &p);
++            let mut u = vec![0u8; 0x200];
++            u[0x9C..0xA0].copy_from_slice(&(PERSONS + 0x100 * i).to_le_bytes());
++            u[0x8..0xC].copy_from_slice(&0xFFFF_FFFFu32.wrapping_sub(UNIT_GUEST).to_le_bytes());
++            m.put(unit(i), &u);
++        }
++        let join = |m: &mut Fake, f: u32, u: u32| {
++            let force = POOL + 12 * f;
++            m.write(u + 0xA4, &force.to_le_bytes());
++            let last = m.r32(force + 4).unwrap();
++            if last == 0 {
++                m.write(force, &u.to_le_bytes());
++            } else {
++                m.write(last + 0x14, &u.to_le_bytes());
++                m.write(u + 0x10, &last.to_le_bytes());
++            }
++            m.write(force + 4, &u.to_le_bytes());
++        };
++        for i in 0..3 {
++            join(&mut m, 0, unit(i));
++        }
++        join(&mut m, 3, unit(3));
++        join(&mut m, 4, unit(4));
++        m
++    }
++
++    fn pids(m: &mut Fake, f: u8) -> Vec<String> {
++        force_units(m, POOL, f).into_iter().map(|u| unit_pid(m, u).unwrap()).collect()
++    }
++
++    fn tmp(name: &str) -> PathBuf {
++        let d = std::env::temp_dir().join(format!("fates_nuz_{}_{name}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&d);
++        d
++    }
++
++    const RULES: &str = "{\"always_allowed\": [\"PID_0\"], \"game_over_not_recorded\": [\"PID_0\", \"PID_9\"], \
++                         \"nuzlocke\": true, \"recruits\": \"all\", \"version\": 1}";
++
++    #[test]
++    fn deaths_written_at_once_and_kept_after_a_reload() {
++        let data = tmp("deaths");
++        let mut m = game();
++        let mut n = Nuz::new_game(&data, "s-1", RULES.into()).unwrap();
++        assert!(gid_ok(&n.gid));
++        assert!(n.path.ends_with(format!("rando/0004000000179800/nuzlocke/{}.json", n.gid)));
++        assert!(in_game(&mut m));
++        let notes = n.frame(&mut m);
++        assert!(notes.is_empty(), "{notes:?}");
++        assert_eq!(n.dead.iter().map(|d| d.pid.as_str()).collect::<Vec<_>>(), ["PID_4"]);
++        assert_eq!(n.dead[0].chapter, "A007");
++        assert_eq!(n.mode_undone, 1, "Casual was switched back");
++        assert_eq!(m.r32(GUD + 0x28).unwrap() & MODE_NOT_CLASSIC, 0);
++        // written at once: a reload of the file knows it
++        let back = Nuz::load(&data, &n.gid, "s-1", None).unwrap();
++        assert!(back.is_dead("PID_4"));
++        assert_eq!(back.never_recorded, ["PID_0", "PID_9"]);
++        // a reset brings back an older save: PID_4 alive in force 3 again, PID_1 too
++        let mut m = game();
++        let f4 = POOL + 48;
++        m.write(f4, &0u32.to_le_bytes());
++        m.write(f4 + 4, &0u32.to_le_bytes());
++        // unit 4 into force 3 after unit 3
++        m.write(unit(4) + 0xA4, &(POOL + 36).to_le_bytes());
++        m.write(unit(3) + 0x14, &unit(4).to_le_bytes());
++        m.write(unit(4) + 0x10, &unit(3).to_le_bytes());
++        m.write(POOL + 36 + 4, &unit(4).to_le_bytes());
++        assert_eq!(pids(&mut m, 3), ["PID_3", "PID_4"]);
++        let mut n = back;
++        n.frame(&mut m);
++        assert_eq!(pids(&mut m, 3), ["PID_3"]);
++        assert_eq!(pids(&mut m, 4), ["PID_4"]);
++        assert_eq!(n.kills, 1);
++        assert_eq!(n.dead.len(), 1, "not written twice");
++        // a second frame changes nothing
++        n.frame(&mut m);
++        assert_eq!(n.kills, 1);
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn kill_follows_transfer_impl_and_keeps_lists_whole() {
++        let mut m = game();
++        // the middle unit of force 0 (PID_1)
++        m.write(unit(1) + 0xC, &0xFFu32.to_le_bytes());
++        m.write(unit(1) + 0x28, &[0xFF; 0x20]);
++        kill(&mut m, POOL, unit(1)).unwrap();
++        assert_eq!(pids(&mut m, 0), ["PID_0", "PID_2"]);
++        assert_eq!(pids(&mut m, 4), ["PID_4", "PID_1"]);
++        assert_eq!(m.r32(POOL + 4).unwrap(), unit(2), "force 0 last");
++        assert_eq!(m.r32(unit(2) + 0x10).unwrap(), unit(0), "prev link mended");
++        assert_eq!(m.r32(POOL + 48 + 4).unwrap(), unit(1));
++        assert_eq!(m.r32(unit(1) + 0xA4).unwrap(), POOL + 48);
++        assert_eq!(m.r32(unit(1) + 0xC).unwrap(), 0xFF & !0xA8);
++        assert_eq!(m.r32(unit(1) + 0x8).unwrap(), (0xFFFF_FFFFu32 - UNIT_GUEST) & DEAD_STATE_MASK);
++        let mut e = [0u8; 0x20];
++        m.read(unit(1) + 0x28, &mut e);
++        assert_eq!(&e[..5], &[0x01, 0xFF, 0x7F, 0x00, 0xFC]);
++        assert_eq!(&e[16..23], &[0; 7]);
++        // the first and the last unit too
++        kill(&mut m, POOL, unit(0)).unwrap();
++        kill(&mut m, POOL, unit(2)).unwrap();
++        assert!(pids(&mut m, 0).is_empty());
++        assert_eq!(m.r32(POOL).unwrap(), 0);
++        assert_eq!(m.r32(POOL + 4).unwrap(), 0);
++        assert_eq!(pids(&mut m, 4), ["PID_4", "PID_1", "PID_0", "PID_2"]);
++        // force 3: the list move only
++        m.write(unit(3) + 0xC, &0xFFu32.to_le_bytes());
++        kill(&mut m, POOL, unit(3)).unwrap();
++        assert_eq!(m.r32(unit(3) + 0xC).unwrap(), 0xFF, "no dead path from force 3");
++        // refused: on the map, a guest, already fallen
++        let mut m = game();
++        m.write(unit(1) + 0xB8, &1u32.to_le_bytes());
++        assert!(kill(&mut m, POOL, unit(1)).unwrap_err().contains("map"));
++        m.write(unit(2) + 0x8, &UNIT_GUEST.to_le_bytes());
++        assert!(kill(&mut m, POOL, unit(2)).unwrap_err().contains("guest"));
++        assert!(kill(&mut m, POOL, unit(4)).unwrap_err().contains("force 4"));
++        assert_eq!(pids(&mut m, 0), ["PID_0", "PID_1", "PID_2"]);
++    }
++
++    #[test]
++    fn corrin_is_never_written_and_a_unit_on_the_map_waits() {
++        let data = tmp("corrin");
++        let mut m = game();
++        // PID_0 (Corrin in the rules) falls: not written
++        kill(&mut m, POOL, unit(0)).unwrap();
++        let mut n = Nuz::new_game(&data, "s-1", RULES.into()).unwrap();
++        n.frame(&mut m);
++        assert!(!n.is_dead("PID_0"));
++        assert!(n.is_dead("PID_4"));
++        // PID_2 in the graveyard but drawn on the map: said once, moved when the actor goes
++        n.dead.push(Dead { pid: "PID_2".into(), chapter: "X".into(), cause: "battle".into(), at: String::new() });
++        m.write(unit(2) + 0xB8, &1u32.to_le_bytes());
++        assert_eq!(n.frame(&mut m).len(), 1);
++        assert!(n.frame(&mut m).is_empty(), "said once");
++        assert!(pids(&mut m, 0).contains(&"PID_2".to_string()));
++        m.write(unit(2) + 0xB8, &0u32.to_le_bytes());
++        n.frame(&mut m);
++        assert!(!pids(&mut m, 0).contains(&"PID_2".to_string()));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn graveyard_file_round_trip_and_python_format() {
++        let data = tmp("file");
++        let mut n = Nuz::new_game(&data, "s-\"q", RULES.into()).unwrap();
++        n.dead.push(Dead { pid: "PID_X".into(), chapter: "A00\"1".into(), cause: "battle".into(), at: "t".into() });
++        n.save().unwrap();
++        let text = std::fs::read_to_string(&n.path).unwrap();
++        assert!(text.contains("\"tool\": \"rando-nuzlocke-v1\""));
++        assert!(text.contains("\"version\": 1"));
++        let back = Nuz::load(&data, &n.gid, "x", None).unwrap();
++        assert_eq!(back.run, "s-\"q");
++        assert_eq!(back.dead, n.dead);
++        assert_eq!(back.events.len(), 1);
++        assert_eq!(back.recruits, "all");
++        assert_eq!(str_list(&text, "game_over_not_recorded"), ["PID_0", "PID_9"]);
++        // a missing graveyard starts empty with the run's rules; a bad id is refused
++        let fresh = Nuz::load(&data, "abc", "r", Some(RULES.into())).unwrap();
++        assert!(fresh.dead.is_empty());
++        assert!(Nuz::load(&data, "../x", "r", None).is_err());
++        assert!(Nuz::load(&data, "abd", "r", None).is_err(), "no file and no rules");
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn labels_are_keyed_by_their_cp932_bytes() {
++        // "PID_" + cp932 of a Japanese name: never folded together, ASCII kept
++        assert_eq!(label_key(b"PID_A1"), "PID_A1");
++        assert_eq!(label_key(&[b'P', 0x83, 0x76, b'%', 0x20]), "P%83v%25%20");
++        assert_ne!(label_key(&[0x83, 0x76]), label_key(&[0x83, 0x77]));
++        let rules = "{\"game_over_not_recorded\": [\"x\"], \"game_over_not_recorded_keys\": [\"PID_%83v\"], \"nuzlocke\": true}";
++        let n = Nuz::from_rules(PathBuf::from("x.json"), "ab", "r", rules.into());
++        assert_eq!(n.never_recorded, ["PID_%83v"]);
++    }
++
++    #[test]
++    fn rules_file_means_nuzlocke_on() {
++        let d = tmp("rules");
++        assert!(read_rules(&d).is_none());
++        std::fs::create_dir_all(&d).unwrap();
++        std::fs::write(d.join(RULES_FILE), RULES).unwrap();
++        assert!(read_rules(&d).unwrap().is_ok());
++        std::fs::write(d.join(RULES_FILE), "{\"nuzlocke\": false}").unwrap();
++        assert!(read_rules(&d).unwrap().is_err());
++        let _ = std::fs::remove_dir_all(&d);
++    }
++}
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index a2c1e04..1c064b4 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -645,6 +645,12 @@ pub fn slot_name(save: &str) -> Option<String> {
+ /// the game wrote a save: with an active run its side file names the run, without one it
+ /// is removed (that slot is the original game now).
+ pub fn slot_written(data: &Path, save: &str, run: Option<&str>) -> io::Result<()> {
++    slot_written_nuz(data, save, run, None)
++}
++
++/// `slot_written` with the save's Nuzlocke game id (engine round E2): the side file names
++/// it too, so loading the save brings back that game's graveyard. None = exactly as before.
++pub fn slot_written_nuz(data: &Path, save: &str, run: Option<&str>, nuz: Option<&str>) -> io::Result<()> {
+     let Some(name) = slot_name(save) else { return Ok(()) };
+     let dir = slots_dir(data);
+     let path = dir.join(&name);
+@@ -653,7 +659,9 @@ pub fn slot_written(data: &Path, save: &str, run: Option<&str>) -> io::Result<()
+             fs::create_dir_all(&dir)?;
+             let tmp = dir.join(format!("{name}.tmp"));
+             let id = id.replace('\\', "\\\\").replace('"', "\\\"");
+-            fs::write(&tmp, format!("{{\"format\": {FORMAT}, \"run\": \"{id}\", \"save\": \"{name}\"}}\n"))?;
++            let nuz = nuz.filter(|g| crate::fates_nuzlocke::gid_ok(g))
++                .map(|g| format!(", \"nuzlocke\": \"{g}\"")).unwrap_or_default();
++            fs::write(&tmp, format!("{{\"format\": {FORMAT}, \"run\": \"{id}\", \"save\": \"{name}\"{nuz}}}\n"))?;
+             fs::rename(&tmp, &path)
+         }
+         None => match fs::remove_file(&path) {
+@@ -663,6 +671,12 @@ pub fn slot_written(data: &Path, save: &str, run: Option<&str>) -> io::Result<()
+     }
+ }
+ 
++/// the Nuzlocke game id a save's side file names (None = not a Nuzlocke game).
++pub fn slot_nuz(data: &Path, save: &str) -> Option<String> {
++    let text = fs::read_to_string(slots_dir(data).join(slot_name(save)?)).ok()?;
++    crate::fates_rando_session::json_field(&text, "nuzlocke").filter(|g| crate::fates_nuzlocke::gid_ok(g))
++}
++
+ /// the run a save belongs to (None = the original game).
+ pub fn slot_run(data: &Path, save: &str) -> Option<String> {
+     let text = fs::read_to_string(slots_dir(data).join(slot_name(save)?)).ok()?;
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index aaa20db..890ebb3 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -94,6 +94,8 @@ pub struct Session {
+     /// that change is a load, not a new game
+     since_slot_read: Option<u32>,
+     pub notices: Vec<String>,
++    /// engine round E2: the active Nuzlocke game (its run was made with Nuzlocke on), or None
++    pub nuz: Option<crate::fates_nuzlocke::Nuz>,
+ }
+ 
+ /// a mode-word change at most this many frames after a save slot was read is a load.
+@@ -228,6 +230,7 @@ impl Session {
+     /// the original game: the active run's GameData cells put back.
+     pub fn original(&mut self, g: &mut dyn Guest) {
+         self.placements.clear();
++        self.nuz = None;
+         let Some(mut run) = self.run.take() else { return };
+         if let Err(bad) = run.revert_gamedata(g) {
+             self.note(format!("{}: the tables could not be put back ({} cells differ, first: {})",
+@@ -284,9 +287,51 @@ impl Session {
+             make(data, &id, &seed, answer)?;
+         }
+         self.lay(g, data, &id)?;
++        // engine round E2: a run made with Nuzlocke on starts a new Nuzlocke game (its own id
++        // and an empty graveyard); a refused graveyard is said, and the game goes on without
++        match crate::fates_nuzlocke::read_rules(&run_dir(data, &id)) {
++            None => {}
++            Some(Ok(rules)) => match crate::fates_nuzlocke::Nuz::new_game(data, &id, rules) {
++                Ok(n) => {
++                    log::info!("fates_rando: Nuzlocke game {} started (graveyard {})", n.gid, n.path.display());
++                    self.nuz = Some(n);
++                }
++                Err(e) => self.note(format!("Nuzlocke could not start: {e}")),
++            },
++            Some(Err(e)) => self.note(format!("Nuzlocke could not start: {e}")),
++        }
+         Ok(Some(id))
+     }
+ 
++    /// the Nuzlocke game save `path` names (engine round E2), once its run is laid.
++    fn nuz_for_slot(&mut self, data: &Path, path: &str) {
++        let want = fates_rando::slot_nuz(data, path);
++        self.nuz_for(data, want.as_deref());
++    }
++
++    /// the Nuzlocke game `gid` of the active run (None = no Nuzlocke game).
++    pub fn nuz_for(&mut self, data: &Path, gid: Option<&str>) {
++        let run = self.active();
++        let (Some(gid), Some(run)) = (gid, run) else {
++            self.nuz = None;
++            return;
++        };
++        if self.nuz.as_ref().is_some_and(|n| n.gid == gid) {
++            return;
++        }
++        let rules = crate::fates_nuzlocke::read_rules(&run_dir(data, &run)).and_then(Result::ok);
++        match crate::fates_nuzlocke::Nuz::load(data, gid, &run, rules) {
++            Ok(n) => {
++                log::info!("fates_rando: Nuzlocke game {gid} loaded ({} in the graveyard)", n.dead.len());
++                self.nuz = Some(n);
++            }
++            Err(e) => {
++                self.nuz = None;
++                self.note(format!("the Nuzlocke game {gid} could not be loaded: {e}"));
++            }
++        }
++    }
++
+     /// the game opened save file `path` to read it: that save's run is laid, or the
+     /// original game put back, before the game parses a byte of it. Every open, not only
+     /// the first: the Load list may read every slot while the player browses.
+@@ -309,6 +354,7 @@ impl Session {
+         }
+         let want = fates_rando::slot_run(data, path);
+         if want.is_some() && want == self.active() {
++            self.nuz_for_slot(data, path);
+             return;
+         }
+         match want {
+@@ -321,12 +367,14 @@ impl Session {
+                 }
+             }
+         }
++        self.nuz_for_slot(data, path);
+     }
+ 
+     /// the game wrote save file `path`: its side file names the active run, or is removed.
+     pub fn save_written(&mut self, data: &Path, path: &str) {
+         let run = self.active();
+-        if let Err(e) = fates_rando::slot_written(data, path, run.as_deref()) {
++        let nuz = self.nuz.as_ref().map(|n| n.gid.clone());
++        if let Err(e) = fates_rando::slot_written_nuz(data, path, run.as_deref(), nuz.as_deref()) {
+             self.note(format!("{path}: the randomizer side file could not be written: {e}"));
+         }
+     }
+@@ -337,6 +385,10 @@ impl Session {
+         self.placements.clear();
+         self.waits.clear();
+         self.run = None;
++        // engine round E2: a state of the same run keeps the Nuzlocke game going (its graveyard
++        // is applied from the next frame, so a state never undoes a death); a state file's
++        // sidecar may name another game after this (read_state_sidecar)
++        let keep = self.nuz.take().filter(|n| Some(n.run.as_str()) == id);
+         let Some(id) = id else { return };
+         let path = run_dir(data, id).join("patch.txt");
+         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Patch::parse(&t)) {
+@@ -346,6 +398,7 @@ impl Session {
+                     r.assume_applied_in(g, base);
+                 }
+                 self.run = Some(r);
++                self.nuz = keep;
+             }
+             Err(e) => self.note(format!("the state's randomized game {id} is missing ({e}); its tables stay as saved")),
+         }
+@@ -365,6 +418,17 @@ pub fn after_frame(system: &mut System) {
+     if !is_fates(system) {
+         return;
+     }
++    after_frame_inner(system);
++    // engine round E2: the active Nuzlocke game's frame (nothing without one)
++    if system.rando.nuz.is_some() && crate::fates_nuzlocke::in_game(&mut system.memory) {
++        let notes = system.rando.nuz.as_mut().map(|n| n.frame(&mut system.memory)).unwrap_or_default();
++        for t in notes {
++            notice(system, t);
++        }
++    }
++}
++
++fn after_frame_inner(system: &mut System) {
+     prebuild(system);
+     match system.rando.frame(&mut system.memory) {
+         Pick::None | Pick::Page => {}
+@@ -823,12 +887,19 @@ pub fn sidecar_path(state: &Path) -> PathBuf {
+ 
+ /// writes (run active) or removes (original game) the sidecar of a state file.
+ pub fn write_sidecar(state: &Path, run: Option<&str>) -> std::io::Result<()> {
++    write_sidecar_nuz(state, run, None)
++}
++
++/// `write_sidecar` with the Nuzlocke game id (engine round E2; None = exactly as before).
++pub fn write_sidecar_nuz(state: &Path, run: Option<&str>, nuz: Option<&str>) -> std::io::Result<()> {
+     let side = sidecar_path(state);
+     match run {
+         Some(id) => {
+             let tmp = sidecar_path(&side);
+             let id = id.replace('\\', "\\\\").replace('"', "\\\"");
+-            std::fs::write(&tmp, format!("{{\"format\": {}, \"run\": \"{id}\"}}\n", fates_rando::FORMAT))?;
++            let nuz = nuz.filter(|g| crate::fates_nuzlocke::gid_ok(g))
++                .map(|g| format!(", \"nuzlocke\": \"{g}\"")).unwrap_or_default();
++            std::fs::write(&tmp, format!("{{\"format\": {}, \"run\": \"{id}\"{nuz}}}\n", fates_rando::FORMAT))?;
+             std::fs::rename(&tmp, &side)
+         }
+         None => match std::fs::remove_file(&side) {
+@@ -848,13 +919,23 @@ pub fn write_state_sidecar(system: &System, state: &Path) -> std::io::Result<()>
+     if !is_fates(system) {
+         return Ok(());
+     }
+-    write_sidecar(state, state_run(system).as_deref())
++    let nuz = system.rando.nuz.as_ref().map(|n| n.gid.clone());
++    write_sidecar_nuz(state, state_run(system).as_deref(), nuz.as_deref())
+ }
+ 
+ /// after a state file was loaded: the active run from its sidecar (none = original).
+ pub fn read_state_sidecar(system: &mut System, state: &Path) {
+     let run = read_sidecar(state);
+     state_restore(system, run.as_deref());
++    // engine round E2: the state's Nuzlocke game; its graveyard is applied from the next
++    // frame on, so a state never undoes a death
++    if is_fates(system) {
++        let gid = std::fs::read_to_string(sidecar_path(state)).ok().and_then(|t| json_field(&t, "nuzlocke"));
++        if gid.is_some() {
++            let data = data_dir(system);
++            system.rando.nuz_for(&data, gid.as_deref());
++        }
++    }
+ }
+ 
+ // --------------------------------------------------------------------------- Python
+@@ -1094,6 +1175,12 @@ fn make_run_inner(data: &Path, id: &str, seed: &str, answer: &str, game: Option<
+             keep.push((p.clone(), name.to_string()));
+         }
+     }
++    // engine round E2: the Nuzlocke rules `rando.py make --patch-out` writes beside the patch
++    // (only with Nuzlocke on: no file = Nuzlocke off for this run)
++    let rules = work.join(crate::fates_nuzlocke::RULES_FILE);
++    if rules.is_file() {
++        keep.push((rules, crate::fates_nuzlocke::RULES_FILE.to_string()));
++    }
+     for (from, name) in keep {
+         let _ = std::fs::copy(&from, dir.join(&name));
+     }
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 57d762c..21b6f54 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -4,6 +4,7 @@
+ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
++pub mod fates_nuzlocke;
+ pub mod fates_rando;
+ pub mod fates_rando_file;
+ pub mod fates_rando_session;
+-- 
+

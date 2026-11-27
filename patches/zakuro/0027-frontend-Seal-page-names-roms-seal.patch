@@ -1,0 +1,20 @@
+From: FE Fates port <engine@localhost>
+Subject: [PATCH] frontend: Fire Emblem Fates: the Seal of Flames page names roms/seal (F-048)
+
+The Install button runs tools/play/sof.py install, which now finds the
+download zip in roms/seal (any depth; the old root folder for one
+release). Only the "Not installed" text changes. Applies after 0026.
+---
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+index e3eabbc..0275d05 100644
+--- a/crates/zakuro/src/game_pick.rs
++++ b/crates/zakuro/src/game_pick.rs
+@@ -167,7 +167,7 @@ impl SealStatus {
+     pub fn reason(&self) -> Option<String> {
+         match self {
+             SealStatus::Installed => None,
+-            SealStatus::Missing => Some("Not installed. Put the Seal of Flames v6 download in the port folder, then press Install.".into()),
++            SealStatus::Missing => Some("Not installed. Put the Seal of Flames download zip (still zipped) in the roms\\seal folder, then press Install.".into()),
+             SealStatus::Broken(why) => Some(format!("Needs repair ({why}): press Install again (your saves are kept).")),
+         }
+     }

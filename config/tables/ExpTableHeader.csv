@@ -1,0 +1,7 @@
+offset,size,type,name,confidence,evidence
+0x00,4,ptr:ExpBattle,battle,high,ExpTable::GetBattle(int) 004E6368 reads [ExpTable+0x0] (row stride 0x48)
+0x04,4,ptr:ExpBattleFloor,battle_threshold,high,ExpTable::GetBattleThreshold(int) 004E6314 reads [ExpTable+0x4] (row stride 0x18)
+0x08,4,ptr:ExpRod,rod_decline,high,ExpTable::GetRodDecline(int) 004E62C4 reads [ExpTable+0x8] (row stride 0x28)
+0x0C,4,ptr:ExpRodHigh,rod_high_decline,high,ExpTable::GetRodHighDecline(int) 004E62E0 reads [ExpTable+0xC] (row stride 4)
+0x10,4,ptr:ExpDance,dance,high,ExpTable::GetDance(int) 004E634C reads [ExpTable+0x10] (row stride 0x28)
+0x14,4,ptr:ExpSupport,support_decline,high,ExpTable::GetSupportDecline(int) 004E62F8 reads [ExpTable+0x14] (row stride 0x28)

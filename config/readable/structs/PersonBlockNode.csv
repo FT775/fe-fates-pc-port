@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr:PersonBlock,block,high,"Person::IsDownload 0x0053E070 loads the block through it and tests the block's number range",
+0x008,0x4,ptr:PersonBlockNode,next,high,"Person::IsDownload 0x0053E0D0 continues with this word until 0",

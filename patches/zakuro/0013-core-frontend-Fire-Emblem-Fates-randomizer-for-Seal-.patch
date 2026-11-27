@@ -1,0 +1,406 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Fri, 20 Nov 2026 16:59:21 -0500
+Subject: [PATCH 13/21] core, frontend: Fire Emblem Fates' randomizer for Seal
+ of Flames too
+
+The owner asked that the randomizer work for every path and story, Seal of
+Flames included (F-047, round 58). Seal of Flames by Laz14
+(gamebanana.com/mods/656034, CC BY-NC-ND 4.0) shares Fates' title id
+(0004000000179800) and plays from its own profile with its files laid over
+the game's RomFS (Zakuro's mods folder).
+
+- Config gets fates_rando_game: None (the default, every existing caller and
+  Fire Emblem Fates) or Some("seal"). The frontend now leaves fates_rando on
+  for both games and sets fates_rando_game from game_pick::rando_game(choice);
+  the Esc menu's Randomizer entry and the page's schema ask are no longer
+  held back for Seal of Flames.
+- make_run_for: for Seal the tool command gets two more arguments, the game
+  and <data>/mods/<title>/romfs (mod_romfs, Zakuro's upper/lower-case title
+  folder rule); the Python snippet then calls tools/randomizer/sources.py
+  activate first, so the run is made from the mod's own tables and its patch
+  guards are the mod's bytes. For Fates the command is the same as before.
+- answer_for: a Seal answer gets "game": "seal" first, so its runs have their
+  own ids and their options.json names the game. A Fates answer is unchanged.
+- Placement files: Seal reads its RomFS through zakuro_fs::layered::Layered.
+  Layered::lookup(path) gives a file's (data offset, size) in the layered
+  image; placements() uses it when fates_rando_game is set (Fates with a
+  layered RomFS still gets none, as before), make_placement reads the stored
+  file through Layered::read, and read_file's Layered branch calls
+  overlay_read like the plain RomImage branch.
+
+Every cell is still checked against its original value before anything is
+written (all or nothing): a Seal run on the original game's tables (or the
+reverse) is refused whole at GameData, so nothing is laid.
+
+Checked: cargo test -p zakuro-core --lib, -p zakuro-fs --lib, -p zakuro --lib
+all pass (new: answer_for and run ids, mod_romfs, the make snippet,
+Layered::lookup against Layered::read, game_pick::rando_game).
+---
+ crates/zakuro-core/src/fates_rando_session.rs | 114 ++++++++++++++++--
+ crates/zakuro-core/src/lib.rs                 |   6 +
+ crates/zakuro-core/src/services/fs.rs         |   3 +
+ crates/zakuro-fs/src/layered.rs               |  32 +++++
+ crates/zakuro/src/game_pick.rs                |  18 ++-
+ crates/zakuro/src/lib.rs                      |  10 +-
+ crates/zakuro/src/menus.rs                    |   4 +-
+ 7 files changed, 171 insertions(+), 16 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index bfed854..59ae7e9 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -367,11 +367,38 @@ pub fn notices(system: &System) -> Vec<String> {
+ /// made yet (a few seconds, hidden).
+ pub fn answer(system: &mut System, answer: &str) -> Result<Option<String>, String> {
+     let data = data_dir(system);
+-    let r = system.rando.answer(&mut system.memory, &data, answer, &mut make_run);
++    let game = system.config.fates_rando_game.clone();
++    let answer = answer_for(answer, game.as_deref());
++    let mut make = |d: &Path, id: &str, seed: &str, a: &str| make_run_for(d, id, seed, a, game.as_deref());
++    let r = system.rando.answer(&mut system.memory, &data, &answer, &mut make);
+     refresh_placements(system);
+     r
+ }
+ 
++/// the answer as the tool gets it: for Fire Emblem Fates exactly the page's; for another
++/// game (Seal of Flames) the same with `"game": "<game>"` first, so its runs get their own
++/// ids and their options.json names the game.
++pub fn answer_for(answer: &str, game: Option<&str>) -> String {
++    match (game, answer.trim_start().strip_prefix('{')) {
++        (Some(g), Some(rest)) if json_field(answer, "game").is_none() => {
++            let rest = rest.trim_start();
++            let sep = if rest.starts_with('}') { "" } else { ", " };
++            format!("{{\"game\": \"{g}\"{sep}{rest}")
++        }
++        _ => answer.to_string(),
++    }
++}
++
++/// where Seal of Flames' files are for the tool: Zakuro's mod folder of the title in the
++/// game's data folder (upper-case id unless only the lower-case one exists, as mods.rs).
++pub fn mod_romfs(data: &Path) -> PathBuf {
++    let mods = data.join("mods");
++    let upper = mods.join(format!("{TITLE:016X}"));
++    let lower = mods.join(format!("{TITLE:016x}"));
++    let dir = if !upper.exists() && lower.exists() { lower } else { upper };
++    dir.join("romfs")
++}
++
+ /// lays a run already made (see `Session::lay`).
+ pub fn lay_run(system: &mut System, id: &str) -> Result<(), String> {
+     let data = data_dir(system);
+@@ -387,10 +414,25 @@ pub fn go_original(system: &mut System) {
+ 
+ fn placements(system: &System, patch: &Patch) -> Vec<Placement> {
+     let Some(title) = system.title.as_ref() else { return Vec::new() };
+-    // only the plain RomFS the game reads as "romfs:/"; with mods laid over it (a PLAY
+-    // RANDOMIZED profile) the GameData guard has already refused
+-    if title.layered.is_some() {
+-        return Vec::new();
++    // Fire Emblem Fates: only the plain RomFS the game reads as "romfs:/"; with mods laid
++    // over it (a PLAY RANDOMIZED profile) the GameData guard has already refused. A game
++    // that is a mod sharing the title id (Seal of Flames) plays from its layered RomFS: the
++    // placement files are found in that image (the run was made from the mod's files)
++    if let Some(layered) = title.layered.as_ref() {
++        if system.config.fates_rando_game.is_none() {
++            return Vec::new();
++        }
++        let mut out = Vec::new();
++        for (i, f) in patch.files.iter().enumerate() {
++            if f.kind != fates_rando::Kind::Dispos {
++                continue;
++            }
++            match layered.lookup(&f.rel) {
++                Some((start, len)) => out.push(Placement { file: i, start, len, served: None, late: false }),
++                None => log::warn!("fates_rando: {}: not in the layered RomFS", f.rel),
++            }
++        }
++        return out;
+     }
+     let Some(romfs) = title.romfs.as_ref() else { return Vec::new() };
+     let mut out = Vec::new();
+@@ -475,9 +517,17 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     let run = system.rando.run.as_ref()?;
+     let f = run.patch.files.get(p.file)?.clone();
+     let title = system.title.as_ref()?;
+-    let romfs = title.romfs.as_ref()?;
+-    let at = (romfs.base + p.start) as usize;
+-    let stored = title.shared_image().data().get(at..at + p.len as usize)?.to_vec();
++    let stored = if let Some(layered) = title.layered.as_ref() {
++        let mut buf = vec![0u8; p.len as usize];
++        if layered.read(title.shared_image().data(), p.start, &mut buf) != buf.len() {
++            return None;
++        }
++        buf
++    } else {
++        let romfs = title.romfs.as_ref()?;
++        let at = (romfs.base + p.start) as usize;
++        title.shared_image().data().get(at..at + p.len as usize)?.to_vec()
++    };
+     match crate::fates_rando_file::patch_stored(&stored, &f) {
+         Ok(bytes) => {
+             log::info!("fates_rando: {} patched in the read ({} cells)", f.rel, f.values.len() + f.ptrs.len());
+@@ -750,12 +800,20 @@ import ingame\n\
+ a = json.load(open(answer, encoding='utf-8'))\n\
+ a['seed'] = a.get('seed') or seed\n\
+ with open(options, 'w', encoding='utf-8') as fh:\n    json.dump(a, fh, sort_keys=True)\n\
++if len(sys.argv) > 8 and sys.argv[7] != 'fates':\n    import sources\n    sources.activate(sys.argv[7], sys.argv[8] or None)\n\
+ sys.exit(rando.main(['make'] + ingame.make_args(a) + ['--out', out, '--patch-out', patch]))\n";
+ 
+ /// makes run `id` with Python and keeps its files in `<data>/rando/<title>/runs/<id>/`.
+ /// Python works in the repo's `build/rando-make/<id>/` (the randomizer refuses to write
+ /// inside %APPDATA%, where the owner's data folder is); the files are copied over after.
+ pub fn make_run(data: &Path, id: &str, seed: &str, answer: &str) -> Result<PathBuf, String> {
++    make_run_for(data, id, seed, answer, None)
++}
++
++/// `make_run` for a game: None = Fire Emblem Fates (the same command as before); Some(g)
++/// = a mod sharing the title id (`seal`): the tool first switches its tables to that game
++/// (`tools/randomizer/sources.py` `activate`, the mod's files from `mod_romfs(data)`).
++pub fn make_run_for(data: &Path, id: &str, seed: &str, answer: &str, game: Option<&str>) -> Result<PathBuf, String> {
+     let tool = find_tool()?;
+     let py = find_python()?;
+     let root = tool.parent().and_then(Path::parent).ok_or("tools/randomizer has no repo above it")?;
+@@ -765,8 +823,13 @@ pub fn make_run(data: &Path, id: &str, seed: &str, answer: &str) -> Result<PathB
+     let answer_path = work.join("answer.json");
+     std::fs::write(&answer_path, answer).map_err(|e| e.to_string())?;
+     let (out, patch, options) = (work.join("mod"), work.join("patch.txt"), work.join("options.json"));
+-    let args: Vec<&std::ffi::OsStr> = vec!["-c".as_ref(), MAKE_SCRIPT.as_ref(), tool.as_os_str(), answer_path.as_os_str(),
+-                                            out.as_os_str(), patch.as_os_str(), seed.as_ref(), options.as_os_str()];
++    let mut args: Vec<&std::ffi::OsStr> = vec!["-c".as_ref(), MAKE_SCRIPT.as_ref(), tool.as_os_str(), answer_path.as_os_str(),
++                                                out.as_os_str(), patch.as_os_str(), seed.as_ref(), options.as_os_str()];
++    let romfs = mod_romfs(data);
++    if let Some(g) = game {
++        args.push(g.as_ref());
++        args.push(romfs.as_os_str());
++    }
+     let (cmd, _) = python_command(&py, &args);
+     log::info!("fates_rando: making {id} with {:?}", py.program);
+     let (code, lines) = run_hidden(cmd, MAKE_TIMEOUT).map_err(|e| format!("the randomizer: {e}"))?;
+@@ -832,6 +895,37 @@ mod tests {
+         assert_eq!(active_run(&system), None);
+     }
+ 
++    #[test]
++    fn seal_of_flames_runs_name_their_game_and_fates_answers_stay_as_they_are() {
++        let page = "{\"randomizer\": true, \"seed\": \"abc\"}";
++        assert_eq!(answer_for(page, None), page);
++        let seal = answer_for(page, Some("seal"));
++        assert_eq!(seal, "{\"game\": \"seal\", \"randomizer\": true, \"seed\": \"abc\"}");
++        assert_eq!(json_field(&seal, "randomizer").as_deref(), Some("true"));
++        assert_eq!(json_field(&seal, "game").as_deref(), Some("seal"));
++        assert_ne!(run_id("abc", &seal), run_id("abc", page), "a Seal run never takes a Fates run's id");
++        assert_eq!(answer_for("{}", Some("seal")), "{\"game\": \"seal\"}");
++        assert_eq!(answer_for(&seal, Some("seal")), seal, "named once");
++        assert!(crate::Config::default().fates_rando_game.is_none(), "every existing caller: Fates");
++    }
++
++    #[test]
++    fn the_mod_folder_follows_zakuros_title_folder_rule() {
++        let data = std::env::temp_dir().join(format!("fef-rando-modromfs-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&data);
++        assert_eq!(mod_romfs(&data), data.join("mods").join("0004000000179800").join("romfs"));
++        std::fs::create_dir_all(data.join("mods").join("0004000000179800")).unwrap();
++        assert_eq!(mod_romfs(&data), data.join("mods").join("0004000000179800").join("romfs"));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
++    #[test]
++    fn the_make_script_switches_tables_only_for_another_game() {
++        assert!(MAKE_SCRIPT.contains("sys.argv[7] != 'fates'"));
++        assert!(MAKE_SCRIPT.contains("sources.activate(sys.argv[7], sys.argv[8] or None)"));
++        assert!(MAKE_SCRIPT.find("sources.activate").unwrap() < MAKE_SCRIPT.find("rando.main").unwrap());
++    }
++
+     #[test]
+     fn python_starts_without_a_window() {
+         let py = Python { program: "python".into(), args: vec![] };
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index a4fa66f..57d762c 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -105,6 +105,11 @@ pub struct Config {
+     /// it off for a game that shares Fates' title id but is not Fates, a mod such as
+     /// Seal of Flames by Laz14, and then every randomizer hook returns at once.
+     pub fates_rando: bool,
++    /// which game the in-game randomizer makes its runs for: None = Fire Emblem Fates
++    /// itself (as before); Some("seal") = Seal of Flames by Laz14, which shares Fates'
++    /// title id: the tool reads the mod's tables (`<data>/mods/<title>/romfs` laid over the
++    /// game's) and the chapter placement files are patched in the mod's layered RomFS.
++    pub fates_rando_game: Option<String>,
+ }
+ 
+ impl Default for Config {
+@@ -135,6 +140,7 @@ impl Default for Config {
+             wireless_reboot: None,
+             skip_idle_loops: true,
+             fates_rando: true,
++            fates_rando_game: None,
+         }
+     }
+ }
+diff --git a/crates/zakuro-core/src/services/fs.rs b/crates/zakuro-core/src/services/fs.rs
+index aa63f0a..17c6e7d 100644
+--- a/crates/zakuro-core/src/services/fs.rs
++++ b/crates/zakuro-core/src/services/fs.rs
+@@ -1235,6 +1235,9 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
+         FileBacking::Layered(layered, image) => {
+             let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
+             let count = layered.read(image.data(), offset, &mut data);
++            // Fire Emblem Fates' randomizer for a mod sharing its title id (Seal of Flames):
++            // a chapter placement file of the active run read with its cells laid
++            crate::fates_rando_session::overlay_read(system, &file.path, offset, &mut data[..count]);
+             system.write_from_service(dest, &data[..count]);
+             count as u32
+         }
+diff --git a/crates/zakuro-fs/src/layered.rs b/crates/zakuro-fs/src/layered.rs
+index 7a381fd..babe133 100644
+--- a/crates/zakuro-fs/src/layered.rs
++++ b/crates/zakuro-fs/src/layered.rs
+@@ -131,6 +131,15 @@ impl Layered {
+         count
+     }
+ 
++    /// where the file at path (/ separated, from where the mod's paths
++    /// start) sits in the layered image: (offset of its data, its size).
++    /// None when the image has no such file.
++    pub fn lookup(&self, path: &str) -> Option<(u64, u64)> {
++        let romfs = RomFs::parse_level3(&self.meta, 0).ok()?;
++        let file = romfs.lookup(path).ok()?;
++        Some((romfs.file_data_offset(&file), file.data_size))
++    }
++
+     /// the files the mod put in, replacing, patching or adding them, whose
+     /// paths wanted takes, with their bytes. a path goes from where the
+     /// mod's paths start, / separated.
+@@ -481,6 +490,29 @@ mod tests {
+ 
+     /// reads that start and end anywhere get the same bytes as reading the
+     /// whole image, games read in chunks.
++    /// lookup finds a file where reading the layered image gets its bytes,
++    /// the mod's file or the game's (the randomizer patches Seal of Flames'
++    /// placement files in the layered image).
++    #[test]
++    fn lookup_points_at_the_files_bytes_in_the_layered_image() {
++        let image = game(&[("GameData/Dispos/A/A001.bin.lz", b"game placement"), ("GameData/GameData.bin.lz", b"tables")]);
++        let romfs = RomFs::parse_level3(&image, 0).unwrap();
++        let mods = folder("lookup");
++        put(&mods, "romfs/GameData/Dispos/A/A001.bin.lz", b"the mod's placement, longer");
++        put(&mods, "romfs/GameData/Dispos/C/R001.bin.lz", b"a new chapter");
++        let layered = Layered::new(&romfs, &image, &mods).unwrap().unwrap();
++        for (path, want) in [("GameData/Dispos/A/A001.bin.lz", &b"the mod's placement, longer"[..]),
++                             ("GameData/Dispos/C/R001.bin.lz", b"a new chapter"),
++                             ("GameData/GameData.bin.lz", b"tables")] {
++            let (start, size) = layered.lookup(path).expect(path);
++            let mut out = vec![0; size as usize];
++            assert_eq!(layered.read(&image, start, &mut out), out.len());
++            assert_eq!(out, want, "{path}");
++        }
++        assert_eq!(layered.lookup("GameData/Dispos/C/R099.bin.lz"), None);
++        std::fs::remove_dir_all(mods).unwrap();
++    }
++
+     #[test]
+     fn reads_in_pieces_match_the_whole() {
+         let image = game(&[("a.bin", &[1; 100]), ("b.bin", &[2; 37])]);
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+index 5464fa9..e3eabbc 100644
+--- a/crates/zakuro/src/game_pick.rs
++++ b/crates/zakuro/src/game_pick.rs
+@@ -17,7 +17,8 @@
+ //!   `<profile>\game-settings.toml`, so a Seal session never changes the owner's;
+ //! - the choice is remembered in `game-choice.txt` beside the program's folder (never in
+ //!   settings.toml), written only by the window;
+-//! - the randomizer runs only for Fire Emblem Fates (`Config::fates_rando`).
++//! - the randomizer runs for both (F-047): for Seal of Flames its runs are made from the
++//!   mod's own tables (`Config::fates_rando_game` = `rando_game(Game::Seal)`).
+ //!
+ //! No byte of the mod is read here: "installed" is decided from folder names and the
+ //! profile's own JSON. The Install button runs the port's `tools/play/sof.py install`
+@@ -33,6 +34,15 @@ use serde::{Deserialize, Serialize};
+ use crate::settings::{game_key, GameSettings, Settings, FATES_SE_USA};
+ 
+ /// the credit shown wherever the choice is.
++/// what the core's randomizer is told the game is (`Config::fates_rando_game`): None for
++/// Fire Emblem Fates (exactly as before), "seal" for Seal of Flames.
++pub fn rando_game(game: Game) -> Option<&'static str> {
++    match game {
++        Game::Fates => None,
++        Game::Seal => Some("seal"),
++    }
++}
++
+ pub const CREDIT: &str = "Seal of Flames by Laz14 (gamebanana.com/mods/656034), CC BY-NC-ND 4.0";
+ /// the Seal of Flames line on the page and in the menu.
+ pub const SEAL_NAME: &str = "Seal of Flames (by Laz14)";
+@@ -640,6 +650,12 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    #[test]
++    fn the_randomizer_runs_for_both_games_with_seals_own_tables() {
++        assert_eq!(rando_game(Game::Fates), None, "Fire Emblem Fates exactly as before");
++        assert_eq!(rando_game(Game::Seal), Some("seal"));
++    }
++
+     #[test]
+     fn the_install_runs_hidden_and_isolated() {
+         let python = zakuro_core::fates_rando_session::Python { program: "python".into(), args: vec![] };
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 32191a7..c7cd27b 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -813,7 +813,10 @@ impl App {
+             username: self.nickname(),
+             console_id: settings.console_id,
+             slider_3d: settings.slider_3d(),
+-            fates_rando: self.choice == game_pick::Game::Fates,
++            // the in-game randomizer runs for both games (F-047): Seal of Flames' runs are
++            // made from the mod's own tables and laid in its layered RomFS
++            fates_rando: true,
++            fates_rando_game: game_pick::rando_game(self.choice).map(str::to_owned),
+             ..Config::default()
+         }
+     }
+@@ -941,7 +944,7 @@ impl App {
+         // Fire Emblem Fates' Randomizer page asks the port's tool for its rows now, in a
+         // thread, so they are there by the mode pick; a new game starts with none open
+         self.menus.rando.reset();
+-        if rando_link::is_fates(&game.system) && self.options.headless.is_none() && self.choice == game_pick::Game::Fates {
++        if rando_link::is_fates(&game.system) && self.options.headless.is_none() {
+             self.menus.rando.ask();
+         }
+         // with a window the mode pick waits for the page; headless runs answer by
+@@ -1131,7 +1134,7 @@ impl App {
+         }
+         self.choice = game;
+         self.active = self.settings.clone();
+-        self.menus.rando_blocked = game != game_pick::Game::Fates;
++        self.menus.rando_blocked = false;
+         self.menus.seal_playing = game == game_pick::Game::Seal;
+         let to = game.other();
+         let why = (to == game_pick::Game::Seal).then(|| game_pick::seal_status(self.seal_profile.as_deref(), false).reason()).flatten();
+@@ -1348,6 +1351,7 @@ impl App {
+             "choice": choice,
+             "data_dir": data,
+             "fates_rando": game.system.config.fates_rando,
++            "fates_rando_game": game.system.config.fates_rando_game,
+             "fatal_errors": game.system.fatal_errors.len(),
+             "hashes": hashes,
+         })
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index 9c5aba2..21f45c4 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -107,8 +107,8 @@ pub struct Menus {
+     background: Background,
+     /// Fire Emblem Fates' Randomizer page (the New Game one and the menu's This run).
+     pub rando: crate::rando_page::RandoPage,
+-    /// the Randomizer entry stays out even for Fire Emblem Fates' title id: a game
+-    /// sharing it is playing (the Fates port's Seal of Flames).
++    /// the Randomizer entry stays out even for Fire Emblem Fates' title id. Since F-047
++    /// (round 58) no game sets it: Seal of Flames has the randomizer too.
+     pub rando_blocked: bool,
+     /// the Fates port's Switch game entry, while its page applies: the other game, and
+     /// why it can't be chosen when it can't.

@@ -1,0 +1,129 @@
+{
+ "status": "NEW",
+ "written": "2026-11-25 10:09:11",
+ "from": "build/r75b/integrate/smoke2",
+ "compared_with": "build/r75b/integrate/smoke_reference.json",
+ "note": "hashes and verdicts only (no game values); re-take inside a round commit with --write-baseline; round 84 (F-072): the 2 Seal jobs and their run moved to config/seal/smoke_baseline.json",
+ "runs": {
+  "fates-all1": {
+   "id": "r59fall1-37ec8c6e",
+   "patch_sha256": "3f35cda1292b57773f1d5d6a86110c9782afa658faee2ec6a8b6a4e66aef521c"
+  }
+ },
+ "jobs": {
+  "bt-A011-off": {
+   "verdict": "PASS",
+   "map_frame": 6058,
+   "hashes": {
+    "units_map": "b6d7307ae682188f63946ab1898e311471a6902c8d993f262de6cc3ca05667a5",
+    "units_reload": "efcc94ec4dc90cf3d4e15485525f0c7c21442c87d1f6ff61144a3ae3d8a7a3ce",
+    "cells_map": "b0a13d918b4f115b39742feec2f7eaea6f68a3ab288b3a72ed11f4cfb57e84dc",
+    "cells_reload": "b0a13d918b4f115b39742feec2f7eaea6f68a3ab288b3a72ed11f4cfb57e84dc"
+   }
+  },
+  "bt-A011-all1": {
+   "verdict": "PASS",
+   "map_frame": 6058,
+   "hashes": {
+    "units_map": "4b37c9c8903bbae0ecc52ecd34adcbc98149583fa973eb02a13f7903e0a53cbb",
+    "units_reload": "e6f0c610838666ed13ede8d413525fcc8ad083a851edc001a54d224abd0397d1",
+    "cells_map": "b0a13d918b4f115b39742feec2f7eaea6f68a3ab288b3a72ed11f4cfb57e84dc",
+    "cells_reload": "b0a13d918b4f115b39742feec2f7eaea6f68a3ab288b3a72ed11f4cfb57e84dc"
+   }
+  },
+  "cq-B016-off": {
+   "verdict": "PASS",
+   "map_frame": 6182,
+   "hashes": {
+    "units_map": "2a8efeac89fcf7a30e02df3248308364c26e619cfb596a3162b50a933ad65644",
+    "units_reload": "b7e95d941cb5488d9140d5a13381c09fdcb1a1bd6df098efd5e2d4de87d51392",
+    "cells_map": "48ca46f10f7a2272172064d0c00ec677ad632222fe3fe2ec265cfe8e6108a0b6",
+    "cells_reload": "48ca46f10f7a2272172064d0c00ec677ad632222fe3fe2ec265cfe8e6108a0b6"
+   }
+  },
+  "cq-B016-all1": {
+   "verdict": "PASS",
+   "map_frame": 6182,
+   "hashes": {
+    "units_map": "4e992f559b2196cae05b05abed3207d5ac7650d4a9ed62c4fc1d0ddddf20c1a4",
+    "units_reload": "0e29c9e145cf9c5fbd1cd24bbe256107db04213921ceee88fdf83d1ebdd96360",
+    "cells_map": "48ca46f10f7a2272172064d0c00ec677ad632222fe3fe2ec265cfe8e6108a0b6",
+    "cells_reload": "48ca46f10f7a2272172064d0c00ec677ad632222fe3fe2ec265cfe8e6108a0b6"
+   }
+  },
+  "rv-C012-off": {
+   "verdict": "PASS",
+   "map_frame": 6118,
+   "hashes": {
+    "units_map": "baed0acd6414fb64a5b1c8c84649874ce6a242ce64847f97999593a8dc751b00",
+    "units_reload": "cc9067c890b272a086c94fb5d620d0deef829ccef10b7ca8fbe48803485179f9",
+    "cells_map": "fa05bfc952f91b9fefd4173a3360faaf2497f31c1f2d292c43cab39f2b5a2f2b",
+    "cells_reload": "fa05bfc952f91b9fefd4173a3360faaf2497f31c1f2d292c43cab39f2b5a2f2b"
+   }
+  },
+  "rv-C012-all1": {
+   "verdict": "PASS",
+   "map_frame": 6118,
+   "hashes": {
+    "units_map": "06a9f3006b59d26074dc32aa4564cf095a603df1f5c161a6c24157370accb9b3",
+    "units_reload": "d1562f5c4b18cce049f8c1f540cf9912cae9d55bc6ae3c47d3e8b61e1d6dd8f1",
+    "cells_map": "fa05bfc952f91b9fefd4173a3360faaf2497f31c1f2d292c43cab39f2b5a2f2b",
+    "cells_reload": "fa05bfc952f91b9fefd4173a3360faaf2497f31c1f2d292c43cab39f2b5a2f2b"
+   }
+  }
+ },
+ "memory": {
+  "mem-off": [
+   {
+    "event": "boot",
+    "game_frame": 0,
+    "fatal_errors": 0,
+    "sha256": [
+     "425382d5857f04fc49585cabbdef6fc647472ee26f52c54caaaeaad17320b3f8",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917"
+    ]
+   },
+   {
+    "event": "at",
+    "game_frame": 3000,
+    "fatal_errors": 0,
+    "sha256": [
+     "3906459544411573bed6bbe316f65b70c653b4c404e794e4e223a339664219b0",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917",
+     "f73da0ca5157d04d88b14df894c7cccb9033d2899280f58e929e295d31e72bc7"
+    ]
+   },
+   {
+    "event": "at",
+    "game_frame": 4600,
+    "fatal_errors": 0,
+    "sha256": [
+     "e48003d8417dffddd9d5ce0db94b608144d4c2ad6dbf5ecec0e5d39c94bf274a",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917",
+     "7b777f293abf13427657840a16244e96c464f96b5bac66d2ce5fb19ff48c361d"
+    ]
+   },
+   {
+    "event": "at",
+    "game_frame": 5200,
+    "fatal_errors": 0,
+    "sha256": [
+     "e48003d8417dffddd9d5ce0db94b608144d4c2ad6dbf5ecec0e5d39c94bf274a",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917",
+     "e4cd7f64fb04c2fb71ba891e525170dd7559a88215010736f7e82e1c5fa708ce"
+    ]
+   },
+   {
+    "event": "end",
+    "game_frame": 5200,
+    "fatal_errors": 0,
+    "sha256": [
+     "e48003d8417dffddd9d5ce0db94b608144d4c2ad6dbf5ecec0e5d39c94bf274a",
+     "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917",
+     "e4cd7f64fb04c2fb71ba891e525170dd7559a88215010736f7e82e1c5fa708ce"
+    ]
+   }
+  ]
+ }
+}

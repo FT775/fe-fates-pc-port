@@ -1,0 +1,1380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Fri, 20 Nov 2026 02:42:19 -0500
+Subject: [PATCH 09/21] frontend: Fire Emblem Fates' Randomizer page after the
+ New Game mode pick
+
+The Fates port's owner asked (its docs/DECISIONS.md F-044) for the
+randomizer settings as a page inside the game, right after Casual or
+Classic, and a Randomizer entry in the Esc menu.
+
+- rando_page: the form (every row the port's rando.py schema gives,
+  Randomizer off by default, seed with Random, Everything on, Defaults),
+  shown over the paused game when the core says the mode was picked.
+  Start game hands the answers to the core; a failure offers Back or the
+  original game. The schema is asked once per Fates start, in a thread,
+  through Python started hidden (CREATE_NO_WINDOW, stdin closed, output
+  piped into the log); never in headless runs.
+- Esc menu: Randomizer (Fates only) opens This run: on/off, the seed,
+  the settings not at their default, the spoiler log, the core's notices.
+- rando_link: the page's only door to zakuro-core fates_rando_session
+  (one data folder, one run folder, one state sidecar writer). With a
+  window the core waits for the page; headless runs answer by themselves.
+- <data>/rando/last.json is written only when a randomized game starts.
+- --headless plays ZAKURO_REPLAY's inputs back too (it pressed nothing
+  before), so a test run gets past the title by itself.
+- settings test a_first_run_has_the_fates_port_picks compares another
+  game's resolved settings without the per-game maps that hold Fates'
+  own picks (it failed since 0006).
+
+Our own code and words; no game data.
+---
+ Cargo.lock                      |   1 +
+ crates/zakuro/Cargo.toml        |   2 +
+ crates/zakuro/src/lib.rs        | 100 +++-
+ crates/zakuro/src/menus.rs      |   8 +-
+ crates/zakuro/src/rando_link.rs | 124 +++++
+ crates/zakuro/src/rando_page.rs | 937 ++++++++++++++++++++++++++++++++
+ crates/zakuro/src/settings.rs   |   9 +-
+ 7 files changed, 1176 insertions(+), 5 deletions(-)
+ create mode 100644 crates/zakuro/src/rando_link.rs
+ create mode 100644 crates/zakuro/src/rando_page.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a2096c7..5d9e8f5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4650,6 +4650,7 @@ dependencies = [
+  "recomp3ds",
+  "rfd",
+  "serde",
++ "serde_json",
+  "sha2",
+  "toml",
+  "winit",
+diff --git a/crates/zakuro/Cargo.toml b/crates/zakuro/Cargo.toml
+index 797b370..65db34d 100644
+--- a/crates/zakuro/Cargo.toml
++++ b/crates/zakuro/Cargo.toml
+@@ -28,6 +28,8 @@ egui = { version = "0.36", default-features = false, features = ["default_fonts"
+ egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "wayland", "x11"] }
+ ab_glyph = "0.2"
+ serde = { version = "1.0.229", features = ["derive"] }
++# the randomizer page reads the port's tool's rows and gives the core its answers as JSON
++serde_json = "1"
+ toml = "1.1.6"
+ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+ image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 2279782..3b6bb7e 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -13,6 +13,8 @@ mod library;
+ mod menus;
+ mod overlays;
+ mod present;
++mod rando_link;
++mod rando_page;
+ mod recompile;
+ mod report;
+ mod settings;
+@@ -158,7 +160,7 @@ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+     if let Some(frames) = app.options.headless {
+         app.start();
+         if let Some(game) = &mut app.game {
+-            run_headless(&mut game.system, frames);
++            run_headless(&mut game.system, game.replay.as_mut(), frames);
+         }
+         return;
+     }
+@@ -350,11 +352,16 @@ fn paint_test_pattern(config: Config) -> System {
+     system
+ }
+ 
+-fn run_headless(system: &mut System, frames: u64) {
++fn run_headless(system: &mut System, mut replay: Option<&mut zakuro_core::replay::Replay>, frames: u64) {
+     let start = Instant::now();
+     let mut outcome = FrameOutcome::Completed;
+     let mut ran = 0;
+-    for _ in 0..frames {
++    for frame in 0..frames {
++        // ZAKURO_REPLAY plays its inputs back headless too (a test run that gets past
++        // the title by itself, Fire Emblem Fates' randomizer test hook for one)
++        if let Some(replay) = replay.as_deref_mut() {
++            system.set_input(replay.input(frame));
++        }
+         outcome = system.run_frame();
+         ran += 1;
+         if outcome != FrameOutcome::Completed {
+@@ -890,6 +897,15 @@ impl App {
+         if !notes.is_empty() {
+             self.menus.message = Some(notes.join("\n\n"));
+         }
++        // Fire Emblem Fates' Randomizer page asks the port's tool for its rows now, in a
++        // thread, so they are there by the mode pick; a new game starts with none open
++        self.menus.rando.reset();
++        if rando_link::is_fates(&game.system) && self.options.headless.is_none() {
++            self.menus.rando.ask();
++        }
++        // with a window the mode pick waits for the page; headless runs answer by
++        // themselves (FEF_RANDO_ANSWER or the original game)
++        rando_link::set_interactive(&mut game.system, self.options.headless.is_none());
+         self.game = Some(game);
+         self.extras = Extras::default();
+         // the new game's cameras see what the settings say, and it plays
+@@ -909,6 +925,7 @@ impl App {
+ 
+     fn back_to_library(&mut self) {
+         self.game = None;
++        self.menus.rando.reset();
+         self.overlay_corner = None;
+         if let Some(room) = &self.room {
+             room.playing("");
+@@ -1800,6 +1817,10 @@ impl App {
+         }
+         game.system.set_input(input);
+         let outcome = game.system.run_frame();
++        // the core saw the New Game mode pick and waits for the Randomizer page
++        if rando_link::take_pending(&mut game.system) {
++            self.menus.rando.open_new_game();
++        }
+         // the overlay reads the game the program was built on, not another
+         // one its library opened
+         let ours = self.linked.as_ref().is_none_or(|linked| game.system.title.as_ref().is_some_and(|title| title.program_id() == linked.program_id()));
+@@ -1969,6 +1990,10 @@ impl App {
+             let partial = path.with_extension("state.new");
+             std::fs::write(&partial, &bytes).and_then(|()| std::fs::rename(&partial, &path)).map_err(|error| error.to_string())
+         });
++        if saved.is_ok() {
++            // the randomized game in it, beside it (none = the original game)
++            rando_link::state_saved(&game.system, &path);
++        }
+         match saved {
+             Ok(()) => {
+                 log::info!("saved the state to {} in {:?}", path.display(), started.elapsed());
+@@ -1991,6 +2016,10 @@ impl App {
+                 _ => format!("The state could not be read, {error}"),
+             })
+             .and_then(|bytes| game.system.load_state(&bytes).map_err(|error| format!("The state could not be loaded, {error}.")));
++        if loaded.is_ok() {
++            // the memory holds that game's tables already; the core is told which run it is
++            rando_link::state_loaded(&mut game.system, &path);
++        }
+         match loaded {
+             Ok(()) => {
+                 log::info!("loaded the state from {}", path.display());
+@@ -2075,6 +2104,8 @@ impl App {
+         let corner = self.overlay_corner.clone().filter(|_| game.is_some());
+         let (menus, library, settings, jobs, waiting) = (&mut self.menus, &self.library, &mut self.settings, &self.jobs, &self.waiting);
+         let mut actions = Vec::new();
++        let mut rando_actions = Vec::new();
++        let rando_data = self.data_dir.clone();
+         let overlay = gui.frame(window, |ui| {
+             match &game {
+                 Some((name, fps, recompiled)) => {
+@@ -2115,6 +2146,12 @@ impl App {
+             if let Some(cheats) = &cheats {
+                 actions.extend(menus.cheats(ui.ctx(), cheats));
+             }
++            if game.is_some() {
++                rando_actions.extend(menus.rando.draw_new_game(ui.ctx(), rando_data.as_deref()));
++                if menus.rando.this_run_open {
++                    rando_actions.extend(menus.rando.draw_this_run(ui.ctx()));
++                }
++            }
+             if let Some(request) = &keyboard {
+                 actions.extend(menus.keyboard(ui.ctx(), request));
+             }
+@@ -2128,9 +2165,66 @@ impl App {
+         for action in actions {
+             self.act(action, event_loop);
+         }
++        self.rando(rando_actions);
+         overlay
+     }
+ 
++    /// Fire Emblem Fates' Randomizer page: gives the core the page's answer (the one
++    /// shown as "making" last frame, or Play the original game), and keeps This run up
++    /// to date while the menu's Randomizer window is open.
++    fn rando(&mut self, actions: Vec<rando_page::PageAction>) {
++        let mut answers: Vec<String> = self.menus.rando.take_answer().into_iter().collect();
++        for action in actions {
++            match action {
++                rando_page::PageAction::Answer(text) => answers.push(text),
++                rando_page::PageAction::Spoiler(path) => show_folder(&path),
++            }
++        }
++        let data = self.data_dir.clone();
++        let Some(game) = &mut self.game else { return };
++        if let Some(text) = answers.into_iter().next() {
++            let result = rando_link::answer(&mut game.system, &text).map(|run| {
++                let notices = rando_link::notices(&game.system);
++                let parsed = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default();
++                match run {
++                    Some(id) => {
++                        log::info!(target: "zakuro::rando", "the randomized game {id} was laid");
++                        let spoiler = data.as_deref().map(|data| rando_page::run_dir(data, &id).join("spoiler.txt"));
++                        self.menus.rando.run_from(&parsed, spoiler, notices)
++                    }
++                    None => {
++                        log::info!(target: "zakuro::rando", "the original game goes on");
++                        self.menus.rando.run_from(&serde_json::json!({"randomizer": false}), None, notices)
++                    }
++                }
++            });
++            if let Err(why) = &result {
++                log::warn!(target: "zakuro::rando", "{why}");
++            }
++            self.menus.rando.answered(result, data.as_deref());
++            // the time making it took is not the game's to make up
++            self.next_frame = Instant::now();
++        }
++        if !self.menus.rando.this_run_open {
++            self.menus.rando.shown_for = None;
++        } else if !self.menus.rando.new_game {
++            // a save loaded since may have brought another run, or none
++            let run = rando_link::active_run(&game.system);
++            let notices = rando_link::notices(&game.system);
++            let key = (run.clone(), notices.len());
++            if self.menus.rando.shown_for.as_ref() == Some(&key) {
++                return;
++            }
++            self.menus.rando.shown_for = Some(key);
++            let answers = match (&run, &data) {
++                (Some(id), Some(data)) => rando_link::run_answers(data, id).unwrap_or_else(|| serde_json::json!({"randomizer": true, "seed": id})),
++                _ => serde_json::json!({"randomizer": false}),
++            };
++            let spoiler = run.as_deref().zip(data.as_deref()).map(|(id, data)| rando_page::run_dir(data, id).join("spoiler.txt"));
++            self.menus.rando.this_run = self.menus.rando.run_from(&answers, spoiler, notices);
++        }
++    }
++
+     /// the window's places of the screens in an arrangement.
+     fn window_layout(&self, arrangement: zakuro_gpu::ScreenLayout) -> Option<(Option<zakuro_gpu::Viewport>, Option<zakuro_gpu::Viewport>)> {
+         let size = self.window.as_ref()?.inner_size();
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index cfad9ba..5568985 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -103,6 +103,8 @@ pub struct Menus {
+     pub compiler_offer: Option<Vec<Wanted>>,
+     icons: HashMap<PathBuf, egui::TextureHandle>,
+     background: Background,
++    /// Fire Emblem Fates' Randomizer page (the New Game one and the menu's This run).
++    pub rando: crate::rando_page::RandoPage,
+ }
+ 
+ /// the room the player is in, as the multiplayer window shows it.
+@@ -207,7 +209,7 @@ fn cover(area: Vec2, picture: [usize; 2]) -> egui::Rect {
+ impl Menus {
+     /// whether something is open that stops the game while it is.
+     pub fn over_game(&self) -> bool {
+-        self.menu_open || self.settings_open || self.game_settings.is_some()
++        self.menu_open || self.settings_open || self.game_settings.is_some() || self.rando.over_game()
+     }
+ 
+     /// the library, filling the window. waiting are the games waiting for
+@@ -489,6 +491,10 @@ impl Menus {
+                 if wide(ui, "Cheats") {
+                     self.cheats_open = true;
+                 }
++                // Fire Emblem Fates: what the game playing now was started with
++                if program_id == Some(crate::rando_page::FATES) && wide(ui, "Randomizer") {
++                    self.rando.this_run_open = true;
++                }
+                 if wide(ui, "Multiplayer") {
+                     self.multiplayer_open = true;
+                 }
+diff --git a/crates/zakuro/src/rando_link.rs b/crates/zakuro/src/rando_link.rs
+new file mode 100644
+index 0000000..1e34383
+--- /dev/null
++++ b/crates/zakuro/src/rando_link.rs
+@@ -0,0 +1,124 @@
++//! The one place the Randomizer page (rando_page.rs) meets zakuro-core's `fates_rando`.
++//!
++//! What the page needs of the core (docs/RANDOMIZER_INGAME.md, round 51), by the design's
++//! names:
++//!
++//! - a **pending new game**: the core's own after-frame hook (in `System::run_frame`, so
++//!   headless runs and boot-server have it too) saw the mode pick and now waits for an
++//!   answer; headless, it answers by itself from `FEF_RANDO_ANSWER` or "off";
++//! - **answer(answers JSON)**: `{"randomizer": false}` lets the game go on as the
++//!   original; with Randomizer on the core runs `rando.py make --patch-out` hidden,
++//!   checks every cell and lays it (or nothing), and names the run;
++//! - the **active run** (its id, `<data>/rando/<title>/runs/<id>/`), and its notices.
++//!
++//! The core (patch 0008, `zakuro_core::fates_rando_session`) has these calls; this file
++//! only forwards to them, so the page and the core share one data folder (the program's
++//! `--data`, given to the core as `config.data_dir`), one run folder and one state sidecar
++//! writer.
++
++use std::path::Path;
++
++use zakuro_core::System;
++use zakuro_core::fates_rando_session as core;
++
++use crate::rando_page::FATES;
++
++/// whether the game running is Fire Emblem Fates.
++pub fn is_fates(system: &System) -> bool {
++    system.title.as_ref().is_some_and(|title| title.program_id() == FATES)
++}
++
++/// true once, in the frame the core saw the New Game mode pick and began waiting for the
++/// page's answer.
++pub fn take_pending(system: &mut System) -> bool {
++    core::take_pending(system)
++}
++
++/// the program has a window: the mode pick waits for the page (headless runs leave this
++/// off, and the core answers by itself from `FEF_RANDO_ANSWER` or "off").
++pub fn set_interactive(system: &mut System, interactive: bool) {
++    system.rando.interactive = interactive;
++}
++
++/// whether the answers ask for a randomized game (anything unreadable = the original).
++#[cfg_attr(not(test), allow(dead_code))]
++pub fn randomizer_on(answers: &str) -> bool {
++    serde_json::from_str::<serde_json::Value>(answers).ok().and_then(|value| value.get("randomizer")?.as_bool()).unwrap_or(false)
++}
++
++/// gives the core the page's answers. Ok(None) = the original game goes on; Ok(Some(id))
++/// = the randomized game `id` was laid; Err = nothing was written, and why.
++pub fn answer(system: &mut System, answers: &str) -> Result<Option<String>, String> {
++    core::answer(system, answers)
++}
++
++/// the randomized game in memory now (None = the original game).
++pub fn active_run(system: &System) -> Option<String> {
++    core::active_run(system)
++}
++
++/// what the core has to say about the active run (a chapter's placements kept original,
++/// a guard that failed).
++pub fn notices(system: &System) -> Vec<String> {
++    core::notices(system)
++}
++
++/// `<state>.rando.json`, the randomized game a Zakuro save state holds (the core's name).
++pub fn state_sidecar(state: &Path) -> std::path::PathBuf {
++    core::sidecar_path(state)
++}
++
++/// a save state was written: the run in it goes beside it; with none, nothing is left
++/// beside it (that state is the original game). The core writes it.
++pub fn state_saved(system: &System, state: &Path) {
++    if let Err(error) = core::write_state_sidecar(system, state) {
++        log::warn!(target: "zakuro::rando", "{}: {error}", state_sidecar(state).display());
++    }
++}
++
++/// the run a save state names, None = the original game.
++pub fn state_run(state: &Path) -> Option<String> {
++    core::read_sidecar(state)
++}
++
++/// a save state was loaded: the core takes the state's run (its patch and placements;
++/// the memory already holds that game's tables, so no table is written).
++pub fn state_loaded(system: &mut System, state: &Path) {
++    if let Some(id) = state_run(state) {
++        log::info!(target: "zakuro::rando", "the state holds the randomized game {id}");
++    }
++    core::read_state_sidecar(system, state);
++}
++
++/// the answers a run was made from: `<data>/rando/<title>/runs/<id>/options.json`.
++pub fn run_answers(data: &Path, run: &str) -> Option<serde_json::Value> {
++    let text = std::fs::read_to_string(core::run_dir(data, run).join("options.json")).ok()?;
++    let mut answers: serde_json::Value = serde_json::from_str(&text).ok()?;
++    // a run is a randomized game, whatever its file says of the switch
++    answers.as_object_mut()?.insert("randomizer".into(), serde_json::Value::Bool(true));
++    Some(answers)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_states_run_is_kept_beside_it() {
++        let dir = std::env::temp_dir().join(format!("zakuro-rando-link-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let state = dir.join("1.state");
++        assert_eq!(state_sidecar(&state), dir.join("1.state.rando.json"));
++        assert_eq!(state_run(&state), None);
++        std::fs::write(state_sidecar(&state), r#"{"format": 1, "run": "r51-0a1b2c3d"}"#).unwrap();
++        assert_eq!(state_run(&state).as_deref(), Some("r51-0a1b2c3d"));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn an_answer_with_randomizer_off_is_the_original_game() {
++        assert!(!randomizer_on(r#"{"randomizer": false}"#));
++        assert!(!randomizer_on("garbage") && !randomizer_on(r#"{"seed": "x"}"#));
++        assert!(randomizer_on(r#"{"randomizer": true, "seed": "x"}"#));
++    }
++}
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+new file mode 100644
+index 0000000..447af17
+--- /dev/null
++++ b/crates/zakuro/src/rando_page.rs
+@@ -0,0 +1,937 @@
++//! Fire Emblem Fates: the Randomizer page (docs/RANDOMIZER_INGAME.md sections 2, 5 and 6).
++//!
++//! It opens by itself, pausing the game like the menu over it, in the frame the core says
++//! the New Game mode (Casual / Classic / Phoenix) was picked, and shows every row of the
++//! port's randomizer (`tools/randomizer/rando.py schema`: one list, the same as PLAY
++//! RANDOMIZED's). **Start game** hands the core the answers as JSON
++//! (`{"randomizer": bool, "seed": "...", key: value, ...}`); the core makes the game from
++//! them (`rando.py make --patch-out`) and lays it, or does nothing with Randomizer off.
++//! The menu's **Randomizer** shows what the game playing now was started with.
++//!
++//! Python is started only hidden: on Windows with CREATE_NO_WINDOW, its output read
++//! through pipes into zakuro.log, never a console window. Without Python or the tool the
++//! page says so in one line and the game goes on as the original.
++//!
++//! The form ([`RandoForm`]) is a plain model, apart from its drawing, so it is tested
++//! without a window.
++
++use std::io::Read;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::sync::mpsc::{channel, Receiver, TryRecvError};
++use std::time::{Duration, Instant};
++
++use egui::{Color32, RichText, Vec2};
++use serde_json::{json, Map, Value};
++
++/// Fire Emblem Fates (USA), the one game the page is for.
++pub const FATES: u64 = 0x0004_0000_0017_9800;
++
++/// Windows' process creation flag that starts a console program with no window.
++pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++
++/// how long Python may take to answer `--version` and `schema`.
++const ANSWER_WITHIN: Duration = Duration::from_secs(5);
++
++/// a command that opens no window: CREATE_NO_WINDOW on Windows, nothing typed in, its
++/// output piped (read by [`run_hidden`], which writes it to the log). Every program this
++/// module starts goes through here.
++pub fn hidden(command: &mut Command) -> &mut Command {
++    #[cfg(windows)]
++    {
++        use std::os::windows::process::CommandExt;
++        command.creation_flags(CREATE_NO_WINDOW);
++    }
++    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
++}
++
++/// runs a program hidden and gives its output, or why it gave none. What it writes to
++/// its error output goes to zakuro.log. A program still running after `within` is
++/// stopped.
++pub fn run_hidden(program: &str, args: &[String], within: Duration) -> Result<String, String> {
++    let mut child = hidden(&mut Command::new(program))
++        .args(args)
++        .spawn()
++        .map_err(|error| format!("{program} could not be started: {error}"))?;
++    let mut out = child.stdout.take();
++    let mut err = child.stderr.take();
++    let out = std::thread::spawn(move || {
++        let mut text = String::new();
++        if let Some(out) = out.as_mut() {
++            let _ = out.read_to_string(&mut text);
++        }
++        text
++    });
++    let err = std::thread::spawn(move || {
++        let mut text = String::new();
++        if let Some(err) = err.as_mut() {
++            let _ = err.read_to_string(&mut text);
++        }
++        text
++    });
++    let start = Instant::now();
++    let status = loop {
++        match child.try_wait() {
++            Ok(Some(status)) => break Some(status),
++            Ok(None) if start.elapsed() < within => std::thread::sleep(Duration::from_millis(20)),
++            _ => {
++                let _ = child.kill();
++                let _ = child.wait();
++                break None;
++            }
++        }
++    };
++    let text = out.join().unwrap_or_default();
++    for line in err.join().unwrap_or_default().lines().filter(|line| !line.trim().is_empty()) {
++        log::info!(target: "zakuro::rando", "{program}: {line}");
++    }
++    match status {
++        None => Err(format!("{program} did not answer within {} s", within.as_secs())),
++        Some(status) if status.success() => Ok(text),
++        Some(status) => Err(format!("{program} stopped with {status}")),
++    }
++}
++
++/// the Pythons to try, in order: FEF_PYTHON, then `py -3`, then `python`.
++pub fn pythons() -> Vec<(String, Vec<String>)> {
++    let mut out = Vec::new();
++    if let Some(own) = std::env::var_os("FEF_PYTHON").filter(|value| !value.is_empty()) {
++        out.push((own.to_string_lossy().into_owned(), vec![]));
++    }
++    out.push(("py".to_owned(), vec!["-3".to_owned()]));
++    out.push(("python".to_owned(), vec![]));
++    out
++}
++
++/// the port's randomizer, `tools/randomizer/rando.py`: FEF_RANDO_TOOL (the folder or the
++/// file), else next to the program (`play/game/../../tools/randomizer`) or a few folders
++/// above it.
++pub fn tool() -> Option<PathBuf> {
++    if let Some(own) = std::env::var_os("FEF_RANDO_TOOL").filter(|value| !value.is_empty()) {
++        let own = PathBuf::from(own);
++        let file = if own.is_dir() { own.join("rando.py") } else { own };
++        return file.is_file().then_some(file);
++    }
++    let exe = std::env::current_exe().ok()?;
++    exe.ancestors().skip(1).take(6).map(|dir| dir.join("tools").join("randomizer").join("rando.py")).find(|file| file.is_file())
++}
++
++/// a Python that runs, and the rows the randomizer's page has.
++#[derive(Debug, Clone)]
++pub struct Found {
++    pub python: (String, Vec<String>),
++    pub tool: PathBuf,
++    pub rows: Vec<Row>,
++}
++
++/// finds Python and asks the randomizer for its rows, each answer within 5 s, hidden.
++pub fn find() -> Result<Found, String> {
++    let tool = tool().ok_or("The randomizer (tools/randomizer) was not found next to the program; the game plays as the original.")?;
++    let mut any_python = false;
++    let mut last = String::new();
++    for (program, prefix) in pythons() {
++        let mut version = prefix.clone();
++        version.push("--version".to_owned());
++        match run_hidden(&program, &version, ANSWER_WITHIN) {
++            Ok(_) => any_python = true,
++            Err(_) => continue,
++        }
++        let mut args = prefix.clone();
++        args.push(tool.to_string_lossy().into_owned());
++        args.push("schema".to_owned());
++        match run_hidden(&program, &args, ANSWER_WITHIN).and_then(|text| parse_schema(&text)) {
++            Ok(rows) => return Ok(Found { python: (program, prefix), tool, rows }),
++            Err(error) => last = error,
++        }
++    }
++    if any_python {
++        Err(format!("The randomizer did not give its settings ({last}); the game plays as the original."))
++    } else {
++        Err("Python 3 was not found; the randomizer needs it. The game plays as the original.".to_owned())
++    }
++}
++
++// ---------------------------------------------------------------------------- the rows
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum Kind {
++    OnOff,
++    Seed,
++    Choice(Vec<String>),
++    Number(i64, i64),
++}
++
++/// one row of the page, as `rando.py schema` gives it.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Row {
++    pub key: String,
++    pub label: String,
++    pub kind: Kind,
++    pub default: Value,
++    /// the value "Everything on" gives.
++    pub all: Value,
++    /// shown greyed, always its default (Children: not built).
++    pub fixed: bool,
++    pub indent: bool,
++}
++
++/// `rando.py schema`'s JSON -> the rows (format 1).
++pub fn parse_schema(text: &str) -> Result<Vec<Row>, String> {
++    let root: Value = serde_json::from_str(text.trim()).map_err(|error| format!("its settings are not JSON: {error}"))?;
++    if root.get("format").and_then(Value::as_u64) != Some(1) {
++        return Err("its settings are of another format".to_owned());
++    }
++    let rows = root.get("rows").and_then(Value::as_array).ok_or("its settings have no rows")?;
++    let mut out = Vec::new();
++    for row in rows {
++        let text = |name: &str| row.get(name).and_then(Value::as_str).map(str::to_owned);
++        let key = text("key").ok_or("a row has no key")?;
++        let kind = match text("kind").as_deref() {
++            Some("onoff") => Kind::OnOff,
++            Some("seed") => Kind::Seed,
++            Some("choice") => Kind::Choice(
++                row.get("choices").and_then(Value::as_array).ok_or(format!("{key}: no choices"))?
++                    .iter().filter_map(|choice| choice.as_str().map(str::to_owned)).collect(),
++            ),
++            Some("number") => Kind::Number(
++                row.get("min").and_then(Value::as_i64).ok_or(format!("{key}: no min"))?,
++                row.get("max").and_then(Value::as_i64).ok_or(format!("{key}: no max"))?,
++            ),
++            other => return Err(format!("{key}: unknown kind {other:?}")),
++        };
++        let default = row.get("default").cloned().ok_or(format!("{key}: no default"))?;
++        out.push(Row {
++            label: text("label").unwrap_or_else(|| key.clone()),
++            all: row.get("all").cloned().unwrap_or_else(|| default.clone()),
++            fixed: row.get("fixed").and_then(Value::as_bool).unwrap_or(false),
++            indent: row.get("indent").and_then(Value::as_bool).unwrap_or(false),
++            key,
++            kind,
++            default,
++        });
++    }
++    if !out.iter().any(|row| row.key == "randomizer") || !out.iter().any(|row| row.key == "seed") {
++        return Err("its settings lack Randomizer or Seed".to_owned());
++    }
++    Ok(out)
++}
++
++/// a seed the randomizer takes: 1 to 32 letters, digits, '-' and '_', starting with a
++/// letter or digit (PLAY RANDOMIZED's SEED_RX).
++pub fn seed_ok(seed: &str) -> bool {
++    let mut chars = seed.chars();
++    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
++        && seed.len() <= 32
++        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
++}
++
++/// a new seed, 8 letters and digits, different each time.
++pub fn random_seed() -> String {
++    use std::hash::{BuildHasher, Hasher};
++    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
++    hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |time| time.as_nanos()));
++    let mut n = hasher.finish();
++    const LETTERS: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
++    (0..8).map(|_| { let c = LETTERS[(n % 32) as usize] as char; n /= 32; c }).collect()
++}
++
++// ---------------------------------------------------------------------------- the form
++
++/// the page's values, apart from its drawing.
++#[derive(Debug, Clone, PartialEq)]
++pub struct RandoForm {
++    pub rows: Vec<Row>,
++    pub values: Map<String, Value>,
++}
++
++impl RandoForm {
++    /// every row at its default: Randomizer off.
++    pub fn new(rows: Vec<Row>) -> RandoForm {
++        let mut form = RandoForm { rows, values: Map::new() };
++        form.defaults();
++        form
++    }
++
++    pub fn defaults(&mut self) {
++        self.values = self.rows.iter().map(|row| (row.key.clone(), row.default.clone())).collect();
++    }
++
++    /// "Everything on": the suggested values, Randomizer on; the seed is kept.
++    pub fn everything_on(&mut self) {
++        let seed = self.get("seed").clone();
++        for row in &self.rows {
++            let value = if row.fixed { row.default.clone() } else { row.all.clone() };
++            self.values.insert(row.key.clone(), value);
++        }
++        self.values.insert("seed".into(), seed);
++        self.values.insert("randomizer".into(), Value::Bool(true));
++    }
++
++    pub fn get(&self, key: &str) -> &Value {
++        self.values.get(key).unwrap_or(&Value::Null)
++    }
++
++    pub fn on(&self) -> bool {
++        self.get("randomizer").as_bool().unwrap_or(false)
++    }
++
++    pub fn seed(&self) -> &str {
++        self.get("seed").as_str().unwrap_or("")
++    }
++
++    /// sets a row, when the value fits it (a fixed row keeps its default).
++    pub fn set(&mut self, key: &str, value: Value) -> bool {
++        let Some(row) = self.rows.iter().find(|row| row.key == key) else { return false };
++        let fits = match (&row.kind, &value) {
++            _ if row.fixed => false,
++            (Kind::OnOff, Value::Bool(_)) => true,
++            (Kind::Seed, Value::String(seed)) => seed.is_empty() || seed_ok(seed),
++            (Kind::Choice(choices), Value::String(choice)) => choices.contains(choice),
++            (Kind::Number(min, max), Value::Number(n)) => n.as_i64().is_some_and(|n| (*min..=*max).contains(&n)),
++            _ => false,
++        };
++        if fits {
++            self.values.insert(key.to_owned(), value);
++        }
++        fits
++    }
++
++    /// what is wrong with the form, for Start game; None when it can start.
++    pub fn problem(&self) -> Option<String> {
++        let seed = self.seed();
++        (self.on() && !seed.is_empty() && !seed_ok(seed))
++            .then(|| "The seed takes 1 to 32 letters, digits, - and _, starting with a letter or digit.".to_owned())
++    }
++
++    /// the answers the core is given at Start game. With Randomizer off it is
++    /// {"randomizer": false} and nothing else; with it on, every row, the fixed ones at
++    /// their defaults, and a new seed made when none was typed (and shown in the form).
++    pub fn answers(&mut self) -> Value {
++        if !self.on() {
++            return json!({"randomizer": false});
++        }
++        if self.seed().is_empty() {
++            self.values.insert("seed".into(), Value::String(random_seed()));
++        }
++        let mut out = Map::new();
++        for row in &self.rows {
++            let value = if row.fixed { row.default.clone() } else { self.get(&row.key).clone() };
++            out.insert(row.key.clone(), value);
++        }
++        Value::Object(out)
++    }
++
++    /// the rows not at their default, as "label: value", for This run.
++    pub fn changed(answers: &Value, rows: &[Row]) -> Vec<String> {
++        rows.iter()
++            .filter(|row| row.key != "randomizer" && row.key != "seed")
++            .filter_map(|row| {
++                let value = answers.get(&row.key)?;
++                (value != &row.default).then(|| format!("{}: {}", row.label, shown(value)))
++            })
++            .collect()
++    }
++
++    /// last choices, from `<data>/rando/last.json`, laid over the defaults (rows that
++    /// no longer fit are left at their default).
++    pub fn restore(&mut self, text: &str) {
++        let Ok(Value::Object(last)) = serde_json::from_str::<Value>(text) else { return };
++        for (key, value) in last {
++            self.set(&key, value);
++        }
++    }
++}
++
++fn shown(value: &Value) -> String {
++    match value {
++        Value::Bool(true) => "On".into(),
++        Value::Bool(false) => "Off".into(),
++        Value::String(text) => text.clone(),
++        other => other.to_string(),
++    }
++}
++
++/// `<data>/rando/last.json`, the page's last choices.
++pub fn last_path(data: &Path) -> PathBuf {
++    data.join("rando").join("last.json")
++}
++
++/// `<data>/rando/<title>/runs/<run>/`, what the core keeps of a randomized game (the
++/// core's own folder, one definition).
++pub fn run_dir(data: &Path, run: &str) -> PathBuf {
++    zakuro_core::fates_rando_session::run_dir(data, run)
++}
++
++// ---------------------------------------------------------------------------- the page
++
++/// what the page asks of the program.
++#[derive(Debug, Clone, PartialEq)]
++pub enum PageAction {
++    /// give the core these answers (Start game, or Play the original game).
++    Answer(String),
++    /// show the spoiler log of the game playing now.
++    Spoiler(PathBuf),
++}
++
++enum Rows {
++    /// not asked yet (no Fates game started).
++    Unasked,
++    Asking(Receiver<Result<Found, String>>),
++    Ready(Found),
++    Missing(String),
++}
++
++/// the game playing now, as This run shows it.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct ThisRun {
++    /// None = the original game.
++    pub seed: Option<String>,
++    pub changed: Vec<String>,
++    pub spoiler: Option<PathBuf>,
++    /// the core's notices (a chapter's placements kept original, a guard failed, ...).
++    pub notices: Vec<String>,
++}
++
++pub struct RandoPage {
++    rows: Rows,
++    form: Option<RandoForm>,
++    /// the New Game page is open: the core waits for its answer.
++    pub new_game: bool,
++    /// the menu's Randomizer window is open.
++    pub this_run_open: bool,
++    /// what the page says now (making the game, or why it could not).
++    pub status: Option<String>,
++    /// the core failed to make or lay the game: Back to the settings / Play the original game.
++    pub failed: bool,
++    /// the answer was drawn as "making" for a frame and is to be given now.
++    pending_answer: Option<String>,
++    pub this_run: ThisRun,
++    /// the run (and how many notices) This run was last read for, while it is open.
++    pub shown_for: Option<(Option<String>, usize)>,
++}
++
++impl Default for RandoPage {
++    fn default() -> Self {
++        RandoPage {
++            rows: Rows::Unasked,
++            form: None,
++            new_game: false,
++            this_run_open: false,
++            status: None,
++            failed: false,
++            pending_answer: None,
++            this_run: ThisRun::default(),
++            shown_for: None,
++        }
++    }
++}
++
++impl RandoPage {
++    pub fn over_game(&self) -> bool {
++        self.new_game
++    }
++
++    /// a game (re)started: nothing open, the original game; the rows read, kept.
++    pub fn reset(&mut self) {
++        self.new_game = false;
++        self.this_run_open = false;
++        self.status = None;
++        self.failed = false;
++        self.pending_answer = None;
++        self.this_run = ThisRun::default();
++        self.shown_for = None;
++    }
++
++    /// asks the randomizer for its rows, in a thread, once (a Fates game started).
++    pub fn ask(&mut self) {
++        if matches!(self.rows, Rows::Unasked) {
++            let (send, receive) = channel();
++            std::thread::spawn(move || {
++                let _ = send.send(find());
++            });
++            self.rows = Rows::Asking(receive);
++        }
++    }
++
++    fn poll(&mut self, data: Option<&Path>) {
++        if let Rows::Asking(receive) = &self.rows {
++            match receive.try_recv() {
++                Ok(Ok(found)) => {
++                    log::info!(target: "zakuro::rando", "the randomizer page has {} rows ({} via {})", found.rows.len(), found.tool.display(), found.python.0);
++                    let mut form = RandoForm::new(found.rows.clone());
++                    if let Some(text) = data.and_then(|data| std::fs::read_to_string(last_path(data)).ok()) {
++                        form.restore(&text);
++                    }
++                    self.form = Some(form);
++                    self.rows = Rows::Ready(found);
++                }
++                Ok(Err(why)) => {
++                    log::warn!(target: "zakuro::rando", "{why}");
++                    self.rows = Rows::Missing(why);
++                }
++                Err(TryRecvError::Empty) => {}
++                Err(TryRecvError::Disconnected) => self.rows = Rows::Missing("The randomizer could not be asked; the game plays as the original.".into()),
++            }
++        }
++    }
++
++    /// the core picked up the mode pick: open the page (the game waits).
++    pub fn open_new_game(&mut self) {
++        self.ask();
++        self.new_game = true;
++        self.status = None;
++        self.failed = false;
++        self.pending_answer = None;
++    }
++
++    /// the answer to give the core this frame, after "making" was shown for one.
++    pub fn take_answer(&mut self) -> Option<String> {
++        self.pending_answer.take()
++    }
++
++    /// the core's reply to an answer: Ok closes the page (the game goes on), Err keeps it
++    /// open with the reason and Back to the settings / Play the original game.
++    pub fn answered(&mut self, result: Result<ThisRun, String>, data: Option<&Path>) {
++        match result {
++            Ok(run) => {
++                if let (Some(data), Some(form)) = (data, &self.form) {
++                    // kept only for a randomized game: an original one writes nothing
++                    if run.seed.is_some() {
++                        let path = last_path(data);
++                        let text = serde_json::to_string_pretty(&Value::Object(form.values.clone())).unwrap_or_default();
++                        if let Err(error) = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&path, text)) {
++                            log::warn!(target: "zakuro::rando", "{} could not be written: {error}", path.display());
++                        }
++                    }
++                }
++                self.this_run = run;
++                self.new_game = false;
++                self.status = None;
++                self.failed = false;
++            }
++            Err(why) => {
++                self.status = Some(why);
++                self.failed = true;
++            }
++        }
++    }
++
++    /// This run for a randomized game: the seed, the rows not at their default and the
++    /// spoiler log, from the answers the core was given or a run's options.json.
++    pub fn run_from(&self, answers: &Value, spoiler: Option<PathBuf>, notices: Vec<String>) -> ThisRun {
++        if !answers.get("randomizer").and_then(Value::as_bool).unwrap_or(false) {
++            return ThisRun { notices, ..ThisRun::default() };
++        }
++        let rows = match &self.rows {
++            Rows::Ready(found) => found.rows.as_slice(),
++            _ => &[],
++        };
++        ThisRun {
++            seed: answers.get("seed").and_then(Value::as_str).map(str::to_owned),
++            changed: RandoForm::changed(answers, rows),
++            spoiler: spoiler.filter(|path| path.is_file()),
++            notices,
++        }
++    }
++
++    /// the New Game page, while open.
++    pub fn draw_new_game(&mut self, ctx: &egui::Context, data: Option<&Path>) -> Vec<PageAction> {
++        let mut actions = Vec::new();
++        self.poll(data);
++        if !self.new_game {
++            return actions;
++        }
++        let height = (ctx.content_rect().height() - 140.0).max(120.0);
++        egui::Window::new("Randomizer")
++            .id(egui::Id::new("rando new game"))
++            .collapsible(false)
++            .resizable(false)
++            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
++            .show(ctx, |ui| {
++                ui.label(RichText::new("New game: randomize it?").strong());
++                if let Some(status) = &self.status {
++                    ui.label(RichText::new(status).color(if self.failed { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN }));
++                    if self.failed {
++                        ui.horizontal(|ui| {
++                            if ui.button("Back to the settings").clicked() {
++                                self.status = None;
++                                self.failed = false;
++                            }
++                            if ui.button("Play the original game").clicked() {
++                                actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
++                            }
++                        });
++                    }
++                    if !self.failed {
++                        ctx.request_repaint();
++                        return;
++                    }
++                    ui.separator();
++                }
++                match (&self.rows, &mut self.form) {
++                    (Rows::Ready(_), Some(form)) => {
++                        egui::ScrollArea::vertical().max_height(height).show(ui, |ui| rows(ui, form));
++                        ui.separator();
++                        ui.horizontal(|ui| {
++                            if ui.button("Everything on").clicked() {
++                                form.everything_on();
++                            }
++                            if ui.button("Defaults").clicked() {
++                                form.defaults();
++                            }
++                            let problem = form.problem();
++                            let start = ui.add_enabled(problem.is_none() && !self.failed, egui::Button::new(RichText::new("Start game").strong()));
++                            if start.clicked() {
++                                let answers = form.answers();
++                                if form.on() {
++                                    self.status = Some(format!("Making the game from seed {}... (a few seconds)", form.seed()));
++                                    self.failed = false;
++                                    // drawn once, then given to the core next frame
++                                    self.pending_answer = Some(answers.to_string());
++                                } else {
++                                    actions.push(PageAction::Answer(answers.to_string()));
++                                }
++                            }
++                            if let Some(problem) = problem {
++                                ui.label(RichText::new(problem).color(Color32::LIGHT_RED));
++                            }
++                        });
++                    }
++                    (Rows::Missing(why), _) => {
++                        ui.label(RichText::new(why).weak());
++                        if ui.button("Start game").clicked() {
++                            actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
++                        }
++                    }
++                    _ => {
++                        ui.label(RichText::new("Asking the randomizer for its settings...").weak());
++                        ctx.request_repaint();
++                        if ui.button("Play the original game").clicked() {
++                            actions.push(PageAction::Answer(json!({"randomizer": false}).to_string()));
++                        }
++                    }
++                }
++            });
++        actions
++    }
++
++    /// the menu's Randomizer window, when open: This run, read only.
++    pub fn draw_this_run(&mut self, ctx: &egui::Context) -> Vec<PageAction> {
++        let mut actions = Vec::new();
++        let mut open = self.this_run_open;
++        egui::Window::new("Randomizer").id(egui::Id::new("rando this run")).open(&mut open).default_width(360.0).show(ctx, |ui| {
++            ui.label(RichText::new("This run").strong());
++            match &self.this_run.seed {
++                None => ui.label("Randomizer: Off (the original game)"),
++                Some(seed) => ui.label(format!("Randomizer: On, seed {seed}")),
++            };
++            if self.this_run.seed.is_some() {
++                if self.this_run.changed.is_empty() {
++                    ui.label(RichText::new("Every setting at its default").weak());
++                }
++                for line in &self.this_run.changed {
++                    ui.label(line);
++                }
++                if let Some(spoiler) = &self.this_run.spoiler {
++                    if ui.button("Open spoiler log").clicked() {
++                        actions.push(PageAction::Spoiler(spoiler.clone()));
++                    }
++                }
++            }
++            for notice in &self.this_run.notices {
++                ui.label(RichText::new(notice).color(Color32::LIGHT_RED));
++            }
++            ui.separator();
++            ui.label(RichText::new("The settings are chosen when a New Game's mode is picked. Changing them never changes a game already started.").weak().small());
++            if let Rows::Missing(why) = &self.rows {
++                ui.label(RichText::new(why).weak().small());
++            }
++        });
++        self.this_run_open = open;
++        actions
++    }
++}
++
++/// the rows. With Randomizer off they show grey but can still be set (the FE8 port's
++/// rule); a fixed row (Children) is grey and cannot be changed.
++fn rows(ui: &mut egui::Ui, form: &mut RandoForm) {
++    let on = form.on();
++    let rows = form.rows.clone();
++    egui::Grid::new("rando rows").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
++        for row in &rows {
++            let mut label = RichText::new(if row.indent { format!("    {}", row.label) } else { row.label.clone() });
++            let grey = row.fixed || (!on && row.key != "randomizer");
++            if grey {
++                label = label.weak();
++            }
++            ui.label(label);
++            ui.add_enabled_ui(!row.fixed, |ui| {
++                let value = form.get(&row.key).clone();
++                match &row.kind {
++                    Kind::OnOff => {
++                        let mut v = value.as_bool().unwrap_or(false);
++                        ui.horizontal(|ui| {
++                            ui.selectable_value(&mut v, false, "Off");
++                            ui.selectable_value(&mut v, true, "On");
++                        });
++                        if Value::Bool(v) != value {
++                            form.set(&row.key, Value::Bool(v));
++                        }
++                    }
++                    Kind::Seed => {
++                        let mut text = value.as_str().unwrap_or("").to_owned();
++                        ui.horizontal(|ui| {
++                            ui.add(egui::TextEdit::singleline(&mut text).char_limit(32).hint_text("new one at Start game").desired_width(160.0));
++                            if ui.button("Random").clicked() {
++                                text = random_seed();
++                            }
++                        });
++                        if text != value.as_str().unwrap_or("") {
++                            // kept as typed so the problem shows; Start game checks it
++                            form.values.insert(row.key.clone(), Value::String(text));
++                        }
++                    }
++                    Kind::Choice(choices) => {
++                        let mut v = value.as_str().unwrap_or("").to_owned();
++                        egui::ComboBox::from_id_salt(&row.key).selected_text(v.clone()).show_ui(ui, |ui| {
++                            for choice in choices {
++                                ui.selectable_value(&mut v, choice.clone(), choice);
++                            }
++                        });
++                        if value.as_str() != Some(v.as_str()) {
++                            form.set(&row.key, Value::String(v));
++                        }
++                    }
++                    Kind::Number(min, max) => {
++                        let mut v = value.as_i64().unwrap_or(*min);
++                        ui.add(egui::DragValue::new(&mut v).range(*min..=*max));
++                        if value.as_i64() != Some(v) {
++                            form.set(&row.key, json!(v));
++                        }
++                    }
++                }
++            });
++            ui.end_row();
++        }
++    });
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// the rows as `rando.py schema` printed them on 2026-11-20 (a few of each kind).
++    const SCHEMA: &str = r#"{"format": 1, "rows": [
++        {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true},
++        {"key": "seed", "label": "Seed", "kind": "seed", "default": "", "pattern": "[A-Za-z0-9][A-Za-z0-9_-]{0,31}"},
++        {"key": "classes", "label": "Classes", "kind": "onoff", "default": true, "all": true, "flag": "--classes"},
++        {"key": "trees", "label": "Class trees (own side / any)", "kind": "choice", "choices": ["own", "any"], "default": "own", "all": "own", "flag": "--trees"},
++        {"key": "children", "label": "Children (not built)", "kind": "onoff", "default": false, "all": false, "fixed": true, "flag": "--children"},
++        {"key": "growth_mode", "label": "Growths mode", "indent": false, "default": "slice1", "all": "redistribute", "flag": "--growth-mode", "kind": "choice", "choices": ["slice1", "redistribute", "delta", "full"]},
++        {"key": "growth_variance", "label": "Growth variance %", "indent": true, "default": 30, "all": 30, "flag": "--growth-variance", "kind": "number", "min": 0, "max": 100},
++        {"key": "starting_items", "label": "Starting items", "indent": false, "default": false, "all": true, "flag": "--starting-items", "kind": "onoff"},
++        {"key": "enemy_classes", "label": "Enemy classes", "indent": false, "default": false, "all": true, "flag": "--enemy-classes", "kind": "onoff"}
++    ]}"#;
++
++    fn form() -> RandoForm {
++        RandoForm::new(parse_schema(SCHEMA).unwrap())
++    }
++
++    #[test]
++    fn python_is_started_with_no_window() {
++        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
++        // every program this module starts goes through hidden(), which sets the flag
++        let source = include_str!("rando_page.rs");
++        let body = source.split("pub fn hidden(").nth(1).unwrap().split("\n}\n").next().unwrap();
++        assert!(body.contains("creation_flags(CREATE_NO_WINDOW)"));
++        assert!(body.contains("stdout(Stdio::piped())") && body.contains("stderr(Stdio::piped())"));
++        let spawns = source.matches(concat!("Comm", "and::new(")).count();
++        let hidden = source.matches(concat!("hidden(&mut Comm", "and::new(")).count();
++        assert_eq!(spawns, hidden, "a program started without hidden()");
++        assert_eq!(spawns, 1);
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn a_missing_program_is_a_plain_error() {
++        let error = run_hidden("zakuro-no-such-program-here", &[], Duration::from_secs(1)).unwrap_err();
++        assert!(error.contains("could not be started"));
++    }
++
++    #[test]
++    fn the_schema_is_read() {
++        let rows = parse_schema(SCHEMA).unwrap();
++        assert_eq!(rows.len(), 9);
++        assert_eq!(rows[3].kind, Kind::Choice(vec!["own".into(), "any".into()]));
++        assert_eq!(rows[6].kind, Kind::Number(0, 100));
++        assert!(rows[6].indent && rows[4].fixed);
++        assert!(parse_schema("{\"format\": 2, \"rows\": []}").is_err());
++        assert!(parse_schema("not json").is_err());
++        assert!(parse_schema("{\"format\": 1, \"rows\": [{\"key\": \"seed\", \"kind\": \"seed\", \"default\": \"\"}]}").is_err());
++    }
++
++    #[test]
++    fn defaults_are_randomizer_off() {
++        let mut form = form();
++        assert!(!form.on());
++        assert_eq!(form.seed(), "");
++        assert_eq!(form.get("classes"), &json!(true));
++        assert_eq!(form.get("growth_mode"), &json!("slice1"));
++        assert_eq!(form.get("starting_items"), &json!(false));
++        // off = the original game, nothing else said
++        assert_eq!(form.answers(), json!({"randomizer": false}));
++        assert_eq!(form.problem(), None);
++    }
++
++    #[test]
++    fn everything_on_is_the_suggested_values_and_keeps_the_seed() {
++        let mut form = form();
++        form.set("seed", json!("r51all"));
++        form.everything_on();
++        assert!(form.on());
++        assert_eq!(form.seed(), "r51all");
++        assert_eq!(form.get("growth_mode"), &json!("redistribute"));
++        assert_eq!(form.get("starting_items"), &json!(true));
++        assert_eq!(form.get("enemy_classes"), &json!(true));
++        assert_eq!(form.get("children"), &json!(false));
++        form.defaults();
++        assert_eq!(form, self::form());
++    }
++
++    #[test]
++    fn the_answers_hold_every_row() {
++        let mut form = form();
++        form.set("randomizer", json!(true));
++        form.set("seed", json!("abc-1_2"));
++        form.set("enemy_classes", json!(true));
++        form.set("growth_variance", json!(55));
++        let answers = form.answers();
++        assert_eq!(answers, json!({
++            "randomizer": true, "seed": "abc-1_2", "classes": true, "trees": "own", "children": false,
++            "growth_mode": "slice1", "growth_variance": 55, "starting_items": false, "enemy_classes": true
++        }));
++        let text = answers.to_string();
++        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), answers);
++        assert_eq!(RandoForm::changed(&answers, &form.rows), vec!["Growth variance %: 55", "Enemy classes: On"]);
++    }
++
++    #[test]
++    fn rows_take_only_values_that_fit() {
++        let mut form = form();
++        assert!(!form.set("children", json!(true)), "Children is not built");
++        assert!(!form.set("trees", json!("sideways")));
++        assert!(!form.set("growth_variance", json!(101)));
++        assert!(!form.set("classes", json!("yes")));
++        assert!(!form.set("nothing", json!(true)));
++        assert!(!form.set("seed", json!("-starts-badly")));
++        assert!(!form.set("seed", json!("x".repeat(33))));
++        assert!(form.set("seed", json!("x".repeat(32))));
++        assert!(form.set("seed", json!("")));
++        // placement rows are settable like the rest
++        assert!(form.set("starting_items", json!(true)) && form.set("enemy_classes", json!(true)));
++        assert_eq!(form.get("children"), &json!(false));
++    }
++
++    #[test]
++    fn an_empty_seed_is_made_at_start_and_shown() {
++        let mut form = form();
++        form.set("randomizer", json!(true));
++        let answers = form.answers();
++        let seed = answers["seed"].as_str().unwrap().to_owned();
++        assert!(seed_ok(&seed) && seed.len() == 8);
++        assert_eq!(form.seed(), seed);
++    }
++
++    #[test]
++    fn a_bad_typed_seed_stops_start() {
++        let mut form = form();
++        form.values.insert("seed".into(), json!("bad seed!"));
++        assert_eq!(form.problem(), None, "with Randomizer off the seed is not used");
++        form.set("randomizer", json!(true));
++        assert!(form.problem().is_some());
++    }
++
++    #[test]
++    fn last_choices_come_back_where_they_fit() {
++        let mut form = form();
++        form.restore(r#"{"randomizer": true, "seed": "kept", "trees": "any", "children": true, "growth_variance": 900, "gone": 1}"#);
++        assert!(form.on());
++        assert_eq!(form.seed(), "kept");
++        assert_eq!(form.get("trees"), &json!("any"));
++        assert_eq!(form.get("children"), &json!(false));
++        assert_eq!(form.get("growth_variance"), &json!(30));
++        form.restore("not json");
++        assert_eq!(form.seed(), "kept");
++    }
++
++    #[test]
++    fn the_page_waits_until_answered() {
++        let mut page = RandoPage::default();
++        page.rows = Rows::Missing("Python 3 was not found".into());
++        assert!(!page.over_game());
++        page.open_new_game();
++        assert!(page.over_game(), "the game waits while the page is open");
++        page.answered(Err("make failed".into()), None);
++        assert!(page.over_game() && page.failed);
++        page.answered(Ok(ThisRun::default()), None);
++        assert!(!page.over_game() && !page.failed);
++        assert_eq!(page.this_run.seed, None);
++    }
++
++    #[test]
++    fn this_run_lists_what_is_not_default() {
++        let mut page = RandoPage::default();
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        let run = page.run_from(&json!({"randomizer": true, "seed": "s1", "classes": false, "trees": "own"}), None, vec![]);
++        assert_eq!(run.seed.as_deref(), Some("s1"));
++        assert_eq!(run.changed, vec!["Classes: Off"]);
++        assert_eq!(page.run_from(&json!({"randomizer": false}), None, vec![]).seed, None);
++    }
++
++    #[test]
++    fn the_page_draws_without_a_window() {
++        let ctx = egui::Context::default();
++        let mut page = RandoPage::default();
++        page.rows = Rows::Ready(Found { python: ("py".into(), vec![]), tool: PathBuf::new(), rows: parse_schema(SCHEMA).unwrap() });
++        page.form = Some(form());
++        page.open_new_game();
++        page.this_run_open = true;
++        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 480.0));
++        for _ in 0..3 {
++            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
++            ctx.run_ui(input, |ui| {
++                assert!(page.draw_new_game(ui.ctx(), None).is_empty());
++                assert!(page.draw_this_run(ui.ctx()).is_empty());
++            })
++            .drop_without_applying_deltas();
++        }
++        let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("rando new game"))).unwrap();
++        assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
++    }
++
++    /// the port's own tool, through a real Python started hidden:
++    /// FEF_RANDO_TOOL=<repo>/tools/randomizer cargo test -p zakuro --lib -- --ignored real_tool
++    #[test]
++    #[ignore]
++    fn the_real_tool_gives_its_rows() {
++        let found = find().unwrap();
++        let keys: Vec<&str> = found.rows.iter().map(|row| row.key.as_str()).collect();
++        for key in ["randomizer", "seed", "classes", "growths", "join_stats", "trees", "keep_royals", "children",
++                    "growth_mode", "starting_items", "shops", "rewards", "enemy_weapons", "enemy_classes", "boss_classes"] {
++            assert!(keys.contains(&key), "{key} missing from {keys:?}");
++        }
++        let mut form = RandoForm::new(found.rows);
++        assert!(!form.on());
++        assert!(form.rows.iter().any(|row| row.fixed && row.key == "children"));
++        form.everything_on();
++        assert_eq!(form.get("starting_items"), &json!(true));
++        assert_eq!(form.get("enemy_classes"), &json!(true));
++    }
++
++    #[test]
++    fn data_files_live_in_the_data_folder() {
++        let data = Path::new("D:/x");
++        assert_eq!(last_path(data), Path::new("D:/x/rando/last.json"));
++        assert_eq!(run_dir(data, "s-1"), Path::new("D:/x/rando/0004000000179800/runs/s-1"));
++    }
++}
+diff --git a/crates/zakuro/src/settings.rs b/crates/zakuro/src/settings.rs
+index c0a6d8c..ac99cad 100644
+--- a/crates/zakuro/src/settings.rs
++++ b/crates/zakuro/src/settings.rs
+@@ -940,7 +940,14 @@ mod tests {
+         assert_eq!((fates.resolution, fates.top_shape), (3, TopShape::Wide16x9));
+         assert_eq!(settings.enhancements[&game_key(FATES_SE_USA)], FATES_FIRST_RUN_ENHANCEMENTS);
+         assert_eq!(settings.top_shape, TopShape::Console);
+-        assert_eq!(settings.for_game(Some(0x0004_0000_000A_0500)), Settings::default().for_game(Some(0x0004_0000_000A_0500)));
++        // another game resolves to the defaults (the maps that hold Fates' own picks aside)
++        let resolved = |settings: &Settings| {
++            let mut own = settings.for_game(Some(0x0004_0000_000A_0500));
++            own.per_game.clear();
++            own.enhancements.clear();
++            own
++        };
++        assert_eq!(resolved(&settings), resolved(&Settings::default()));
+         let text = toml::to_string_pretty(&settings).unwrap();
+         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+         // a settings file that is there, even an empty one, gets none of it

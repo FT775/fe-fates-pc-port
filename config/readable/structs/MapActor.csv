@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence,elements
+0x008,0x4,u32,draw,medium,"map::Actor::Tick 0x0038D44C: the object whose word +0x4 holds the actor's draw bits; bit 4 (0x10) is set when the map HP bar is shown, cleared otherwise",
+0x034,0x4,ptr:Unit,unit,medium,"map::Actor::Tick 0x0038D430 reads the unit's state_flags through it (bit 2, the carried pair partner, hides the HP bar)",

@@ -1,0 +1,60 @@
+{
+ "format": 1,
+ "keys": {
+  "fates/boss-classes/r63fboss1": {
+   "parts": {
+    "mod": "17f31431653c6c85d01018135cd15f83ed9ec63bfbbbb73451b5515ff89bf001",
+    "patch": "372b5d5cb1f2bb5f37a1a48b0a999bf152333d38558eac1706ad0a4a7e9ab16e",
+    "plan": "d1f81611374ab190c0689750dfbb39647405f602049e6db4255a634038552b4d",
+    "spoiler": "ba034d82609b6269db34eaf876219c42b26af89935011cd563b61f551bc5ad58"
+   },
+   "sha256": "2403b8ca3263fff3f57e5b85096b85a18fb4eeb2c818181b5969eda4e1fda880"
+  },
+  "fates/default/1": {
+   "parts": {
+    "mod": "f2ab36f6c3e06741fa2fa648c7783dbbe8be25b009fe1dc3336a0df999ae8c17",
+    "patch": "f5142d7617e01c1b4f97a79019cff474f2cbb8c716de3fb11e307840f9551b7f",
+    "plan": "f05f7ffb5eb001d2219d28ef6a431a4ba70a09cbb4c92299c5e29a173a0b8f1f",
+    "spoiler": "92abae537c188fed9dab44bfa9ea1c53313e96d9de735f2e0f0628e90a91c6ba"
+   },
+   "sha256": "672ecd3a501d48154bdd701623da251f22ad4b5f741f6acfd54b902fbc207fcc"
+  },
+  "fates/everything-on/1": {
+   "parts": {
+    "mod": "a584de370c78b9406b7721cb11aa506d996d1e5c0b3ff422a3f8e8a71e4b6201",
+    "patch": "487c725d37ac0a22d42e9f20c7b4a5e4454aec5825b74030e0040b09ffc8ed81",
+    "plan": "fb11b7872c977fbd2b809f5d956534568e10414e9d22f6c9e21d810766bb2212",
+    "spoiler": "6a1ebc0183f0fc0934a6d8c54d93b096e36ac0cb4ce2f31fa98fe7bf9e18a3a8"
+   },
+   "sha256": "8f304cb197282f8269ddcf9055af6b11b74ac812a54510e882dc33740f0f6736"
+  },
+  "ids/r62-page": {
+   "parts": {
+    "make_flags": "08c2dd5e482d7696300fda7e603c18ea917d6f107f4766913198acf4c4a3f926",
+    "run_ids": "02b4937a8fc2b89042a9e5e42d526395cf39cf720e053c2ab8823fc9c5cc9d15"
+   },
+   "sets": 119,
+   "sha256": "8b03992cce63e9e5d81c0f17479623e20157d29db722d075023ad369c6392436"
+  },
+  "seal/default/1": {
+   "parts": {
+    "mod": "a8cd4f27771582568fcdf0f6c3098d4ff4aca409d78ce314b74ac2b74fe9f5da",
+    "patch": "fb55e66c8fdb0b4e838616682cb39aeeda04251cdedabf0017b260a15c1b71a8",
+    "plan": "96b27edcc0ba864e1d047524ef0e56a42909e84c4818644c7b8a5804e74311a0",
+    "spoiler": "c2c269565b99757f0debe8c74579256805d17c4794e6c08d815f4f2684333667"
+   },
+   "sha256": "74adf7d2fe15c102de0e6381d1ef69331fa3b7c30b92e799acae68c72332728f"
+  },
+  "seal/everything-on/1": {
+   "parts": {
+    "mod": "664cc058c97ad16682f2ad314dd5700a8005250c35020e5ca8fa0aeeee307141",
+    "patch": "29fea850dbc1f5dc727fdfc206e3510c7953f4be2da22736bbf1950c44bb616c",
+    "plan": "c591c698012aa29c22ba31ff60647763446ce910eba63585cf039a42ceff4911",
+    "spoiler": "b131c8da630c604ebb7a03867c0e0ae7ff31f64b28c2077dd4a1cb9a814e8312"
+   },
+   "sha256": "da14a43128ffb961c42cf4a308782bb5d360323b2ef8ed9c94e2b203e3f4535f"
+  }
+ },
+ "note": "sha256 only (round 67, tools/release/fingerprints.py); change only inside a round commit",
+ "round": 75
+}

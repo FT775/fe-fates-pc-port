@@ -1,0 +1,44 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,4,str,pid,high,Unit::CreateFromDispos 003D60D8 and Dispos::Data::GetUnit read +0x0; data PID_ strings,
+0x04,4,str,jid,high,Unit::CreateFromDispos and Dispos::Data::UnitMove read +0x4; data JID_ (empty = the person's own class),
+0x08,1,u8,team,high,map::Dispos::Data::IsEnable 005278DC and Dispos::Data::GetUnit 0039E43C pass +0x8 to Force::Get(Force::Type) (the unit's army; GetUnit makes no unit once that army holds 50); values 0-2 (0 = player: the only team map::Dispos::Calculate turns into deployment slots); Paragon 'team' (fact),
+0x09,1,u8,level,high,Unit::CreateFromDispos reads +0x9 (0 = the person's own level),
+0x0A,2,u8[2],pos_start,medium,map::Dispos::Data::IsEnable 005278DC requires +0xA/+0xB (s8) to be >= 0 and below the map size (image bytes 0/1); Dispos::Data::Calculate copies them next to +0xC/+0xD; differs from pos in 1042 of 9601 units (where the unit appears before it moves to pos: not traced); Paragon 'coord_1' (fact),x|y
+0x0C,2,u8[2],pos,high,Unit::SetDispos 003D92FC and Dispos::Data::Calculate read +0xC/+0xD (map position); map::Dispos::Data::IsEnable 005278DC leaves the unit out unless play_x_min <= x < play_x_end and play_y_min <= y < play_y_end (TerrainGrid; flags bit 0x8000: anywhere on the map),x|y
+0x0E,2,pad,pad_0e,high,zero in every unit of every file,
+0x10,4,u32,flags,high,map::Dispos::Data::IsEnable 005278DC: bit 8/9/10 (0x100/0x200/0x400) = the unit is used on Normal/Hard/Lunatic (GameUserData+0x2D); 0x8000 = position may be outside the playable area; bit 0 = left out when its tile is taken; map::Dispos::Calculate 0039EF34: 0x10000 = the next unit of the group is paired with this one (Unit::DoubleOn); Dispos::Data::GetUnit: 0x40 = never created by GetUnit; Unit::CreateFromDispos also reads it; other bits not traced; Paragon spawn_flags (fact),
+0x14,4,str,item_1,high,data IID_ strings; Unit::SetDisposItem 003D8C38 fills the unit's item slots,
+0x18,1,u8,item_1_flags,high,Unit::SetDisposItem 003D8C38: bit 0 marks the unit item (unit::Item+0x2 bit 15; kept only for some ISID flags); bits 1-4 give the item only at some levels (bit 1: unpromoted level <= 20; bit 2: level >= 21 or promoted; bit 3: level <= 30 and promoted level <= 10; bit 4: level >= 31 or promoted level >= 11); Paragon item_flags (fact); WAS the first byte of item_N_flags (u8[4]),
+0x19,3,s8[3],item_1_forge,high,Unit::SetDisposItem 003D8C38 reads entry+0x5+difficulty (s8; GameUserData+0x2D): forge rank on Normal/Hard/Lunatic; negative = the item is not given on that difficulty; WAS the last three bytes of item_N_flags (u8[4]),normal|hard|lunatic
+0x1C,4,str,item_2,high,data IID_ strings,
+0x20,1,u8,item_2_flags,high,as item_1_flags (Unit::SetDisposItem; item slot 2),
+0x21,3,s8[3],item_2_forge,high,as item_1_forge (item slot 2),normal|hard|lunatic
+0x24,4,str,item_3,high,data IID_ strings,
+0x28,1,u8,item_3_flags,high,as item_1_flags (Unit::SetDisposItem; item slot 3),
+0x29,3,s8[3],item_3_forge,high,as item_1_forge (item slot 3),normal|hard|lunatic
+0x2C,4,str,item_4,high,data IID_ strings,
+0x30,1,u8,item_4_flags,high,as item_1_flags (Unit::SetDisposItem; item slot 4),
+0x31,3,s8[3],item_4_forge,high,as item_1_forge (item slot 4),normal|hard|lunatic
+0x34,4,str,item_5,high,data IID_ strings,
+0x38,1,u8,item_5_flags,high,as item_1_flags (Unit::SetDisposItem; item slot 5),
+0x39,3,s8[3],item_5_forge,high,as item_1_forge (item slot 5),normal|hard|lunatic
+0x3C,4,str,skill_1,high,data SEID_ strings,
+0x40,4,str,skill_2,high,data SEID_ strings,
+0x44,4,str,skill_3,high,data SEID_ strings,
+0x48,4,str,skill_4,high,data SEID_ strings,
+0x4C,4,str,skill_5,high,data SEID_ strings,
+0x50,4,u32,skill_flags,medium,Unit::SetDispos reads +0x50 (u32); Paragon 'skill_flags' (fact),
+0x54,4,str,ai_action,high,data AI_AC_ strings; Paragon (fact),
+0x58,4,str,ai_action_param,medium,data; Paragon (fact),
+0x5C,4,str,ai_mission,high,data AI_MI_ strings; Paragon (fact),
+0x60,4,str,ai_mission_param,medium,data; Paragon (fact),
+0x64,4,str,ai_attack,high,data AI_AT_ strings; Paragon (fact),
+0x68,4,str,ai_attack_param,medium,data; Paragon (fact),
+0x6C,4,str,ai_move,high,data AI_MV_ strings; Paragon (fact),
+0x70,4,str,ai_move_param,medium,data; Paragon (fact),
+0x74,10,u8[10],ai_params,medium,Unit::SetDispos reads each byte +0x74..+0x7D into the unit's AI state; Paragon ai_unknown_1/2 (fact),0|1|2|3|4|5|6|7|8|9
+0x7E,2,pad,pad_7e,high,zero in every unit,
+0x80,4,u32,ai_flags,medium,Unit::SetDispos reads +0x80 (u32),
+0x84,1,u8,sortie_flag,medium,run-time state: map::Dispos::CreateProcess 0039DB78 zeroes +0x84..+0x89 of every unit of a group and Calculate / GetUnit write 2/3/4 into +0x84 while the map runs (the file is used in place); zero in every vanilla unit: keep 0,
+0x85,3,pad,pad_85,high,zero in every unit; run-time scratch (map::Dispos::CreateProcess zeroes +0x85..+0x89; Calculate reads +0x85 as a UnitPool index),
+0x88,4,pad,pad_88,high,zero in every unit,

@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe13 <engine@localhost>
+Date: Mon, 9 Nov 2026 03:22:29 -0500
+Subject: [PATCH 03/21] core: Fire Emblem: Awakening's scenes from its screen
+ markers (EUR and USA)
+
+game_ui.rs holds Awakening's screen markers and the places of its battle
+panels, battle buttons, banners, title and world-map pieces; scenes.rs turns
+the markers drawn each frame into scenes (battle, forecast, talk, unit view,
+world map, title, cursor on a unit, unit picked). System answers the
+frontend's questions about them and gives the bottom screen's picture.
+
+Both releases are known: EUR 000400000009F100 and USA 00040000000A0500
+(same English UI textures and layout). Nothing is watched unless
+Config::game_screens is on (default off), or set_game_screens turns it on.
+
+Adapted from fe-awakening-recomp 832fe86 (github.com/Zelkin1/fe-awakening-recomp,
+MIT, Copyright (c) 2026 the authors of the Fire Emblem: Awakening
+recompilation project): game_ui.rs and scenes.rs, the scene methods of
+System in lib.rs, the marker set-up in loader.rs. Changed: the USA title
+id, the Config::game_screens switch, set_game_screens.
+---
+ crates/zakuro-core/src/game_ui.rs | 181 ++++++++++++++++++++++++++++++
+ crates/zakuro-core/src/lib.rs     | 121 ++++++++++++++++++++
+ crates/zakuro-core/src/loader.rs  |   7 ++
+ crates/zakuro-core/src/scenes.rs  | 152 +++++++++++++++++++++++++
+ 4 files changed, 461 insertions(+)
+ create mode 100644 crates/zakuro-core/src/game_ui.rs
+ create mode 100644 crates/zakuro-core/src/scenes.rs
+
+diff --git a/crates/zakuro-core/src/game_ui.rs b/crates/zakuro-core/src/game_ui.rs
+new file mode 100644
+index 0000000..5fce6c3
+--- /dev/null
++++ b/crates/zakuro-core/src/game_ui.rs
+@@ -0,0 +1,181 @@
++//! Fire Emblem: Awakening's screens, for the top-screen extras: the markers
++//! that tell its scenes apart and the places of its battle panels, battle
++//! buttons, banners, title and world-map pieces on the bottom screen.
++//!
++//! Adapted from fe-awakening-recomp 832fe86 (github.com/Zelkin1/fe-awakening-recomp,
++//! MIT, Copyright (c) 2026 the authors of the Fire Emblem: Awakening
++//! recompilation project), crates/zakuro-core/src/game_ui.rs. Changed: the
++//! USA release (00040000000A0500) is served too; it has the same English UI
++//! textures and layout as the EUR release (checked against the files, not
++//! yet in every scene in game).
++
++use zakuro_gpu::{Anchor, BannerSide, Banners, Ground, Marker, Piece, Place, Rounded};
++
++use crate::scenes::{BATTLE, BRIEF_FORECAST, EXP, FORECAST, LEFT_BANNER, ON_UNIT, RIGHT_BANNER, TALKING, TITLE, UNIT_VIEW, WORLD_MAP};
++
++/// the European release.
++pub const FIRE_EMBLEM_AWAKENING: u64 = 0x0004_0000_0009_F100;
++/// the North American release.
++pub const FIRE_EMBLEM_AWAKENING_USA: u64 = 0x0004_0000_000A_0500;
++
++/// whether a title is Fire Emblem: Awakening, a release the extras know.
++pub fn is_awakening(program_id: u64) -> bool {
++    matches!(program_id, FIRE_EMBLEM_AWAKENING | FIRE_EMBLEM_AWAKENING_USA)
++}
++
++pub struct GameUi {
++    pub markers: &'static [Marker],
++    pub battle_panels: &'static [Piece],
++    pub battle_buttons: &'static [Piece],
++    pub battle_buttons_over_panels: &'static [Piece],
++    pub battle_banners: &'static Banners,
++    pub title_pieces: &'static [Piece],
++    pub world_map_pieces: &'static [Piece],
++}
++
++pub fn for_game(program_id: u64) -> Option<&'static GameUi> {
++    is_awakening(program_id).then_some(&AWAKENING)
++}
++
++static AWAKENING: GameUi = GameUi {
++    markers: MARKERS,
++    battle_panels: BATTLE_PANELS,
++    battle_buttons: BATTLE_BUTTONS,
++    battle_buttons_over_panels: BATTLE_BUTTONS_OVER_PANELS,
++    battle_banners: &BATTLE_BANNERS,
++    title_pieces: TITLE_PIECES,
++    world_map_pieces: WORLD_MAP_PIECES,
++};
++
++const ETC1A4: u32 = 0xD;
++const RGBA4: u32 = 0x4;
++const LA8: u32 = 0x5;
++const L8: u32 = 0x7;
++
++const fn marker(id: u32, format: u32, width: u32, height: u32, bottom: bool, place: Place) -> Marker {
++    Marker { id, format, width, height, bottom, place }
++}
++
++const fn place(left: [f32; 2], top: [f32; 2], width: [f32; 2], height: [f32; 2]) -> Place {
++    Place { left, top, width, height }
++}
++
++const TOP_SCREEN: bool = false;
++const BOTTOM_SCREEN: bool = true;
++
++const MARKERS: &[Marker] = &[
++    marker(ON_UNIT, ETC1A4, 256, 256, TOP_SCREEN, place([0.55, 0.98], [0.0, 0.06], [0.3, 0.42], [0.12, 0.21])),
++    marker(TALKING, Marker::UNTEXTURED, 0, 0, TOP_SCREEN, place([-0.005, 0.005], [-0.005, 0.005], [0.99, 1.01], [0.99, 1.01])),
++    marker(WORLD_MAP, RGBA4, 256, 512, TOP_SCREEN, place([0.1, 0.26], [0.8, 0.94], [0.5, 0.75], [0.08, 0.2])),
++    marker(TALKING, ETC1A4, 256, 512, TOP_SCREEN, place([-0.05, 0.75], [-0.05, 0.9], [0.3, 0.35], [0.12, 0.16])),
++    marker(UNIT_VIEW, ETC1A4, 256, 256, BOTTOM_SCREEN, place([-0.25, -0.05], [-0.05, 0.05], [0.7, 0.9], [1.0, 1.15])),
++    marker(FORECAST, ETC1A4, 256, 512, TOP_SCREEN, place([-0.03, 0.03], [0.03, 0.12], [0.95, 1.05], [0.7, 0.85])),
++    marker(BRIEF_FORECAST, ETC1A4, 256, 512, TOP_SCREEN, place([-0.03, 0.03], [0.67, 0.695], [0.95, 1.05], [0.31, 0.335])),
++    marker(BATTLE, ETC1A4, 256, 512, BOTTOM_SCREEN, place([-0.1, 0.1], [0.0, 0.14], [0.95, 1.05], [0.5, 0.65])),
++    marker(EXP, ETC1A4, 256, 512, TOP_SCREEN, place([0.18, 0.31], [0.4, 0.47], [0.4, 0.6], [0.11, 0.16])),
++    marker(LEFT_BANNER, ETC1A4, 256, 512, BOTTOM_SCREEN, place([0.0, 0.15], [-0.05, 0.08], [0.33, 0.37], [0.08, 0.12])),
++    marker(RIGHT_BANNER, ETC1A4, 256, 512, BOTTOM_SCREEN, place([0.5, 0.65], [-0.05, 0.08], [0.33, 0.37], [0.08, 0.12])),
++    marker(TITLE, LA8, 256, 32, BOTTOM_SCREEN, place([0.05, 0.15], [0.38, 0.48], [0.75, 0.85], [0.1, 0.17])),
++    marker(TITLE, L8, 512, 32, BOTTOM_SCREEN, place([-0.3, -0.2], [0.83, 0.9], [1.45, 1.55], [0.1, 0.16])),
++];
++
++const fn rounded(rect: [u16; 4], corners: [u8; 4]) -> Rounded {
++    Rounded { rect, shift: [0, 0], mirror: false, corners, soft: 0, light: false, shade: 255, shadow: true, outline: &[], cut: None }
++}
++
++const fn light(rect: [u16; 4], corners: [u8; 4], soft: u8) -> Rounded {
++    Rounded { soft, light: true, shadow: false, ..rounded(rect, corners) }
++}
++
++const fn button(x: u16, width: u16) -> Rounded {
++    Rounded { shadow: false, ..rounded([x, 191, width, 42], [4; 4]) }
++}
++
++const TITLE_PIECES: &[Piece] = &[
++    Piece { from: [30, 106, 260, 28], across: Anchor::Middle(0), down: Anchor::End(30), size: 100, shapes: PROMPT, follows: None },
++    Piece { from: [12, 212, 296, 26], across: Anchor::Middle(0), down: Anchor::End(0), size: 100, shapes: COPYRIGHT, follows: None },
++];
++const PROMPT: &[Rounded] = &[light([30, 106, 260, 28], [14; 4], 12)];
++const COPYRIGHT: &[Rounded] = &[light([12, 212, 296, 26], [13; 4], 10)];
++
++const WORLD_MAP_PIECES: &[Piece] = &[Piece { from: [2, 0, 316, 43], across: Anchor::Middle(0), down: Anchor::Start(2), size: 70, shapes: PLACE_NAME, follows: None }];
++const PLACE_NAME: &[Rounded] = &[
++    Rounded { outline: PLACE_FRAME, ..rounded([15, 10, 290, 28], [1; 4]) },
++    Rounded { outline: PLACE_FRAME, ..rounded([8, 14, 10, 20], [6, 0, 6, 0]) },
++    Rounded { outline: PLACE_FRAME, ..rounded([302, 14, 10, 20], [0, 6, 0, 6]) },
++    Rounded { cut: Some(Ground { redder: 3, darker: 90 }), ..rounded([22, 0, 46, 11], [6; 4]) },
++];
++const PLACE_FRAME: &[[u16; 2]] = &[[174, 100], [3026, 100], [3036, 103], [3046, 115], [3048, 129], [3052, 139], [3066, 143], [3080, 151], [3096, 163], [3102, 171], [3108, 175], [3110, 181], [3116, 187], [3120, 195], [3122, 207], [3126, 211], [3126, 265], [3122, 271], [3116, 291], [3108, 299], [3106, 305], [3102, 307], [3096, 315], [3084, 325], [3054, 339], [3050, 343], [3048, 347], [3048, 359], [3046, 361], [3046, 365], [3038, 373], [3036, 378], [164, 378], [162, 373], [154, 365], [150, 343], [146, 339], [134, 335], [116, 325], [104, 315], [98, 307], [94, 305], [92, 299], [84, 291], [78, 271], [74, 265], [74, 211], [78, 207], [78, 203], [80, 201], [80, 193], [92, 175], [116, 153], [134, 143], [146, 139], [150, 135], [150, 127], [152, 125], [154, 115], [164, 103]];
++
++const LEFT_PANEL_REST: [u16; 2] = [24, 4];
++const RIGHT_PANEL_REST: [u16; 2] = [184, 4];
++
++const BATTLE_PANELS: &[Piece] = &[
++    Piece { from: [70, 88, 180, 52], across: Anchor::Middle(0), down: Anchor::End(4), size: 49, shapes: STATS, follows: None },
++    Piece { from: [0, 6, 162, 70], across: Anchor::Middle(-88), down: Anchor::End(4), size: 49, shapes: HP_LEFT, follows: Some((LEFT_BANNER, LEFT_PANEL_REST)) },
++    Piece { from: [162, 6, 162, 70], across: Anchor::Middle(88), down: Anchor::End(4), size: 49, shapes: HP_RIGHT, follows: Some((RIGHT_BANNER, RIGHT_PANEL_REST)) },
++];
++const HP_LEFT: &[Rounded] = &[
++    Rounded { shift: [4, 0], ..rounded([0, 17, 152, 59], [0; 4]) },
++    Rounded { shift: [10, 0], ..rounded([146, 17, 12, 59], [0, 6, 0, 6]) },
++    Rounded { shift: [-27, 0], mirror: true, shadow: false, ..rounded([32, 28, 123, 22], [0; 4]) },
++    Rounded { shift: [98, 0], shadow: false, ..rounded([30, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [129, 0], shadow: false, ..rounded([0, 28, 31, 22], [0; 4]) },
++    Rounded { shift: [5, 0], shadow: false, ..rounded([155, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [6, 0], shadow: false, ..rounded([155, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [7, 0], shadow: false, ..rounded([155, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [8, 0], shadow: false, ..rounded([155, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [9, 0], shadow: false, ..rounded([155, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-154, 0], mirror: true, shadow: false, ..rounded([154, 24, 4, 44], [0; 4]) },
++    Rounded { shift: [-148, 0], mirror: true, shadow: false, ..rounded([148, 68, 10, 8], [0, 0, 6, 0]) },
++    Rounded { shift: [-148, 0], mirror: true, shadow: false, ..rounded([148, 17, 10, 10], [6, 0, 0, 0]) },
++    Rounded { shift: [4, 0], ..rounded([24, 6, 112, 22], [8; 4]) },
++];
++const HP_RIGHT: &[Rounded] = &[
++    rounded([168, 17, 152, 59], [0; 4]),
++    Rounded { shift: [-6, 0], ..rounded([162, 17, 12, 59], [6, 0, 6, 0]) },
++    Rounded { shift: [-5, 0], shadow: false, ..rounded([164, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-4, 0], shadow: false, ..rounded([164, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-3, 0], shadow: false, ..rounded([164, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-2, 0], shadow: false, ..rounded([164, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-127, 0], shadow: false, ..rounded([290, 28, 30, 22], [0; 4]) },
++    Rounded { shift: [-96, 0], shadow: false, ..rounded([289, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [-95, 0], shadow: false, ..rounded([289, 28, 1, 22], [0; 4]) },
++    Rounded { shift: [30, 0], mirror: true, shadow: false, ..rounded([165, 28, 125, 22], [0; 4]) },
++    Rounded { shift: [157, 0], mirror: true, shadow: false, ..rounded([162, 24, 5, 4], [0; 4]) },
++    Rounded { shift: [158, 0], mirror: true, shadow: false, ..rounded([162, 28, 4, 22], [0; 4]) },
++    Rounded { shift: [157, 0], mirror: true, shadow: false, ..rounded([162, 50, 5, 18], [0; 4]) },
++    Rounded { shift: [152, 0], mirror: true, shadow: false, ..rounded([162, 68, 10, 8], [0, 0, 0, 6]) },
++    Rounded { shift: [152, 0], mirror: true, shadow: false, ..rounded([162, 17, 10, 10], [0, 6, 0, 0]) },
++    rounded([184, 6, 112, 22], [8; 4]),
++];
++const STATS: &[Rounded] = &[
++    rounded([70, 88, 180, 52], [4; 4]),
++    Rounded { shift: [39, 0], mirror: true, shadow: false, ..rounded([136, 88, 9, 52], [0; 4]) },
++];
++
++const BATTLE_BUTTONS: &[Piece] = &[Piece { from: [6, 191, 307, 42], across: Anchor::Middle(0), down: Anchor::End(4), size: 28, shapes: BUTTONS, follows: None }];
++const BATTLE_BUTTONS_OVER_PANELS: &[Piece] = &[Piece { from: [6, 191, 307, 42], across: Anchor::Middle(0), down: Anchor::End(31), size: 28, shapes: BUTTONS, follows: None }];
++const BUTTONS: &[Rounded] = &[button(6, 43), button(54, 43), button(102, 43), button(175, 42), button(222, 43), button(270, 43)];
++
++const BATTLE_BANNERS: Banners = Banners {
++    sides: [
++        BannerSide {
++            name: [40, 8, 80, 18],
++            hp: [0, 30, 30, 20],
++            gauge: [32, 28, 122, 20],
++            weapon: [36, 54, 120, 22],
++            values: [[74, 92, 69, 14], [74, 108, 69, 14], [74, 124, 69, 14]],
++            follows: Some((LEFT_BANNER, LEFT_PANEL_REST)),
++        },
++        BannerSide {
++            name: [200, 8, 80, 18],
++            hp: [290, 30, 30, 20],
++            gauge: [166, 28, 124, 20],
++            weapon: [178, 54, 124, 22],
++            values: [[177, 92, 69, 14], [177, 108, 69, 14], [177, 124, 69, 14]],
++            follows: Some((RIGHT_BANNER, RIGHT_PANEL_REST)),
++        },
++    ],
++    labels: [[146, 92, 28, 14], [146, 108, 28, 14], [146, 124, 28, 14]],
++};
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index abc584d..dbd1424 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -4,6 +4,7 @@
+ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
++pub mod game_ui;
+ pub mod cro;
+ pub mod download_play;
+ pub mod hints;
+@@ -15,6 +16,7 @@ pub mod mods;
+ pub mod replay;
+ pub mod room;
+ pub mod recompiled;
++mod scenes;
+ pub mod services;
+ pub mod state;
+ 
+@@ -58,6 +60,10 @@ pub struct Config {
+     /// draw the pictures of the texture pack in the title's mods folder in
+     /// place of its textures, which takes the host's GPU.
+     pub texture_packs: bool,
++    /// watch for the screens of a game the top-screen extras know (see
++    /// game_ui), so the frontend can tell its scenes apart. off, the
++    /// default, watches nothing and costs nothing.
++    pub game_screens: bool,
+     /// the title's update, an update's CIA, whose code and data it runs.
+     pub update: Option<std::path::PathBuf>,
+     /// the title's downloadable content, DLC CIAs.
+@@ -107,6 +113,7 @@ impl Default for Config {
+             data_dir: None,
+             hardware_renderer: false,
+             texture_packs: true,
++            game_screens: false,
+             update: None,
+             dlc: Vec::new(),
+             enhancements: std::collections::BTreeMap::new(),
+@@ -180,6 +187,13 @@ pub struct System {
+     showing: [Option<zakuro_gpu::ScreenRef>; 3],
+     /// frame interpolation's count of the refreshes.
+     pacing: Pacing,
++    /// the pictures the title gave the top screen since boot.
++    pictures_from_game: u64,
++    /// the scenes the game showed, from its screen markers.
++    scenes: scenes::Scenes,
++    /// the game's screens, when Config::game_screens is on and the extras
++    /// know the game.
++    pub(crate) game_ui: Option<&'static game_ui::GameUi>,
+     /// the dynamic module loader's state.
+     pub cro: cro::CroManager,
+     /// what the cameras see, from the frontend.
+@@ -279,6 +293,9 @@ impl System {
+             lcd_force_black: false,
+             showing: [None, None, None],
+             pacing: Pacing::default(),
++            pictures_from_game: 0,
++            scenes: scenes::Scenes::default(),
++            game_ui: None,
+             cro: cro::CroManager::default(),
+             camera: None,
+             room: None,
+@@ -802,6 +819,12 @@ impl System {
+         }
+ 
+         self.renderer.end_frame();
++        if self.game_ui.is_some() {
++            let drawn_markers = self.gpu.take_marked();
++            let new_spans = self.gpu.take_spans();
++            let a_held = self.services.hid.input.buttons.contains(services::hid::PadState::A);
++            self.scenes.end_frame(self.frames, &drawn_markers, new_spans, a_held, self.pictures_from_game);
++        }
+ 
+         // pick up any buffer swap the game queued directly in GSP shared
+         // memory before the LCDs latch whatever is currently configured.
+@@ -929,6 +952,9 @@ impl System {
+         stride: u32,
+         format: u32,
+     ) {
++        if screen == 0 {
++            self.pictures_from_game += 1;
++        }
+         self.gpu
+             .set_framebuffer(screen, active, left, right, stride, format);
+     }
+@@ -1174,6 +1200,101 @@ impl System {
+         self.gpu.scaled_screen(base, (height, width), stride / bpp, format, &bytes)
+     }
+ 
++    /// whether the map cursor is on a unit (the unit window shows).
++    pub fn cursor_on_unit(&self) -> bool {
++        self.scenes.shown(scenes::ON_UNIT, self.frames)
++    }
++
++    /// whether a talk is on, its window over the top screen.
++    pub fn talking(&self) -> bool {
++        self.scenes.shown(scenes::TALKING, self.frames)
++    }
++
++    pub fn world_map(&self) -> bool {
++        self.scenes.shown(scenes::WORLD_MAP, self.frames)
++    }
++
++    /// whether the battle forecast shows, in full or brief.
++    pub fn forecast(&self) -> bool {
++        self.scenes.shown(scenes::FORECAST, self.frames)
++    }
++
++    pub fn brief_forecast(&self) -> bool {
++        self.scenes.shown(scenes::BRIEF_FORECAST, self.frames)
++    }
++
++    /// whether a unit's own page shows on the bottom screen.
++    pub fn unit_view(&self) -> bool {
++        self.scenes.shown(scenes::UNIT_VIEW, self.frames)
++    }
++
++    /// whether a unit was picked on the map and is being moved.
++    pub fn unit_selected(&self) -> bool {
++        self.scenes.unit_selected()
++    }
++
++    /// the battle panels to show over the top screen while a battle shows.
++    pub fn battle_pieces(&self) -> Option<&'static [zakuro_gpu::Piece]> {
++        self.battle_ui().map(|ui| ui.battle_panels)
++    }
++
++    /// where the battle panels' text is, while a battle shows.
++    pub fn battle_banners(&self) -> Option<&'static zakuro_gpu::Banners> {
++        self.battle_ui().map(|ui| ui.battle_banners)
++    }
++
++    /// the battle's buttons (skip, speed...) to show over the top screen,
++    /// placed above the panels when those show too.
++    pub fn battle_buttons(&self, over_panels: bool) -> Option<&'static [zakuro_gpu::Piece]> {
++        self.battle_ui().map(|ui| if over_panels { ui.battle_buttons_over_panels } else { ui.battle_buttons })
++    }
++
++    fn battle_ui(&self) -> Option<&'static game_ui::GameUi> {
++        self.game_ui.filter(|_| self.scenes.battle_shows(self.frames))
++    }
++
++    /// the title screen's prompt and copyright line, while it shows.
++    pub fn title_pieces(&self) -> Option<&'static [zakuro_gpu::Piece]> {
++        self.game_ui.filter(|_| self.scenes.shown(scenes::TITLE, self.frames)).map(|ui| ui.title_pieces)
++    }
++
++    /// the world map's place name, while it shows and no one talks.
++    pub fn world_pieces(&self) -> Option<&'static [zakuro_gpu::Piece]> {
++        self.game_ui.filter(|_| self.world_map() && !self.talking()).map(|ui| ui.world_map_pieces)
++    }
++
++    /// where the markers were drawn a few frames ago, as the screens show.
++    pub fn marker_spans(&self) -> Vec<(u32, [f32; 4])> {
++        self.scenes.marker_spans(self.frames)
++    }
++
++    /// whether the game's screens are watched (Config::game_screens, for a
++    /// game the extras know).
++    pub fn follows_cursor(&self) -> bool {
++        self.game_ui.is_some() && self.gpu.follows_markers()
++    }
++
++    /// starts or stops watching the game's screens (Config::game_screens).
++    /// whether they are watched now: never for a game the extras do not know.
++    pub fn set_game_screens(&mut self, on: bool) -> bool {
++        self.config.game_screens = on;
++        let program_id = self.title.as_ref().map(|title| title.program_id()).unwrap_or(0);
++        self.game_ui = game_ui::for_game(program_id).filter(|_| on);
++        self.gpu.set_markers(self.game_ui.map(|ui| ui.markers.to_vec()).unwrap_or_default());
++        self.scenes = scenes::Scenes::default();
++        self.game_ui.is_some()
++    }
++
++    /// the bottom screen's newest picture at the console's size, upright
++    /// RGBA, none while the host's GPU has not drawn one yet.
++    pub fn bottom_picture(&mut self) -> Option<Vec<u8>> {
++        if !self.gpu.draws_on_gpu() {
++            return Some(self.read_screen(zakuro_common::Screen::Bottom));
++        }
++        let screen = self.screen_ref(zakuro_common::Screen::Bottom, false)?;
++        self.gpu.native_picture(screen)
++    }
++
+     /// reads one screen into a straight RGBA8 buffer for presentation.
+     pub fn read_screen(&mut self, screen: zakuro_common::Screen) -> Vec<u8> {
+         self.read_screen_at(screen, false)
+diff --git a/crates/zakuro-core/src/loader.rs b/crates/zakuro-core/src/loader.rs
+index 937bcbb..bb5430d 100644
+--- a/crates/zakuro-core/src/loader.rs
++++ b/crates/zakuro-core/src/loader.rs
+@@ -209,6 +209,13 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
+             Err(error) => log::warn!("{error}, drawing in software"),
+         }
+     }
++    // the screens of a game the top-screen extras know, watched only when
++    // the frontend asks
++    system.game_ui = crate::game_ui::for_game(title.program_id()).filter(|_| system.config.game_screens);
++    if let Some(game_ui) = system.game_ui {
++        system.gpu.set_markers(game_ui.markers.to_vec());
++        log::info!("watching the game's screens for the top-screen extras");
++    }
+     if system.config.interpolate {
+         match system.set_interpolation(true) {
+             true => log::info!("frame interpolation on"),
+diff --git a/crates/zakuro-core/src/scenes.rs b/crates/zakuro-core/src/scenes.rs
+new file mode 100644
+index 0000000..0cd9d58
+--- /dev/null
++++ b/crates/zakuro-core/src/scenes.rs
+@@ -0,0 +1,152 @@
++//! Which scene a game shows, from the screen markers the GPU saw drawn.
++//!
++//! From fe-awakening-recomp 832fe86 (github.com/Zelkin1/fe-awakening-recomp,
++//! MIT, Copyright (c) 2026 the authors of the Fire Emblem: Awakening
++//! recompilation project), crates/zakuro-core/src/scenes.rs, unchanged.
++
++use std::collections::BTreeMap;
++
++pub const ON_UNIT: u32 = 1;
++pub const TALKING: u32 = 2;
++pub const WORLD_MAP: u32 = 3;
++pub const FORECAST: u32 = 4;
++pub const BATTLE: u32 = 5;
++pub const BRIEF_FORECAST: u32 = 6;
++pub const TITLE: u32 = 7;
++pub const EXP: u32 = 8;
++pub const LEFT_BANNER: u32 = 9;
++pub const RIGHT_BANNER: u32 = 10;
++pub const UNIT_VIEW: u32 = 11;
++
++const RECENT_FRAMES: u64 = 4;
++const SPAN_LAG_FRAMES: u64 = 3;
++const PICTURE_HISTORY_MASK: u32 = 0xFFFF;
++const MOST_PICTURES_AT_HALF_RATE: u32 = 10;
++
++#[derive(Default)]
++pub(crate) struct Scenes {
++    last_drawn: BTreeMap<u32, u64>,
++    battle_over: bool,
++    spans: Vec<(u32, [f32; 4], u64)>,
++    selection: UnitSelection,
++}
++
++impl Scenes {
++    pub(crate) fn end_frame(&mut self, frame: u64, drawn_markers: &[u32], new_spans: Vec<(u32, [f32; 4])>, a_held: bool, pictures_from_game: u64) {
++        for &id in drawn_markers {
++            self.last_drawn.insert(id, frame);
++        }
++        self.battle_over = self.shown(BATTLE, frame) && (self.battle_over || drawn_markers.contains(&EXP));
++        self.spans.extend(new_spans.into_iter().map(|(id, span)| (id, span, frame)));
++        self.spans.retain(|&(.., at)| frame - at <= 4 * SPAN_LAG_FRAMES);
++        let cursor_on_unit = self.shown(ON_UNIT, frame);
++        self.selection.update(a_held, pictures_from_game, cursor_on_unit);
++    }
++
++    pub(crate) fn shown(&self, marker: u32, frame: u64) -> bool {
++        self.last_drawn.get(&marker).is_some_and(|&at| frame.saturating_sub(at) <= RECENT_FRAMES)
++    }
++
++    pub(crate) fn battle_shows(&self, frame: u64) -> bool {
++        self.shown(BATTLE, frame) && !self.shown(TALKING, frame) && !self.battle_over
++    }
++
++    pub(crate) fn unit_selected(&self) -> bool {
++        self.selection.state != SelectionState::NotSelected
++    }
++
++    pub(crate) fn marker_spans(&self, frame: u64) -> Vec<(u32, [f32; 4])> {
++        let shown_frame = frame.saturating_sub(SPAN_LAG_FRAMES);
++        let mut latest: Vec<(u32, [f32; 4], u64)> = Vec::new();
++        for &(id, span, at) in self.spans.iter().filter(|&&(.., at)| at <= shown_frame && shown_frame - at <= SPAN_LAG_FRAMES) {
++            match latest.iter_mut().find(|(other, ..)| *other == id) {
++                Some(entry) if entry.2 <= at => *entry = (id, span, at),
++                Some(_) => {}
++                None => latest.push((id, span, at)),
++            }
++        }
++        latest.into_iter().map(|(id, span, _)| (id, span)).collect()
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++enum SelectionState {
++    #[default]
++    NotSelected,
++    OnUnit,
++    CursorAway,
++}
++
++#[derive(Default)]
++struct UnitSelection {
++    state: SelectionState,
++    a_was_held: bool,
++    picture_history: u32,
++    last_pictures_from_game: u64,
++}
++
++impl UnitSelection {
++    fn update(&mut self, a_held: bool, pictures_from_game: u64, cursor_on_unit: bool) {
++        let a_pressed = a_held && !self.a_was_held;
++        self.a_was_held = a_held;
++        let new_picture = pictures_from_game > self.last_pictures_from_game;
++        self.picture_history = (self.picture_history << 1) | new_picture as u32;
++        self.last_pictures_from_game = pictures_from_game;
++        let half_rate = (self.picture_history & PICTURE_HISTORY_MASK).count_ones() <= MOST_PICTURES_AT_HALF_RATE;
++        self.state = match self.state {
++            _ if half_rate => SelectionState::NotSelected,
++            SelectionState::NotSelected if a_pressed && cursor_on_unit => SelectionState::OnUnit,
++            SelectionState::NotSelected => SelectionState::NotSelected,
++            SelectionState::CursorAway if cursor_on_unit => SelectionState::NotSelected,
++            SelectionState::CursorAway => SelectionState::CursorAway,
++            SelectionState::OnUnit if cursor_on_unit => SelectionState::OnUnit,
++            SelectionState::OnUnit => SelectionState::CursorAway,
++        };
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn full_rate(selection: &mut UnitSelection, frames: u64, a_held: bool, cursor_on_unit: bool) {
++        for _ in 0..frames {
++            let pictures = selection.last_pictures_from_game + 1;
++            selection.update(a_held, pictures, cursor_on_unit);
++        }
++    }
++
++    #[test]
++    fn a_selection_lasts_until_the_cursor_comes_back_to_a_unit() {
++        let mut selection = UnitSelection::default();
++        full_rate(&mut selection, 16, false, true);
++        assert_eq!(selection.state, SelectionState::NotSelected);
++        full_rate(&mut selection, 1, true, true);
++        assert_eq!(selection.state, SelectionState::OnUnit);
++        full_rate(&mut selection, 3, false, false);
++        assert_eq!(selection.state, SelectionState::CursorAway);
++        full_rate(&mut selection, 1, false, true);
++        assert_eq!(selection.state, SelectionState::NotSelected);
++    }
++
++    #[test]
++    fn a_battle_at_half_rate_ends_the_selection() {
++        let mut selection = UnitSelection::default();
++        full_rate(&mut selection, 16, false, true);
++        full_rate(&mut selection, 1, true, true);
++        for frame in 0..16 {
++            let pictures = selection.last_pictures_from_game + frame % 2;
++            selection.update(false, pictures, true);
++        }
++        assert_eq!(selection.state, SelectionState::NotSelected);
++    }
++
++    #[test]
++    fn a_marker_shows_for_four_frames_after_its_last_draw() {
++        let mut scenes = Scenes::default();
++        scenes.end_frame(10, &[TALKING], Vec::new(), false, 10);
++        assert!(scenes.shown(TALKING, 14));
++        assert!(!scenes.shown(TALKING, 15));
++        assert!(!scenes.shown(BATTLE, 10));
++    }
++}

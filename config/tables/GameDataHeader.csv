@@ -1,0 +1,26 @@
+offset,size,type,name,confidence,evidence
+0x00,4,ptr:Chapter,chapter_table,high,GameData::Initialize 004E6954: ldrd [hdr+0x0] -> Chapter::Initialize(const void*;int)
+0x04,4,u32,chapter_count,high,GameData::Initialize: second word of the ldrd at +0x0 = Chapter::Initialize count argument
+0x08,4,ptr,person_block,high,GameData::Initialize: ldr [hdr+0x8] -> Person::Initialize(const void*); block = 16-byte header + records
+0x0C,4,ptr,job_block,high,GameData::Initialize: ldr [hdr+0xC] -> Job::Initialize(const void*); block = 8-byte header + records
+0x10,4,ptr:Skill,skill_table,high,GameData::Initialize: ldm [hdr+0x10] (3 words) -> EquipSkill::Initialize(const void*;int;int)
+0x14,4,u32,skill_common_count,medium,EquipSkill::Initialize 2nd argument; EquipSkill::GetCommonNum returns it (skills a unit can learn normally)
+0x18,4,u32,skill_count,high,EquipSkill::Initialize 3rd argument; equals the number of SEID_ labels
+0x1C,4,ptr:Personality,personality_table,high,GameData::Initialize: ldrd [hdr+0x1C] -> Personality::Initialize(const void*;int)
+0x20,4,u32,personality_count,high,Personality::Initialize count argument
+0x24,4,ptr:Belong,belong_table,high,GameData::Initialize: ldrd [hdr+0x24] -> Belong::Initialize(const void*;int)
+0x28,4,u32,belong_count,high,Belong::Initialize count argument; equals the number of BID_ labels
+0x2C,4,ptr,item_block,high,GameData::Initialize: ldr [hdr+0x2C] -> Item::Initialize(const void*); block = 8-byte header + records
+0x30,4,ptr:ItemKind,item_kind_table,high,GameData::Initialize: ldr [hdr+0x30] -> ItemKind::Initialize(const void*)
+0x34,4,ptr:ItemSubKind,item_subkind_table,high,GameData::Initialize: ldr [hdr+0x34] -> ItemSubKind::Initialize(const void*)
+0x38,4,ptr:ItemRefine,item_refine_table,high,GameData::Initialize: ldr [hdr+0x38] -> ItemRefine::Initialize(const void*) (forging)
+0x3C,4,ptr:WeaponLevel,weapon_level_table,high,GameData::Initialize: ldr [hdr+0x3C] -> WeaponLevel::Initialize(const void*)
+0x40,4,ptr:WeaponBonus,weapon_bonus_table,high,GameData::Initialize: ldr [hdr+0x40] -> WeaponBonus::Initialize(const void*)
+0x44,4,ptr:WeaponInteract,weapon_interact_table,high,GameData::Initialize: ldr [hdr+0x44] -> WeaponInteract::Initialize(const void*) (weapon triangle)
+0x48,4,ptr:ExpTableHeader,exp_table,high,GameData::Initialize: ldr [hdr+0x48] -> ExpTable::Initialize(const void*)
+0x4C,4,ptr:TerrainCostHeader,terrain_cost_table,high,GameData::Initialize: ldr [hdr+0x4C] -> TerrainCost::Initialize(const void*) (movement cost classes)
+0x50,4,ptr:GameDataUnknown50,unknown_table_0x50,low,not passed to any initializer by GameData::Initialize; Paragon FE14 GameData.yml also leaves it unnamed (fact cross-check)
+0x54,4,ptr:Tutorial,tutorial_table,high,GameData::Initialize: ldrd [hdr+0x54] -> Tutorial::Initialize(const void*;int)
+0x58,4,u32,tutorial_count,high,Tutorial::Initialize count argument; equals the number of TUTID_ labels
+0x5C,4,ptr:AchieveBonusHeader,achieve_bonus_table,high,GameData::Initialize: ldr [hdr+0x5C] -> AchieveBonus::Initialize(const void*)
+0x60,4,ptr:ArenaHeader,arena_table,high,GameData::Initialize: ldr [hdr+0x60] -> Arena::Initialize(const void*)

@@ -1,0 +1,26 @@
+{
+  "_comment": "Upstream pins (docs/ENGINE.md). tools/engine/engine.py clones each repo into engine/<dir> at 'commit' and refuses to build anything else. Moving a pin is a reviewed change: read the upstream diff first. Same pins as the Fire Emblem Awakening port: Zakuro 0.2.32 lists Fates SE USA (0004000000179800) as Playable + Recompiled, and 3dsrecomp at this pin ships hints for this exact dump.",
+  "toolchain": "stable-x86_64-pc-windows-msvc",
+  "repos": {
+    "zakuro": {
+      "url": "https://github.com/fearkov/zakuro.git",
+      "commit": "c856685cc867bc6d4ac0f765844ca037ae735941",
+      "describe": "v0.2.32 (installed release)",
+      "licence": "MIT",
+      "patches": "patches/zakuro",
+      "branch": "fe14"
+    },
+    "3dsrecomp": {
+      "url": "https://github.com/fearkov/3dsrecomp.git",
+      "commit": "df82e6e3c1231606c38e0f2786dd07f6067979ab",
+      "describe": "the commit Zakuro 0.2.32's Cargo.lock pins",
+      "licence": "none (all rights reserved): personal builds only, unmodified, never tracked or shared"
+    },
+    "fe-awakening-recomp": {
+      "url": "https://github.com/Zelkin1/fe-awakening-recomp.git",
+      "commit": "832fe861f0a100a7ea32983738f4b9c4ca1ed625",
+      "describe": "v1.0.9, reference only (not built): the source patches 0001-0004 adapt (NOTICE.md)",
+      "licence": "MIT"
+    }
+  }
+}

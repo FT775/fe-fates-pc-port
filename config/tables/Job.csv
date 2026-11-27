@@ -1,0 +1,37 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,8,flags64:PersonFlag,flags,high,Job::IsHigh/IsFemale/IsGiant/IsEnemyOnly (00524804 00524AF4 005249F8 00524140) test the u64 at +0x0 with SPID_上級職/女性/巨大/敵専用 bits (PrivateSkill::Get),
+0x08,4,str:self,jid,high,record label = this string; Job::GetIntroName 005241C4 reads +0x8,
+0x0C,4,str,fid,medium,data: FID_ (generic face) IDs; castle::CastleButler::GetFid reads Job+0xC,
+0x10,4,str,mjid_name,high,Job::GetName 00524910 reads +0x10 (MJID_ message),
+0x14,4,str,mjid_help,high,Job::GetHelp 00524888 reads +0x14 (MJID_H_ message),
+0x18,2,u16,job_number,high,Job::IsDownload/GetName read +0x18; equals the record index (Job::Get(unsigned short)); Job::SerializePointer stores it,
+0x1A,2,flags16:JobCategory,category,high,Job::IsFlyer 00524980 / Job::IsRider 00524A7C test +0x1A with JCID_飛行 / JCID_騎乗 bits,
+0x1C,8,s8[8],base,high,Unit::GetMHPImpl..GetMdefImpl read Job+0x1C..+0x23 (s8) in stat order,hp|str|mag|skl|spd|lck|def|res
+0x24,8,s8[8],growth,high,Unit::GetGrow 005330B4 and Unit::CaclulateAutoGrowCapability add Job+0x24[i] (s8) to Person.growth when Person.unit_kind == 1; Unit::Inherit2 reads it; Paragon 'player_growths' (fact),hp|str|mag|skl|spd|lck|def|res
+0x2C,8,s8[8],enemy_growth,high,"Unit::GetGrow 005330B4 and Unit::CaclulateAutoGrowCapability 00532880 add Job+0x2C[i] (s8) instead of +0x24 when Person.unit_kind != 1 (enemies, NPCs; also the auto-level stats of generic units); Paragon 'enemy_growths' (fact)",hp|str|mag|skl|spd|lck|def|res
+0x34,8,s8[8],max,high,Unit::GetLimit(int) 005337F0 reads Job+0x34[i] (maximum stats; plus Person.limit_mod),hp|str|mag|skl|spd|lck|def|res
+0x3C,8,s8[8],pair_up,high,Unit::GetDoubleCapability 00530A34 reads Job+0x3C[i] (pair-up bonus); GetDoubleMovePower reads +0x3C,hp|str|mag|skl|spd|lck|def|res
+0x44,8,u8[8],max_weapon_exp,high,Unit::GetWeaponExpLimit 0052F824 / Job::CanEquipFromSubKind read Job+0x44[i] (u8); weapon order from Paragon (fact),sword|lance|axe|dagger|bow|tome|staff|stone
+0x4C,2,s16,hit,high,Unit::GetHit 00532DC4 and GetInterferenceRodHit read Job+0x4C (s16),
+0x4E,2,s16,crit,high,Unit::GetCritical(const unit::Item*) 0052B9BC reads Job+0x4E (s16),
+0x50,2,s16,avoid,high,Unit::GetAvoid 00533524 reads Job+0x50 (s16),
+0x52,2,s16,dodge,high,Unit::GetSecure 005345E0 reads Job+0x52 (s16) (critical avoid),
+0x54,8,ref16:Skill[4],skill,medium,data: Skill indexes; Job::GetEquipSkill(int) 00524224 reads +0x58/+0x5A; Paragon skill_1..4 (fact),1|2|3|4
+0x5C,1,ref8:TerrainCost,move_cost_class,high,TerrainCost::GetCostFromUnit 001A6708 uses Job+0x5C as the TerrainCost row; map::Dispos::Data::UnitMove and Terrain::IsCastleUnitDispos read it too,
+0x5D,1,u8,mov,high,Unit::GetMovePower 0052D5E4 reads Job+0x5D,
+0x5E,1,u8,unknown_5e,low,data 0x0F/0x14/0x12; Paragon 'smoke_clouds_size' (fact),
+0x5F,1,u8,unknown_5f,low,spot::Mob::CreateDisposUnitMonster reads +0x5F; Paragon 'extra_flags' (fact),
+0x60,4,str,move_sound,medium,data: footstep sound names; Paragon 'movement_sound' (fact),
+0x64,4,ref16:Job[2],promotion,high,Unit::ClassChange 003D40C8 and ClassChangeEnumerator::AddSlideLow read Job+0x64 (u16 Job index),1|2
+0x68,4,ref16:Job[2],base_class,low,data: Job indexes; Paragon base_class_1/2 (fact); no reader found (evidence --fields Job and a scan of the class-change and inherit code for +0x68/+0x6A loads),1|2
+0x6C,4,pad,pad_6c,high,zero in every record,
+0x70,2,ref16:Job,gender_pair,medium,anonymous_namespace::IsInheritJobIndex reads +0x70; data: Job indexes; Paragon 'gender_equivalent_class' (fact),
+0x72,2,ref16:Job,parallel_class,medium,ClassChangeEnumerator::EnumerateParallel and GetInheritJobIndex read +0x72 (u16 Job index),
+0x74,1,u8,origin,medium,"map::EquipSkillCalculator::Calculate / ProcTerrainHeal / ProcTerrainDamage / Job::GetBasicItemCanEquipForEvent read +0x74; values 1-3; GameUserData::IsRouteOrigin / Origin::IsRoute: origin 1 = Hoshido side, 2 = Nohr side (docs/ROUTES.md); Paragon 'origin' (fact)",
+0x75,1,u8,swimwear_index,low,Swimwear::Get reads Job+0x75,
+0x76,1,u8,unknown_76,low,castle::AngelSequence::..::Angel_Create reads Job+0x76,
+0x77,1,s8,swimwear_variant,low,Swimwear::Get reads Job+0x77 (s8),
+0x78,2,u16,sort_order,low,data: 129 distinct values (a per-class number); no code read found,
+0x7A,1,u8,special_battle,low,Unit::IsSpecialBattle reads Job+0x7A,
+0x7B,1,s8,unknown_7b,low,Unit::ClassChange reads Job+0x7B (s8); -1 in most records; Paragon 'dlc_skill_index' (fact),
+0x7C,4,pad,pad_7c,high,zero in every record,

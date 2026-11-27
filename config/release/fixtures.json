@@ -1,0 +1,46 @@
+{
+ "about": "shas only (no game data): the inputs the core tests need. 'file' = sha256 of the file; 'tree' = smoke.py tree_sha (path + content sha of every file); 'listing' = sha256 of every file's path and size (stat only, for big folders). smoke_set: its inputs are checked by 'smoke.py check'. Rewritten only inside a round commit (release.py fixtures --write).",
+ "smoke_set": "config/harness/smoke_set.json",
+ "files": [
+  {
+   "path": "extracted/code.bin",
+   "kind": "file",
+   "sha256": "f9bb025d97941e6ddfead7b40aa96cd18d8db4c4e6298207dc2144a57d1f087c",
+   "why": "the game's code: hygiene-leak and the decomp tests skip or pass blind without it"
+  },
+  {
+   "path": "extracted/text.bin",
+   "kind": "file",
+   "sha256": "bf13c6f0b2f8f42ac7acaab8e45c507e65f27cb1c0b73c40cb1a3774265ba62b",
+   "why": "the game's text section: many table tests read it"
+  },
+  {
+   "path": "extracted/romfs",
+   "kind": "listing",
+   "sha256": "beac4e823da47e3aaa28cc6f74e6eb706816cf9e6dcaa0e74faf7a48922180ca",
+   "files": 21880,
+   "why": "the game's RomFS: most real-data tests skip without it"
+  },
+  {
+   "path": "play/seal-of-flames/data/mods",
+   "kind": "listing",
+   "sha256": "19519e4a9ec37de53e0d645a42be89a4011469ab0514c88a46438c59516e4073",
+   "files": 979,
+   "why": "the installed Seal of Flames copy: the Seal tests skip without it"
+  },
+  {
+   "path": "build/r62/check/runs",
+   "kind": "tree",
+   "sha256": "f509bb4ecc0ef049a94d9600b5cf4bf1835210dec88194a8e7f553245be23eca",
+   "files": 441,
+   "why": "round-62 page runs: the ids fingerprint and page tests"
+  },
+  {
+   "path": "build/r63/might/runs",
+   "kind": "tree",
+   "sha256": "0c925ce636da6d4ef9d5093a0046a6440f0e6e06396934c6bcee091bc20a309d",
+   "files": 40,
+   "why": "round-63 boss-might runs: test_rando_boss_might skips without them"
+  }
+ ]
+}

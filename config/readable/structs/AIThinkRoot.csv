@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x010,0x4,ptr:AIThinkState,state,medium,"AIThink::IsMoveOver(void) 0x004C858C and AIThink::IsMoveOver(Unit*,int,int) 0x004C854C load this pointer before reading AIThinkState.move_over",

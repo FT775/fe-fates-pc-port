@@ -1,0 +1,17 @@
+function,path,table
+^Unit::,arg0+0x9C->,Person
+^Unit::,arg0+0xA0->,Job
+^Unit::(SetDispos|CreateFromDispos|SetDisposItem|Reinstate)\(,arg1,DisposUnit
+^map::Dispos::Data::,arg0,DisposUnit
+^map::Dispos::Calculate\(,arg1,DisposHeader
+.,Terrain,TerrainTile
+^Terrain::.*const$,arg0,TerrainTile
+.,EquipSkill,Skill
+^EquipSkill::.*const$,arg0,Skill
+^Person::.*const$,arg0,Person
+^Job::.*const$,arg0,Job
+^Item::.*const$,arg0,Item
+^Belong::.*const$,arg0,Belong
+^Chapter::.*const$,arg0,Chapter
+^Unit::CreateImpl\(,arg1,Person
+^Unit::CreateImpl\(,arg2,Job

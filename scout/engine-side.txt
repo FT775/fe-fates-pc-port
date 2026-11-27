@@ -1,0 +1,13 @@
+Engine-side scout (2026-11-10). Read-only; nothing built.
+Owner's ROM: Fire Emblem Fates - Special Edition (USA).cci
+  title/program 0004000000179800, product CTR-P-BFZE, decrypted (NoCrypto), 2 GiB card
+  exheader name "Iron15", .code compressed; text 0x100000 size 0x51011C (~5.1 MiB; Awakening USA ~3.4 MiB)
+  rodata @0x611000, data @0x6B4000; savedata 0x80000; extdata id 0x1794
+  ExeFS: .code, banner, icon. No .cro/.crs in RomFS: single executable, no modules.
+  RomFS 21,880 files, ~1.8 GB; sound archive sound/IRON15_sound.bcsar; movies .moflex; live2d.
+  text FNV-1a 9677F5445E8DCD01 == 3dsrecomp hints.txt section "= 0004000000179800 9677F5445E8DCD01" (94 bundled hint addresses)
+Upstream: Zakuro COMPATIBILITY.md lists Fates SE USA 0004000000179800 Playable + Recompiled. No Fates-specific code in Zakuro, 3dsrecomp, or fe-awakening-recomp.
+Awakening-only (to parameterize): tools/engine/engine.py TITLE_ID/PROGRAM_NAME/PACKAGE/PORT_DIR/DEFAULT_ROM/FEA_* env;
+  tools/play/play.py TITLE_ID/PRODUCT_CODE/ROM_SIZE/ROM_SHA256/GAME/SHORTCUT/STANDALONE_NAME/default rom/FEA_* env;
+  patches/zakuro 0003/0004 (game_ui.rs is_awakening + marker/piece tables, sounds.rs bcsar + SE names, settings/menus gate); 0001/0002/0005 game-agnostic.
+  harness/headless/mods/extras/readable tools hard-code 00040000000A0500 and Awakening addresses.

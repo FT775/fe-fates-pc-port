@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x00,34,s8[34],damage,high,Unit::GetExpDamage 0052D418 reads GetBattle(difficulty)[i] (s8) with i = enemy level - own level + 10 clamped to 0..33
+0x22,2,pad,pad_22,high,zero in every row; index clamped to 33
+0x24,34,s8[34],defeat,high,"Unit::GetExpDestroy 0052E184 reads GetBattle(difficulty)+0x24[i] (s8), same index rule"
+0x46,2,pad,pad_46,high,zero in every row; index clamped to 33

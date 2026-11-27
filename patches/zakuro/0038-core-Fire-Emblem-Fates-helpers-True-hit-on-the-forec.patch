@@ -1,0 +1,815 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 19:14:42 -0500
+Subject: [PATCH 38/38] core: Fire Emblem Fates helpers: True hit on the
+ forecast
+
+Round 80 (docs/ROUND80_PLAN.md A3, build/r80/hit/HIT_TRACE.md; the owner's
+pick F-057, run on the standing OK F-059 (3)). Call 6 keeps the plan's
+"70 (real 79)" with Grok's refinement (docs/collab/ROUND80_HELPERS_GROK.md):
+at a shown 50 or less the game's number already is the real one, so no label.
+
+Core: new zakuro-core fates_true_hit.rs. THRESHOLDS is our own table (the
+2-roll average's threshold out of 10000 for each shown 0..100, from
+build/r80/hit/true_hit_table.json), re-made in a test from the rule with a
+true sine; no game bytes. shown_real(threshold): 100 only at 10000, 0 only at
+0, else round(threshold / 100) clamped to 1..99. A label "real NN" is painted
+only for a shown 51..99.
+
+The forecast is found by reading only (never a trap, never a write): the three
+proc list heads at 0x00752B48, the live proc with the target select's vtable
+0x00635C5C, its BattleInfoWindow at +0x854 (+4 = BattleInfo, float +0x6C4 =
+the slide-in; nothing is painted until it has slid in), the page from
+GameConfigData *0x006DA0F8 +4 bit 7 (set = simple page), and each side's hit
+at BattleInfo + k*0x200 + 0x30 (attack count +0x3C <= 0 = the dash, no label).
+Detail page (the game's default): side 0's label right of its "%", side 1's
+left of its number, each painted only when a light/dark check sees that
+side's single-column Hit row (an Attack Stance pair's two columns get no
+label in this first version). Simple page: places from the draw code, outside
+each number. Glyphs are the growth view's 5x7 table (fates_growth_view::glyph,
+now pub(crate)), cream on brown, one native pixel per dot.
+
+Hook: System::read_scaled paints into its own copy of the top picture
+(true_hit_paint), and the frontend's shown / shown_right take the top screen
+from that picture instead of straight from the GPU while true_hit_shown() is
+true, as the growth view does for the bottom screen.
+
+Defaults are today's game: with True hit Off (or no [fates_helpers] table)
+helpers().true_hit() is checked first, nothing is read and the picture and
+the GPU path are exactly as before. True hit only paints the host's copy of
+the screen; guest memory is never written.
+
+Tests (cargo test --lib): core fates_true_hit, 10 tests: the_table_is_the_rule,
+the_shown_real_number_follows_call_6, the_label_is_only_where_it_says_something,
+the_walk_finds_the_window_and_reads_both_sides (0 guest writes),
+no_window_no_forecast, a_side_with_no_attack_has_no_number,
+paints_the_detail_page_beside_side_1_and_nothing_else,
+shown_0_1_50_and_the_dash_leave_the_picture_alone,
+the_detail_page_is_painted_only_when_its_row_is_on_screen,
+the_simple_page_labels_stay_outside_the_numbers.
+
+Round 80 repair (B2, 2026-11-25), after proof T2 painted this patch's places
+on real forecast frames (a line-by-line copy of the painter, build/r80/t/t2):
+on the simple page side 0's label covered the left edge of the game's own
+number ("71%", "82%", "92%") and the labels covered parts of both HP bars;
+on the detail page side 0's number sits in the middle of its row, with about
+30 px free on either side and the big HP number from x 143, too little for
+"real NN". Now place() returns Option<Place>: the detail page's side 0 gets
+no label (None; side 1 unchanged, seen clean beside its number), and on the
+simple page each label sits just above its side's "Hit" box (boxes x
+137..183 and 217..261 from y 178, measured on the real frames), centred on
+it, rows 168..176, over the portrait or the map: never over a number, an HP
+bar, an HP bubble or the other side's box (it can cover part of a map
+unit's small HP bar). Tests updated:
+paints_the_detail_page_beside_side_1_and_nothing_else,
+shown_0_1_50_and_the_dash_leave_the_picture_alone (side 0's row stays the
+game's), the_simple_page_labels_stay_outside_the_numbers (above the box,
+centred, within its width, the two never meet). This patch is now 0038:
+the former 0038 (enemy phase 2x / 4x pacing) was cut (the plan's cut 3).
+---
+ crates/zakuro-core/src/fates_growth_view.rs |   4 +-
+ crates/zakuro-core/src/fates_true_hit.rs    | 666 ++++++++++++++++++++
+ crates/zakuro-core/src/lib.rs               |   6 +
+ crates/zakuro/src/lib.rs                    |   7 +-
+ 4 files changed, 679 insertions(+), 4 deletions(-)
+ create mode 100644 crates/zakuro-core/src/fates_true_hit.rs
+
+diff --git a/crates/zakuro-core/src/fates_growth_view.rs b/crates/zakuro-core/src/fates_growth_view.rs
+index 0c5c65d..38f4f73 100644
+--- a/crates/zakuro-core/src/fates_growth_view.rs
++++ b/crates/zakuro-core/src/fates_growth_view.rs
+@@ -468,8 +468,8 @@ impl Pic<'_> {
+     }
+ }
+ 
+-/// 5x7 glyphs, one byte per row, bit 4 = left column.
+-fn glyph(c: char) -> [u8; 7] {
++/// 5x7 glyphs, one byte per row, bit 4 = left column (also True hit's painter, fates_true_hit).
++pub(crate) fn glyph(c: char) -> [u8; 7] {
+     match c {
+         '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+         '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+diff --git a/crates/zakuro-core/src/fates_true_hit.rs b/crates/zakuro-core/src/fates_true_hit.rs
+new file mode 100644
+index 0000000..a2274fa
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_true_hit.rs
+@@ -0,0 +1,666 @@
++//! Fire Emblem Fates: True hit (round 80, owner pick F-057; the Esc window's "True hit" row,
++//! `fates_helpers::Helpers::true_hit`).
++//!
++//! With the row On, the battle forecast on the top screen gets "real NN" beside the game's own
++//! hit number, for each side that attacks. The number is the real chance the game rolls with:
++//! the game's single roll (`map::battle::detail::RandomCalculateHit` 0x003A3588) hits when a die
++//! 0..9999 falls under a threshold made from the shown hit. At 50 or less the threshold is the
++//! shown number times 100; above 50 the game adds a half sine (most at 75, nothing at 100). The
++//! 101 thresholds in [`THRESHOLDS`] are our own numbers, worked out from that rule
++//! (build/r80/hit/HIT_TRACE.md, make_true_hit_table.py); no game bytes are kept here, and the
++//! test `the_table_is_the_rule` makes them again from the rule with a true sine.
++//!
++//! What is shown (the plan's call 6, with Grok's refinement, docs/collab/ROUND80_HELPERS_GROK.md):
++//! a whole number made from the threshold out of 10000 ([`shown_real`]): 100 only when the
++//! threshold is 10000, else at most 99 (a shown 98 or 99 says "real 99"), and at least 1 when the
++//! threshold is above 0. It is painted for a shown 51..99 only: at 50 or less the game's number
++//! is the real one ("50 (real 50)" is noise, Grok), and a shown 100 is already certain.
++//!
++//! Nothing here writes guest memory, and nothing is read while the row is Off (the default): the
++//! frontend's picture and the game are then today's. With the row On the painter reads guest
++//! memory once or twice a frame and paints only into the host's copy of the top picture
++//! (`System::read_screen_scaled`), never over the game's number or its "%", and not at all for a
++//! side with no attack (the game draws a dash there) or while the window slides in.
++//!
++//! How the forecast window is found each frame: the proc walk (decided in round 80 A3's first
++//! 30 minutes). A PC watch on `BattleInfoWindow::DrawSimpleHit` 0x00365DEC / `DrawDetailDataOne`
++//! 0x003676B8 would need a trap word written over the game's code (the only way this engine stops
++//! at a game address: the chest and names traps write an svc there), which breaks "never writes
++//! guest memory" and the memory compares of proofs D1 and T2. The walk only reads.
++//!
++//! Game facts (ARM code of the game, read only, round 80 A3; docs/ROBOT.md section 3 for the walk):
++//! - Proc tree: three list heads at 0x00752B48; links +20 first child, +28 next sibling; byte +40
++//!   bit 0 dying; word +0 the vtable (`ProcInst::FindNext` 0x0011D318).
++//! - The target select (`map::SequenceTargetSelect::Create` 0x0037089C, proc name
++//!   "SequenceTargetSelect") makes a `map::(anon)::ProcSequence` (constructor 0x0038B588), whose
++//!   vtable word is 0x00635C5C. Its `map::BattleInfoWindow` is at +0x854.
++//! - The window: +0x4 the BattleInfo it shows (`BattleInfoWindow::Draw` 0x003679E0 draws nothing
++//!   while it is 0); float +0x6C4 the slide-in (the sides are drawn at an offset of
++//!   trunc(-200 * (1 - t)^2), 0 when t is 1). Draw picks the simple page (`DrawSimpleSide`) when
++//!   `GameConfigData` (`*0x006DA0F8`) word +0x4 has bit 7 set, else the detail page
++//!   (`DrawDetailSide`, rows Atk / Hit / Crit; the game's default).
++//! - BattleInfo side k at +k*0x200: +0x30 the shown hit (0..100, `Side::GetSimpleHit` 0x005250B4,
++//!   the same word the strike rolls with), +0x3C the attack count (0 or less: a dash).
++//! - Where the number is (top screen, 400x240): detail page, the Hit row's number right-aligned at
++//!   x 94 (side 0) / 317 (side 1), glyph rows 197..207, "%" after it; two digits start at x 80..81
++//!   (side 0) / 303..305 (side 1) (measured on the 29 robot forecast pictures in build/speed/btend;
++//!   counted). With a pair in Attack Stance the page has two columns per side (the partner's
++//!   strike); the row check then fails and nothing is painted (first version). Simple page: the "Hit" label centred at x 160 /
++//!   240, y 181, the number right-aligned at x + the font's widest glyph, y 201
++//!   (`DrawSimpleSide` 0x00367048 calls `DrawSimpleHit` with x = base +66 / -66; read from the
++//!   code, the widest glyph is an estimate until proof T2 looks at a simple forecast).
++
++use crate::fates_rando::Guest;
++
++/// the real threshold out of 10000 for every shown hit 0..=100 (our own numbers from the rule
++/// above; build/r80/hit/true_hit_table.json `threshold_of_10000`).
++pub const THRESHOLDS: [u16; 101] = [
++    0, 100, 200, 300, 400, 500, 600, 700, 800, 900, //
++    1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, //
++    2000, 2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900, //
++    3000, 3100, 3200, 3300, 3400, 3500, 3600, 3700, 3800, 3900, //
++    4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700, 4800, 4900, //
++    5000, 5142, 5286, 5432, 5579, 5726, 5874, 6023, 6172, 6321, //
++    6470, 6618, 6765, 6912, 7057, 7201, 7343, 7482, 7620, 7755, //
++    7887, 8016, 8142, 8265, 8384, 8500, 8611, 8718, 8821, 8920, //
++    9014, 9104, 9189, 9269, 9345, 9416, 9483, 9545, 9603, 9656, //
++    9705, 9750, 9790, 9827, 9861, 9891, 9918, 9942, 9963, 9982, //
++    10000,
++];
++
++/// the threshold out of 10000 for a shown hit, None when it is not 0..=100.
++pub fn threshold(shown: u32) -> Option<u32> {
++    THRESHOLDS.get(shown as usize).map(|&t| t as u32)
++}
++
++/// the whole number True hit shows for a threshold out of 10000 (call 6): rounded, 100 only when
++/// the threshold is 10000, else at most 99, and at least 1 when the threshold is above 0.
++pub fn shown_real(threshold: u32) -> u32 {
++    if threshold >= 10000 {
++        100
++    } else if threshold == 0 {
++        0
++    } else {
++        ((threshold + 50) / 100).clamp(1, 99)
++    }
++}
++
++/// the words painted beside a shown hit, or None when nothing is painted: only a shown 51..99
++/// gets them (at 50 or less the shown number is the real one; 100 is already certain).
++pub fn label(shown: u32) -> Option<String> {
++    if !(51..=99).contains(&shown) {
++        return None;
++    }
++    Some(format!("real {}", shown_real(threshold(shown)?)))
++}
++
++// --------------------------------------------------------------------------- the window
++
++const PROC_ROOTS: u32 = 0x0075_2B48;
++const PROC_ROOT_COUNT: u32 = 3;
++const PROC_CHILD: u32 = 20;
++const PROC_SIBLING: u32 = 28;
++const PROC_FLAGS: u32 = 40;
++/// the vtable word of the target select's `map::(anon)::ProcSequence`
++pub const TARGET_SELECT_VTABLE: u32 = 0x0063_5C5C;
++const WINDOW: u32 = 0x854;
++const WINDOW_INFO: u32 = 0x4;
++const WINDOW_SLIDE: u32 = 0x6C4;
++const GAME_CONFIG: u32 = 0x006D_A0F8;
++const SIDE_SIZE: u32 = 0x200;
++const SIDE_HIT: u32 = 0x30;
++const SIDE_ATTACKS: u32 = 0x3C;
++/// the walk stops after this many procs (a broken list never loops for ever)
++const WALK_MAX: usize = 4096;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Page {
++    /// rows Atk / Hit / Crit (the game's default)
++    Detail,
++    /// the "Hit" label and one number (the game's Options, forecast line)
++    Simple,
++}
++
++/// what the forecast shows this frame: the page, and each side's shown hit (None for a side
++/// with no attack, where the game draws a dash).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Forecast {
++    pub page: Page,
++    pub hit: [Option<u32>; 2],
++}
++
++fn u8_at(g: &mut dyn Guest, addr: u32) -> Option<u8> {
++    if !g.readable(addr, 1) {
++        return None;
++    }
++    let mut b = [0u8; 1];
++    g.read(addr, &mut b);
++    Some(b[0])
++}
++
++/// the live target select proc (the proc walk), or None.
++pub fn target_select(g: &mut dyn Guest) -> Option<u32> {
++    let mut stack: Vec<u32> = Vec::new();
++    for r in (0..PROC_ROOT_COUNT).rev() {
++        if let Some(head) = g.r32(PROC_ROOTS + 4 * r).filter(|&p| p != 0) {
++            stack.push(head);
++        }
++    }
++    let mut visited = 0usize;
++    while let Some(inst) = stack.pop() {
++        visited += 1;
++        if visited > WALK_MAX {
++            return None;
++        }
++        let flags = u8_at(g, inst.wrapping_add(PROC_FLAGS))?;
++        if flags & 1 == 0 && g.r32(inst) == Some(TARGET_SELECT_VTABLE) {
++            return Some(inst);
++        }
++        if let Some(next) = g.r32(inst.wrapping_add(PROC_SIBLING)).filter(|&p| p != 0) {
++            stack.push(next);
++        }
++        if let Some(child) = g.r32(inst.wrapping_add(PROC_CHILD)).filter(|&p| p != 0) {
++            stack.push(child);
++        }
++    }
++    None
++}
++
++/// the sides' offset while the window slides in (`BattleInfoWindow::Draw`), single-precision
++/// steps as the game's.
++fn slide_offset(t: f32) -> i32 {
++    let a = 1.0f32 - t;
++    let b = a * a;
++    let c = 200.0f32 * b;
++    let d = c / 1.0f32;
++    (0.0f32 - d) as i32
++}
++
++/// the forecast the window shows now, fully slid in, or None (no target select, no BattleInfo,
++/// still sliding, or a word that cannot be read).
++pub fn forecast(g: &mut dyn Guest) -> Option<Forecast> {
++    let proc = target_select(g)?;
++    let window = proc.wrapping_add(WINDOW);
++    let info = g.r32(window.wrapping_add(WINDOW_INFO)).filter(|&p| p != 0)?;
++    let t = f32::from_bits(g.r32(window.wrapping_add(WINDOW_SLIDE))?);
++    if !t.is_finite() || slide_offset(t) != 0 {
++        return None;
++    }
++    let config = g.r32(GAME_CONFIG).filter(|&p| p != 0)?;
++    let bits = g.r32(config.wrapping_add(4))?;
++    let page = if bits & 0x80 != 0 { Page::Simple } else { Page::Detail };
++    let mut hit = [None; 2];
++    for (k, slot) in hit.iter_mut().enumerate() {
++        let side = info.wrapping_add(k as u32 * SIDE_SIZE);
++        let attacks = g.r32(side.wrapping_add(SIDE_ATTACKS))? as i32;
++        if attacks > 0 {
++            *slot = Some(g.r32(side.wrapping_add(SIDE_HIT))?);
++        }
++    }
++    Some(Forecast { page, hit })
++}
++
++// --------------------------------------------------------------------------- the painter
++
++/// where the label goes for a page and side (top screen, native 400x240): the text's left or
++/// right edge, its top row, the game's number box (left, top, right, bottom) that must stay
++/// untouched, and whether the text grows to the right of `x`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Place {
++    pub x: u32,
++    pub top: u32,
++    pub right_of: bool,
++    /// the box stops at the text on its far side (the detail page's side 0: the big HP number
++    /// starts one pixel after the text)
++    pub tight: bool,
++    /// the game's two digits and "%" (a painted number is always 51..99: two digits)
++    pub number: (u32, u32, u32, u32),
++}
++
++/// the label's place, or None where no place leaves the game's pixels alone. Detail: side 1 left
++/// of its number (the big HP number ends at x 254; seen clean in proof T2). Side 0 gets no label
++/// on the detail page: its number sits in the middle of its row, with about 30 px free on either
++/// side and the big HP number from x 143 (T2, real frames), too little for "real NN" (round 80
++/// repair). Simple page (round 80 repair, measured on T2's real frames): there is no free room
++/// beside the numbers (the HP bars, their HP bubbles and the other side's box are there), so each
++/// label sits just above its side's "Hit" box (boxes x 137..183 and 217..261, from y 178), centred
++/// on it, over the portrait or the map, never over a number, a bar or the other side.
++pub fn place(page: Page, side: usize) -> Option<Place> {
++    match (page, side) {
++        (Page::Detail, 0) => None,
++        (Page::Detail, _) => Some(Place { x: 298, top: 199, right_of: false, tight: false, number: (303, 197, 327, 207) }),
++        (Page::Simple, 0) => Some(Place { x: 140, top: 169, right_of: true, tight: false, number: (151, 202, 176, 213) }),
++        (Page::Simple, _) => Some(Place { x: 220, top: 169, right_of: true, tight: false, number: (224, 202, 256, 213) }),
++    }
++}
++
++/// the top row of the simple page's "Hit" boxes (T2's real frames): a simple-page label ends above it.
++pub const SIMPLE_BOX_TOP: u32 = 178;
++
++/// the box painted for a label at a place: (left, top, right, bottom), native pixels.
++pub fn label_box(p: Place, text: &str) -> (u32, u32, u32, u32) {
++    let w = text_width(text);
++    let (l, r) = if p.right_of { (p.x, p.x + w - 1) } else { (p.x + 1 - w, p.x) };
++    // one pixel of the box round the text, none on the far side of a tight place
++    let (l, r) = match (p.tight, p.right_of) {
++        (true, true) => (l - 1, r),
++        (true, false) => (l, r + 1),
++        _ => (l - 1, r + 1),
++    };
++    (l, p.top - 1, r, p.top + 7)
++}
++
++fn text_width(text: &str) -> u32 {
++    (text.chars().count() as u32 * 6).saturating_sub(1)
++}
++
++const CREAM: [u8; 3] = [255, 233, 167];
++const BROWN: [u8; 3] = [92, 52, 24];
++
++struct Canvas<'a> {
++    px: &'a mut [u8],
++    width: u32,
++    scale: u32,
++}
++
++impl Canvas<'_> {
++    fn at(&self, x: u32, y: u32) -> [u8; 3] {
++        let (x, y) = (x * self.scale + self.scale / 2, y * self.scale + self.scale / 2);
++        let i = ((y * self.width + x) * 4) as usize;
++        [self.px[i], self.px[i + 1], self.px[i + 2]]
++    }
++
++    fn set(&mut self, x: u32, y: u32, c: [u8; 3]) {
++        if x >= 400 || y >= 240 {
++            return;
++        }
++        for dy in 0..self.scale {
++            for dx in 0..self.scale {
++                let i = (((y * self.scale + dy) * self.width + x * self.scale + dx) * 4) as usize;
++                self.px[i..i + 3].copy_from_slice(&c);
++                self.px[i + 3] = 255;
++            }
++        }
++    }
++
++    /// the detail page's Hit row is on screen for a side: the empty cream part of its row, the
++    /// row's dark lower edge and the game's dark digits (measured on three robot forecast
++    /// pictures; the page's colours differ by army, so light and dark, not exact colours).
++    fn shows_detail_row(&self, side: usize) -> bool {
++        let light = |c: [u8; 3]| c.iter().map(|&v| v as u32).sum::<u32>() > 500;
++        let dark = |c: [u8; 3]| c.iter().map(|&v| v as u32).sum::<u32>() < 300;
++        let (empty, edge, digits) = if side == 0 { ((106, 127), (80, 125), (82, 93)) } else { ((276, 300), (280, 345), (305, 316)) };
++        (empty.0..=empty.1).all(|x| light(self.at(x, 200)))
++            && (edge.0..=edge.1).step_by(5).all(|x| dark(self.at(x, 210)))
++            && (digits.0..=digits.1).any(|x| (197..=207).any(|y| dark(self.at(x, y))))
++    }
++
++    fn label(&mut self, p: Place, text: &str) {
++        let (l, t, r, b) = label_box(p, text);
++        for y in t..=b {
++            for x in l..=r {
++                self.set(x, y, BROWN);
++            }
++        }
++        let left = if p.right_of { p.x } else { p.x + 1 - text_width(text) };
++        let mut cx = left;
++        for ch in text.chars() {
++            let rows = crate::fates_growth_view::glyph(ch);
++            for (ry, row) in rows.iter().enumerate() {
++                for rx in 0..5 {
++                    if row & (0x10 >> rx) != 0 {
++                        self.set(cx + rx, p.top + ry as u32, CREAM);
++                    }
++                }
++            }
++            cx += 6;
++        }
++    }
++}
++
++/// paints each attacking side's label into the top picture (RGBA, `width` x `height`, a whole
++/// multiple of 400 x 240) for the forecast `f`. True when it painted. A side with no attack, or a
++/// shown number the label would only repeat, is left as the game drew it.
++pub fn paint(f: &Forecast, pixels: &mut [u8], width: u32, height: u32) -> bool {
++    let scale = width / 400;
++    if scale == 0 || width % 400 != 0 || height != 240 * scale || pixels.len() < (width * height * 4) as usize {
++        return false;
++    }
++    let mut c = Canvas { px: pixels, width, scale };
++    let mut painted = false;
++    for (side, hit) in f.hit.iter().enumerate() {
++        let Some(text) = hit.and_then(label) else { continue };
++        let Some(p) = place(f.page, side) else { continue };
++        if f.page == Page::Detail && !c.shows_detail_row(side) {
++            continue;
++        }
++        c.label(p, &text);
++        painted = true;
++    }
++    painted
++}
++
++impl crate::System {
++    /// round 80: the forecast to paint this frame, or None: Fire Emblem Fates (or a mod on its
++    /// title id) with the True hit row On, and a forecast with a label to show. Nothing is read
++    /// while the row is Off.
++    pub fn true_hit_forecast(&mut self) -> Option<Forecast> {
++        if !self.helpers().true_hit() {
++            return None;
++        }
++        forecast(&mut self.memory).filter(|f| f.hit.iter().any(|h| h.and_then(label).is_some()))
++    }
++
++    /// round 80: True hit has a label to paint on the top screen this frame (the frontend then
++    /// takes the top picture from `read_screen_scaled`, as the growth view does for the bottom).
++    pub fn true_hit_shown(&mut self) -> bool {
++        self.true_hit_forecast().is_some()
++    }
++
++    /// round 80: the top picture with True hit's labels, or the picture as it was.
++    pub(crate) fn true_hit_paint(&mut self, picture: crate::Screen) -> crate::Screen {
++        let Some(f) = self.true_hit_forecast() else { return picture };
++        let (pixels, width, height) = picture;
++        let mut own = pixels.as_ref().clone();
++        if paint(&f, &mut own, width, height) {
++            return (std::sync::Arc::new(own), width, height);
++        }
++        (pixels, width, height)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    #[test]
++    fn the_table_is_the_rule() {
++        for s in 0..=100u32 {
++            let want = if s <= 50 {
++                s * 100
++            } else {
++                let angle = ((s as f64 - 50.0) * 3.6).to_radians();
++                (s as f64 * 100.0 + (40.0 / 3.0) * s as f64 * angle.sin()).trunc() as u32
++            };
++            assert_eq!(threshold(s), Some(want), "shown {s}");
++        }
++        assert_eq!(threshold(70), Some(7887));
++        assert_eq!(threshold(100), Some(10000));
++        assert_eq!(threshold(101), None);
++        assert!(THRESHOLDS.windows(2).all(|w| w[0] < w[1]), "the real chance grows with the shown one");
++        assert!((0..=100).all(|s| THRESHOLDS[s] as usize >= s * 100), "never below the shown chance");
++    }
++
++    #[test]
++    fn the_shown_real_number_follows_call_6() {
++        let real = |s: u32| shown_real(threshold(s).unwrap());
++        assert_eq!(real(0), 0);
++        assert_eq!(real(1), 1);
++        assert_eq!(real(50), 50);
++        assert_eq!(real(70), 79);
++        assert_eq!(real(98), 99);
++        assert_eq!(real(99), 99);
++        assert_eq!(real(100), 100);
++        for s in 0..100 {
++            assert!(real(s) <= 99, "only a sure hit says 100 (shown {s})");
++        }
++        assert_eq!(shown_real(1), 1, "above 0 shows at least 1");
++        assert_eq!(shown_real(49), 1);
++        assert_eq!(shown_real(9999), 99);
++        assert_eq!(shown_real(10000), 100);
++    }
++
++    #[test]
++    fn the_label_is_only_where_it_says_something() {
++        for s in [0, 1, 49, 50, 100, 101, u32::MAX] {
++            assert_eq!(label(s), None, "shown {s}");
++        }
++        assert_eq!(label(51).as_deref(), Some("real 51"));
++        assert_eq!(label(52).as_deref(), Some("real 53"));
++        assert_eq!(label(70).as_deref(), Some("real 79"));
++        assert_eq!(label(98).as_deref(), Some("real 99"));
++        assert_eq!(label(99).as_deref(), Some("real 99"));
++    }
++
++    // ----------------------------------------------------------------- the window, a fake game
++
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++        writes: u32,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, len: usize) {
++            self.blocks.insert(at, vec![0; len]);
++        }
++        fn w32(&mut self, at: u32, v: u32) {
++            let (b, o) = self.find(at, 4).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + 4].copy_from_slice(&v.to_le_bytes());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, _addr: u32, _data: &[u8]) {
++            self.writes += 1;
++        }
++    }
++
++    const ROOTS: u32 = PROC_ROOTS;
++    const MAIN: u32 = 0x3000_0000;
++    const OTHER: u32 = 0x3000_1000;
++    const SEQ: u32 = 0x3100_0000;
++    const INFO: u32 = 0x3200_0000;
++    const CONFIG: u32 = 0x3300_0000;
++
++    /// root 0 -> MAIN; MAIN's child OTHER; OTHER's sibling the target select, its window slid
++    /// in, side 0 shows 70 with two strikes, side 1 shows 98 with one.
++    fn game() -> Fake {
++        let mut m = Fake::default();
++        m.put(ROOTS, 12);
++        m.put(GAME_CONFIG, 4);
++        m.put(MAIN, 0x40);
++        m.put(OTHER, 0x40);
++        m.put(SEQ, 0x1520);
++        m.put(INFO, 0x400);
++        m.put(CONFIG, 0x20);
++        m.w32(ROOTS, MAIN);
++        m.w32(MAIN, 0x0064_0000);
++        m.w32(MAIN + PROC_CHILD, OTHER);
++        m.w32(OTHER, 0x0064_0010);
++        m.w32(OTHER + PROC_SIBLING, SEQ);
++        m.w32(SEQ, TARGET_SELECT_VTABLE);
++        m.w32(SEQ + WINDOW + WINDOW_INFO, INFO);
++        m.w32(SEQ + WINDOW + WINDOW_SLIDE, 1.0f32.to_bits());
++        m.w32(GAME_CONFIG, CONFIG);
++        m.w32(INFO + SIDE_HIT, 70);
++        m.w32(INFO + SIDE_ATTACKS, 2);
++        m.w32(INFO + SIDE_SIZE + SIDE_HIT, 98);
++        m.w32(INFO + SIDE_SIZE + SIDE_ATTACKS, 1);
++        m
++    }
++
++    #[test]
++    fn the_walk_finds_the_window_and_reads_both_sides() {
++        let mut g = game();
++        assert_eq!(target_select(&mut g), Some(SEQ));
++        assert_eq!(forecast(&mut g), Some(Forecast { page: Page::Detail, hit: [Some(70), Some(98)] }));
++        g.w32(CONFIG + 4, 0x80);
++        assert_eq!(forecast(&mut g).map(|f| f.page), Some(Page::Simple));
++        assert_eq!(g.writes, 0, "nothing is written to the game");
++    }
++
++    #[test]
++    fn no_window_no_forecast() {
++        // a dying target select is not the window
++        let mut g = game();
++        g.blocks.get_mut(&SEQ).unwrap()[PROC_FLAGS as usize] = 1;
++        assert_eq!(forecast(&mut g), None);
++        // no BattleInfo yet
++        let mut g = game();
++        g.w32(SEQ + WINDOW + WINDOW_INFO, 0);
++        assert_eq!(forecast(&mut g), None);
++        // still sliding in
++        let mut g = game();
++        g.w32(SEQ + WINDOW + WINDOW_SLIDE, 0.8f32.to_bits());
++        assert_eq!(forecast(&mut g), None);
++        // nearly in: the offset is already 0 (trunc of -0.02)
++        g.w32(SEQ + WINDOW + WINDOW_SLIDE, 0.99f32.to_bits());
++        assert!(forecast(&mut g).is_some());
++        // no proc tree at all
++        let mut g = Fake::default();
++        assert_eq!(forecast(&mut g), None);
++        // a list that loops ends
++        let mut g = game();
++        g.w32(OTHER + PROC_SIBLING, MAIN);
++        assert_eq!(target_select(&mut g), None);
++    }
++
++    #[test]
++    fn a_side_with_no_attack_has_no_number() {
++        let mut g = game();
++        g.w32(INFO + SIDE_SIZE + SIDE_ATTACKS, 0);
++        assert_eq!(forecast(&mut g).unwrap().hit, [Some(70), None]);
++    }
++
++    // ----------------------------------------------------------------- the painter
++
++    /// a detail page at `scale`: cream rows, their dark lower edges, dark digits in each side's
++    /// number box, and an orange ground everywhere else.
++    fn detail_picture(scale: u32) -> Vec<u8> {
++        let (w, h) = (400 * scale, 240 * scale);
++        let mut px = vec![0u8; (w * h * 4) as usize];
++        let mut put = |x: u32, y: u32, c: [u8; 3]| {
++            for dy in 0..scale {
++                for dx in 0..scale {
++                    let i = (((y * scale + dy) * w + x * scale + dx) * 4) as usize;
++                    px[i..i + 3].copy_from_slice(&c);
++                    px[i + 3] = 255;
++                }
++            }
++        };
++        for y in 0..240 {
++            for x in 0..400 {
++                put(x, y, [196, 121, 39]);
++            }
++        }
++        for (l, r) in [(50, 130), (268, 352)] {
++            for y in 195..210 {
++                for x in l..=r {
++                    put(x, y, [241, 216, 158]);
++                }
++            }
++            for x in l..=r {
++                put(x, 210, [60, 30, 10]);
++            }
++        }
++        for (l, r) in [(82, 103), (305, 327)] {
++            for y in 197..=207 {
++                for x in (l..=r).step_by(2) {
++                    put(x, y, [70, 20, 20]);
++                }
++            }
++        }
++        px
++    }
++
++    fn get(px: &[u8], scale: u32, x: u32, y: u32) -> [u8; 4] {
++        let i = (((y * scale + scale / 2) * 400 * scale + x * scale + scale / 2) * 4) as usize;
++        [px[i], px[i + 1], px[i + 2], px[i + 3]]
++    }
++
++    fn inside((l, t, r, b): (u32, u32, u32, u32), x: u32, y: u32) -> bool {
++        x >= l && x <= r && y >= t && y <= b
++    }
++
++    #[test]
++    fn paints_the_detail_page_beside_side_1_and_nothing_else() {
++        for scale in [1, 2, 3] {
++            let before = detail_picture(scale);
++            let mut px = before.clone();
++            let f = Forecast { page: Page::Detail, hit: [Some(70), Some(98)] };
++            assert!(paint(&f, &mut px, 400 * scale, 240 * scale));
++            // side 0 has no place on the detail page (round 80 repair): only side 1's box changes
++            let boxes = [label_box(place(Page::Detail, 1).unwrap(), "real 99")];
++            for y in 0..240 {
++                for x in 0..400 {
++                    let (a, b) = (get(&before, scale, x, y), get(&px, scale, x, y));
++                    if boxes.iter().any(|&bx| inside(bx, x, y)) {
++                        assert!(b[..3] == BROWN || b[..3] == CREAM, "the label at {x},{y}");
++                    } else {
++                        assert_eq!(a, b, "a game pixel at {x},{y} (scale {scale})");
++                    }
++                }
++            }
++            // some cream text in each box, and never in the game's number or "%"
++            for bx in boxes.iter() {
++                let n = place(Page::Detail, 1).unwrap().number;
++                assert!(bx.0 > n.2 || bx.2 < n.0, "the box is beside the number");
++                let cream = (bx.0..=bx.2).flat_map(|x| (bx.1..=bx.3).map(move |y| (x, y))).filter(|&(x, y)| get(&px, scale, x, y)[..3] == CREAM).count();
++                assert!(cream > 40, "the text is painted ({cream})");
++            }
++        }
++        // side 1's label starts after the big HP number (x 254); side 0 has no place
++        assert!(label_box(place(Page::Detail, 1).unwrap(), "real 99").0 > 254);
++        assert!(place(Page::Detail, 0).is_none());
++    }
++
++    #[test]
++    fn shown_0_1_50_and_the_dash_leave_the_picture_alone() {
++        let before = detail_picture(2);
++        for hit in [[Some(0), Some(1)], [Some(50), None], [None, None], [Some(100), Some(49)]] {
++            let mut px = before.clone();
++            assert!(!paint(&Forecast { page: Page::Detail, hit }, &mut px, 800, 480), "{hit:?}");
++            assert!(px == before, "{hit:?}");
++        }
++        // one side with no attack: only the other side is painted
++        let mut px = before.clone();
++        assert!(paint(&Forecast { page: Page::Detail, hit: [None, Some(70)] }, &mut px, 800, 480));
++        // and side 0's whole row, right of its number up to the big HP number, stays the game's
++        assert!((104..=146).all(|x| (195..=210).all(|y| get(&px, 2, x, y) == get(&before, 2, x, y))));
++    }
++
++    #[test]
++    fn the_detail_page_is_painted_only_when_its_row_is_on_screen() {
++        // the map, a talk, any other picture: the row's cream and edge are not there
++        let mut px = vec![30u8; 400 * 240 * 4];
++        let before = px.clone();
++        assert!(!paint(&Forecast { page: Page::Detail, hit: [Some(70), Some(70)] }, &mut px, 400, 240));
++        assert!(px == before);
++        // a picture of the wrong size
++        let mut px = detail_picture(1);
++        assert!(!paint(&Forecast { page: Page::Detail, hit: [Some(70), Some(70)] }, &mut px, 320, 240));
++    }
++
++    #[test]
++    fn the_simple_page_labels_stay_outside_the_numbers() {
++        // round 80 repair: above each side's "Hit" box, centred on it, never over a number
++        for (side, (box_l, box_r)) in [(137u32, 183u32), (217, 261)].into_iter().enumerate() {
++            let p = place(Page::Simple, side).unwrap();
++            let b = label_box(p, "real 99");
++            assert!(b.3 < SIMPLE_BOX_TOP, "side {side}: the label ends above the box ({b:?})");
++            assert!(b.3 < p.number.1, "side {side}: above the game's number");
++            assert!(b.0 >= box_l && b.2 <= box_r, "side {side}: within the box's width ({b:?})");
++            let mid = (b.0 + b.2) / 2;
++            assert!(mid.abs_diff((box_l + box_r) / 2) <= 1, "side {side}: centred ({mid})");
++        }
++        // the two labels never meet
++        let (l, r) = (label_box(place(Page::Simple, 0).unwrap(), "real 99"), label_box(place(Page::Simple, 1).unwrap(), "real 99"));
++        assert!(l.2 < r.0);
++        let mut px = vec![30u8; 800 * 480 * 4];
++        assert!(paint(&Forecast { page: Page::Simple, hit: [Some(70), Some(98)] }, &mut px, 800, 480));
++    }
++}
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 07c788d..b0bb5f3 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod fates_rando_chests;
+ pub mod fates_rando_file;
+ pub mod fates_rando_names;
+ pub mod fates_rando_session;
++pub mod fates_true_hit;
+ pub mod game_ui;
+ pub mod cro;
+ pub mod download_play;
+@@ -1163,6 +1164,11 @@ impl System {
+             }
+             return (pixels, width, height);
+         }
++        // round 80: True hit's "real NN" beside the forecast's hit numbers (fates_true_hit),
++        // painted into this copy of the top picture only, and only with the row On
++        if screen == zakuro_common::Screen::Top {
++            return self.true_hit_paint(picture);
++        }
+         picture
+     }
+ 
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index c83e3d0..1a9dad6 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -2858,7 +2858,9 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<Gp
+     // round 62: Fire Emblem Fates' unit panel goes up from the picture's pixels, where the
+     // growth view paints its button and percents (zakuro_core::fates_growth_view)
+     let growth = screen == Screen::Bottom && system.growth_panel_shown();
+-    if let Some(gpu) = system.gpu_screen(screen).filter(|_| !growth) {
++    // round 80: so does the top screen while True hit paints the forecast (fates_true_hit)
++    let hit = screen == Screen::Top && system.true_hit_shown();
++    if let Some(gpu) = system.gpu_screen(screen).filter(|_| !growth && !hit) {
+         let scale = system.gpu.scale();
+         return ((std::sync::Arc::new(Vec::new()), screen.width() * scale, screen.height() * scale), Some(gpu));
+     }
+@@ -2868,7 +2870,8 @@ fn shown(system: &mut System, screen: Screen) -> (zakuro_core::Screen, Option<Gp
+ /// the top screen's picture for the right eye, as shown gives the screens,
+ /// when the game draws in 3D.
+ fn shown_right(system: &mut System) -> Option<(zakuro_core::Screen, Option<GpuScreen>)> {
+-    if let Some(gpu) = system.gpu_right_eye() {
++    let hit = system.true_hit_shown();
++    if let Some(gpu) = system.gpu_right_eye().filter(|_| !hit) {
+         let scale = system.gpu.scale();
+         return Some(((std::sync::Arc::new(Vec::new()), Screen::Top.width() * scale, Screen::Top.height() * scale), Some(gpu)));
+     }
+-- 
+2.55.0.windows.5
+

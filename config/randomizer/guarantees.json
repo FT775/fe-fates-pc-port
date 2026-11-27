@@ -1,0 +1,257 @@
+{
+ "about": "Round 75b (docs/SEED_GUARANTEES_PLAN.md section 2, written as 'round 79' there): per story, the roles that must be in the army by the first chapter that needs them. IDs and chapter ids only, no game values. 'army' = who is in the army at that chapter (round 72's break check read it from memory on saves made by playing the story; a male Corrin; the chapter-7 lists are the saves after chapter 7, so one chapter generous). An entry that is a list is one slot: it covers a need only if every person in it does (the retainer slot: which retainer stays depends on Corrin's sex, call 5). Checked by: python tools/randomizer/guarantees.py facts.",
+ "version": 1,
+ "round": "75b",
+ "roles": {
+  "door": "the lock-opening skill in the person's own skills or the class's skills (keys are not counted)",
+  "staff": "a class with a staff rank; a repaired healer's join placement carries a staff (call 3)",
+  "flier": "a class in the flying category (rules.json recruit.flier_job_category)",
+  "vein": "the dragon-vein person flag (Corrin and the royals; never edited)"
+ },
+ "retainer_slot": [
+  "PID_フェリシア",
+  "PID_ジョーカー"
+ ],
+ "never_repaired_note": "kept people (lord, singer, royals with a legendary weapon), rules.json recruit.recruit_fixed / recruit_hold / recruit_castle and the four royals are never given a class by a repair (guarantees.py held()), with one exception: the last resort (guarantees.py last_resort()) may re-class rules.json recruit_fixed (Gunter) when nobody else in that chapter's army can take the role (round 75b; shuffle 'any' only in the sweeps).",
+ "stories": {
+  "A": {
+   "name": "Birthright",
+   "needs": [
+    {
+     "role": "door",
+     "by": "A007",
+     "why": "first chests: 2 chest tile events (kind 10) in A007; first locked doors: 3 (kind 9) in A009",
+     "confidence": "[high] chapters; [medium] army (one chapter generous)",
+     "army_from": "build/r72/check/jobs/bt-A007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_リンカ",
+      "PID_スズカゼ",
+      "PID_サクラ",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_カザハナ",
+      "PID_ツバキ",
+      "PID_サイラス",
+      "PID_サイゾウ",
+      "PID_オロチ"
+     ]
+    },
+    {
+     "role": "staff",
+     "by": "A007",
+     "why": "the owner's 'a healer early': the first chapter after the split (call 2)",
+     "confidence": "[high] army; the chapter is call 2",
+     "army_from": "build/r72/check/jobs/bt-A007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_リンカ",
+      "PID_スズカゼ",
+      "PID_サクラ",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_カザハナ",
+      "PID_ツバキ",
+      "PID_サイラス",
+      "PID_サイゾウ",
+      "PID_オロチ"
+     ]
+    },
+    {
+     "role": "flier",
+     "by": "A010",
+     "why": "a locked door on the ninja-village map (1 kind-9 tile event in A010); public randomizers list it as a map that breaks without a flier (facts only)",
+     "confidence": "[medium]: the need comes from public tools' known-break list",
+     "army_from": "build/r72/check/jobs/bt-A010-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_リンカ",
+      "PID_スズカゼ",
+      "PID_サクラ",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_カザハナ",
+      "PID_ツバキ",
+      "PID_サイラス",
+      "PID_サイゾウ",
+      "PID_オロチ",
+      "PID_アサマ",
+      "PID_オボロ",
+      "PID_ヒナタ",
+      "PID_ツクヨミ"
+     ]
+    },
+    {
+     "role": "vein",
+     "by": "every",
+     "why": "vein tile events in most chapters; Corrin (kept class, vein flag) is on every map",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/bt-A007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女"
+     ]
+    }
+   ]
+  },
+  "B": {
+   "name": "Conquest",
+   "needs": [
+    {
+     "role": "door",
+     "by": "B009",
+     "why": "first chests: 4 (kind 10) in B009; first locked doors: 4 (kind 9) in B012",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/cq-B009-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_エリーゼ",
+      "PID_サイラス",
+      "PID_ハロルド",
+      "PID_エルフィ",
+      "PID_オーディン",
+      "PID_ゼロ"
+     ]
+    },
+    {
+     "role": "staff",
+     "by": "B007",
+     "why": "the first chapter after the split (call 2)",
+     "confidence": "[high] army; the chapter is call 2",
+     "army_from": "build/r72/check/jobs/cq-B007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_エリーゼ",
+      "PID_サイラス",
+      "PID_ハロルド",
+      "PID_エルフィ"
+     ],
+     "note": "Elise is not in the army before chapter 7 (cq-ch6-clear, read from memory: Corrin and Felicia only; build/r62/rando/check/jobs/cq-B006-bossprove/result.json); she arrives during B007 in the mid-chapter group with Silas, Arthur and Effie (placements 21-24, not the opening group), so she counts for chapter 7 like the other chapter-7 joiners, and the retainer slot is there from the first turn. Settled in round 75b part G1."
+    },
+    {
+     "role": "vein",
+     "by": "every",
+     "why": "Corrin is on every map",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/cq-B007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女"
+     ]
+    }
+   ]
+  },
+  "C": {
+   "name": "Revelation",
+   "needs": [
+    {
+     "role": "door",
+     "by": "C009",
+     "why": "chests in C007 (6) and C008 (2), but the original game's first opener (Kaze) is only there after chapter 8: never stricter than the original (call 1) moves the need to the next chest map, C009 (3 chests); first locked door C011",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/rv-C009-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_ギュンター",
+      "PID_サクラ",
+      "PID_カザハナ",
+      "PID_ツバキ",
+      "PID_スズカゼ"
+     ]
+    },
+    {
+     "role": "staff",
+     "by": "C007",
+     "why": "the first chapter after the split (call 2); only the retainer slot may change class there (Corrin, Azura and Gunter are never repaired)",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/rv-C007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_ギュンター"
+     ]
+    },
+    {
+     "role": "flier",
+     "by": "C011",
+     "why": "the same ninja-village map as A010 (1 kind-9 tile event in C011)",
+     "confidence": "[medium], as A010",
+     "army_from": "build/r72/check/jobs/rv-C011-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女",
+      "PID_アクア",
+      [
+       "PID_フェリシア",
+       "PID_ジョーカー"
+      ],
+      "PID_ギュンター",
+      "PID_サクラ",
+      "PID_カザハナ",
+      "PID_タクミ",
+      "PID_オボロ",
+      "PID_ヒナタ",
+      "PID_ツバキ",
+      "PID_スズカゼ",
+      "PID_リンカ",
+      "PID_ツクヨミ"
+     ]
+    },
+    {
+     "role": "vein",
+     "by": "every",
+     "why": "Corrin is on every map",
+     "confidence": "[high]",
+     "army_from": "build/r72/check/jobs/rv-C007-off/result.json (army, read from memory on the story save the job loaded)",
+     "army": [
+      "PID_プレイヤー男",
+      "PID_プレイヤー女"
+     ]
+    }
+   ]
+  }
+ },
+ "information": {
+  "paralogue_doors": {
+   "X004": 2,
+   "X009": 7,
+   "X016": 3,
+   "X022": 5
+  },
+  "paralogue_note": "Paralogues with locked doors are optional and open late, when every story already has its openers: not needs, reported in the spoiler as information only (call 7).",
+  "no_conquest_flier": "No Conquest map is known to need a flier (call 4)."
+ }
+}

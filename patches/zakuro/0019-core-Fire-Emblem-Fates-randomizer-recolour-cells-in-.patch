@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 22:29:09 -0500
+Subject: [PATCH 19/21] core: Fire Emblem Fates randomizer: recolour cells in
+ the resident model table and FaceData
+
+Two patch file kinds laid with GameData at Start game / save load and put back with it:
+'file asset <path> <header>' (asset/ROM*.lz, found in BattleGlobal::Asset()'s list at
+0x006FFA60 by its header word) and 'file face <path> <count>' (the global FaceData at
+0x007047F4, its record count the guard). Every resident file is found and its guard
+passed before anything is written; a failure later puts back what was laid. A save
+state remembers where they are (assume_applied_in). docs/rando/COLOURS.md 5.2; the
+picture tint (5.3) is not built.
+---
+ crates/zakuro-core/src/fates_rando.rs | 111 +++++++++++++++++++++++++-
+ 1 file changed, 108 insertions(+), 3 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 554241d..39b9cad 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -124,8 +124,21 @@ pub enum Kind {
+     /// engine round E1: a chapter's map settings, `map/config/<chapter>.bin` (stored plain,
+     /// not compressed; the map theme names); patched in the game's own read only
+     MapConfig,
++    /// round 59 recolour: a model table file (`asset/ROM*.lz`) resident from boot; the
++    /// header word that names it in the table list (docs/rando/COLOURS.md 5.2)
++    Asset { header: u32 },
++    /// round 59 recolour: the global FaceData file, resident from boot; its record count
++    /// (452 Fates, 456 Seal of Flames) is the guard that it is the file the patch was made for
++    Face { count: u32 },
+ }
+ 
++/// `BattleGlobal::Asset()`'s table object: +12 the first list node, node+12 the next; a
++/// node is an archive like GameData's.
++pub const ASSET_TABLE: u32 = 0x006F_FA60;
++/// the `FaceDataFile` array: 12 bytes each `{count, file object, records start}`; entry 0
++/// is the global FaceData.
++pub const FACE_FILES: u32 = 0x0070_47F4;
++
+ impl Kind {
+     /// files patched inside the game's read of the RomFS (`fates_rando_file`)
+     pub fn in_read(self) -> bool {
+@@ -219,6 +232,14 @@ impl Patch {
+                     };
+                     p.files.push(FilePatch { kind, rel: w[2].to_string(), values: vec![], ptrs: vec![] });
+                 }
++                "file" if w.len() == 4 && (w[1] == "asset" || w[1] == "face") => {
++                    let kind = if w[1] == "asset" {
++                        Kind::Asset { header: hex_u32(w[3]).map_err(at)? }
++                    } else {
++                        Kind::Face { count: w[3].parse().map_err(|e| at(format!("{}: {e}", w[3])))? }
++                    };
++                    p.files.push(FilePatch { kind, rel: w[2].to_string(), values: vec![], ptrs: vec![] });
++                }
+                 "v" if w.len() == 4 => {
+                     let f = p.files.last_mut().ok_or_else(|| at("cell before any file line".into()))?;
+                     let v = Value { off: hex_u32(w[1]).map_err(at)?, old: hex_bytes(w[2]).map_err(at)?,
+@@ -323,6 +344,40 @@ pub fn dispos_now(g: &mut dyn Guest) -> Option<(String, u32)> {
+     Some((name, archive_data_start(g, arch)?))
+ }
+ 
++/// where a resident file of the recolour (Asset, Face) starts in memory now (the data
++/// start its offsets count from); None = not loaded or not the file the patch names.
++pub fn resident_start(g: &mut dyn Guest, kind: Kind) -> Option<u32> {
++    match kind {
++        Kind::Asset { header } => {
++            let mut node = g.r32(ASSET_TABLE.wrapping_add(12))?;
++            for _ in 0..64 {
++                if node == 0 {
++                    return None;
++                }
++                if let Some(start) = archive_data_start(g, node) {
++                    if g.r32(start) == Some(header) {
++                        return Some(start);
++                    }
++                }
++                node = g.r32(node.wrapping_add(12))?;
++            }
++            None
++        }
++        Kind::Face { count } => {
++            if g.r32(FACE_FILES)? != count {
++                return None;
++            }
++            let records = g.r32(FACE_FILES.wrapping_add(8))?;
++            (records != 0).then(|| records.wrapping_sub(4))
++        }
++        _ => None,
++    }
++}
++
++fn is_resident(kind: Kind) -> bool {
++    matches!(kind, Kind::Asset { .. } | Kind::Face { .. })
++}
++
+ /// `GameConfigData` (`*0x006DA0F8`), whose word at +4 `StartFromBeginning` changes.
+ pub const GAME_CONFIG: u32 = 0x006D_A0F8;
+ 
+@@ -427,6 +482,8 @@ pub struct Run {
+     pub patch: Patch,
+     pub id: String,
+     gamedata_at: Option<u32>,
++    /// the recolour's resident files laid with GameData: (file index, data start)
++    resident_at: Vec<(usize, u32)>,
+     /// (placement name, data start) already laid, so a file is laid once per load
+     dispos_done: HashSet<(String, u32)>,
+     pub notices: Vec<String>,
+@@ -434,7 +491,7 @@ pub struct Run {
+ 
+ impl Run {
+     pub fn new(patch: Patch, id: impl Into<String>) -> Run {
+-        Run { patch, id: id.into(), gamedata_at: None, dispos_done: HashSet::new(), notices: vec![] }
++        Run { patch, id: id.into(), gamedata_at: None, resident_at: vec![], dispos_done: HashSet::new(), notices: vec![] }
+     }
+ 
+     pub fn gamedata_applied(&self) -> bool {
+@@ -447,24 +504,72 @@ impl Run {
+         self.gamedata_at = Some(base);
+     }
+ 
++    /// assume_applied, and the recolour's resident files found where they are now (a save
++    /// state holds them laid too), so going back to the original puts them back as well.
++    pub fn assume_applied_in(&mut self, g: &mut dyn Guest, base: u32) {
++        self.gamedata_at = Some(base);
++        self.resident_at = self.patch.files.iter().enumerate()
++            .filter(|(_, f)| is_resident(f.kind))
++            .filter_map(|(i, f)| resident_start(g, f.kind).map(|s| (i, s)))
++            .collect();
++    }
++
+     /// lays the GameData cells (Start game with Randomizer on, or a randomized save loaded).
+     pub fn apply_gamedata(&mut self, g: &mut dyn Guest) -> Result<usize, Vec<String>> {
+         if self.gamedata_at.is_some() {
+             return Ok(0);
+         }
+         let base = gamedata_start(g).ok_or_else(|| vec!["GameData is not loaded".to_string()])?;
++        // the recolour's resident files (model table, FaceData): every one found and its
++        // guard passed before anything is written, so the run is laid whole or not at all
++        let mut resident = Vec::new();
++        let mut bad = Vec::new();
++        for (i, f) in self.patch.files.iter().enumerate().filter(|(_, f)| is_resident(f.kind)) {
++            match resident_start(g, f.kind) {
++                Some(start) => resident.push((i, start)),
++                None => bad.push(format!("{}: not in memory (or not the file the patch was made for)", f.rel)),
++            }
++        }
++        if !bad.is_empty() {
++            return Err(bad);
++        }
+         let n = match self.patch.gamedata() {
+             Some(f) => apply_file(g, f, base, base, false)?,
+             None => 0,
+         };
++        let mut done: Vec<(usize, u32)> = Vec::new();
++        let mut cells = n;
++        for &(i, start) in &resident {
++            match apply_file(g, &self.patch.files[i], start, base, false) {
++                Ok(k) => {
++                    cells += k;
++                    done.push((i, start));
++                }
++                Err(e) => {
++                    for &(j, s) in done.iter().rev() {
++                        let _ = apply_file(g, &self.patch.files[j], s, base, true);
++                    }
++                    if let Some(f) = self.patch.gamedata() {
++                        let _ = apply_file(g, f, base, base, true);
++                    }
++                    return Err(e);
++                }
++            }
++        }
++        self.resident_at = done;
+         self.gamedata_at = Some(base);
+-        Ok(n)
++        Ok(cells)
+     }
+ 
+     /// puts GameData back as the original (title screen, a save of the original game loaded).
+     pub fn revert_gamedata(&mut self, g: &mut dyn Guest) -> Result<usize, Vec<String>> {
+         let Some(base) = self.gamedata_at else { return Ok(0) };
+-        let n = match self.patch.gamedata() {
++        let mut n = 0;
++        for &(i, start) in self.resident_at.clone().iter().rev() {
++            n += apply_file(g, &self.patch.files[i], start, base, true)?;
++        }
++        self.resident_at.clear();
++        n += match self.patch.gamedata() {
+             Some(f) => apply_file(g, f, base, base, true)?,
+             None => 0,
+         };

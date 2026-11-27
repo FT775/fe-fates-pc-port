@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence
+0x0,4,str,name,high,"The group's own name: equals the row label in every row; declared str"
+0x4,4,str,bgm,medium,"File declares the music label (STRM_...); no reader traced"
+0x8,4,list:JobIntro_Unit,units,high,"ProcJobGroup::BeginGroup (001BCE34) reads row+0x8 -> {count, items} and item = items + index*20"

@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe13 <engine@localhost>
+Date: Mon, 9 Nov 2026 03:51:05 -0500
+Subject: [PATCH 05/21] frontend: a program made of one game is named after it
+ and starts it
+
+For the program 3dsrecomp port makes (zakuro::run with code linked in),
+our standalone "Fire Emblem Awakening.exe":
+
+- the window is called after the program's file, without the extension,
+  and keeps that name while the game runs ("Fire Emblem Awakening"),
+  instead of "Zakuro - <game> - <status>";
+- when the command line names no game, it starts the one on the first
+  line of game-path.txt beside the program (quotes allowed), so the
+  program opens straight into its game. Without that file it opens the
+  library, as Zakuro does. A game on the command line wins, as before.
+
+Zakuro itself (run(None)) is unchanged: "Zakuro" and the library. Nothing
+else changes for a program made of one game either: the data folder is
+still default_data_dir() (%APPDATA%\zakuro: saves in user/, mods/,
+cheats/, states/, zakuro.log), settings stay in settings.toml there, and
+Esc still opens the menu with "Settings for this game".
+
+Our own code (fe13 project). Checked: read against lib.rs run_with,
+resumed and the title update; not compiled yet when written.
+---
+ crates/zakuro/src/lib.rs | 45 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 0d60167..2279782 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -74,13 +74,18 @@ pub fn run(linked: Option<Linked>) {
+ pub fn run_with(linked: Option<Linked>, overlay: Option<Box<dyn GameOverlay>>) {
+     report::init();
+ 
+-    let options = match cli::parse() {
++    let mut options = match cli::parse() {
+         Ok(options) => options,
+         Err(message) => {
+             eprintln!("zakuro: {message}");
+             std::process::exit(2);
+         }
+     };
++    // a program made of one game starts that game when the command line
++    // names none, the one game-path.txt beside it points at
++    if linked.is_some() && options.rom.is_none() && !options.test_pattern {
++        options.rom = game_beside_program();
++    }
+     let mut settings = Settings::load();
+     // the console's own number, made the first time and kept, which tells
+     // it apart from others over local wireless
+@@ -191,6 +196,40 @@ fn show_folder(folder: &Path) {
+     }
+ }
+ 
++/// what a program made of one game is called, the name of its file without
++/// the extension, so "Fire Emblem Awakening.exe" shows "Fire Emblem
++/// Awakening" in its title bar. Zakuro itself stays "Zakuro".
++fn program_title(linked: bool) -> &'static str {
++    static TITLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++    if !linked {
++        return "Zakuro";
++    }
++    TITLE.get_or_init(|| {
++        std::env::current_exe()
++            .ok()
++            .and_then(|exe| exe.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
++            .filter(|stem| !stem.is_empty())
++            .unwrap_or_else(|| "Zakuro".to_owned())
++    })
++    .as_str()
++}
++
++/// the game named on the first line of game-path.txt next to the program,
++/// which the program starts when the command line names none. quotes
++/// around the path are fine. none without the file, and then the library
++/// opens as it does in Zakuro.
++fn game_beside_program() -> Option<String> {
++    let file = std::env::current_exe().ok()?.parent()?.join("game-path.txt");
++    let text = std::fs::read_to_string(&file).ok()?;
++    let line = text.trim_start_matches('\u{feff}').lines().map(str::trim).find(|line| !line.is_empty())?;
++    let path = line.trim_matches('"').trim();
++    if path.is_empty() {
++        return None;
++    }
++    log::info!("starting {path}, which {} names", file.display());
++    Some(path.to_owned())
++}
++
+ /// the system's place for a program's data.
+ fn default_data_dir() -> Option<PathBuf> {
+     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+@@ -597,7 +636,7 @@ impl ApplicationHandler for App {
+         }
+ 
+         let size = self.window_size();
+-        let attributes = Window::default_attributes().with_title("Zakuro").with_inner_size(size);
++        let attributes = Window::default_attributes().with_title(program_title(self.linked.is_some())).with_inner_size(size);
+         let renderer = self.options.renderer.unwrap_or(match self.settings.renderer {
+             Renderer::Vulkan => RendererKind::Vulkan,
+             Renderer::OpenGl => RendererKind::OpenGl,
+@@ -1677,7 +1716,9 @@ impl App {
+                 );
+             }
+             if let Some(window) = &self.window {
++                // a program made of one game keeps its own name, the game's
+                 let title = match &self.game {
++                    _ if self.linked.is_some() => program_title(true).to_owned(),
+                     Some(game) => format!("Zakuro - {} - {}", game.name, game.system.status_line()),
+                     None => "Zakuro".to_owned(),
+                 };

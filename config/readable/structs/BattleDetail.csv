@@ -1,0 +1,12 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,s32,attack,high,"Side::CalculateDetailAttack 0x00349B1C stores the attack (Unit::GetAttack + triangle + doubled might + bonus words) here; GetSimplePower 0x00525610 reads it",
+0x004,0x4,s32,defense,high,"Side::CalculateDetailDefense 0x00349D84 stores Unit::GetDefImpl here (floored at 0); GetSimplePower subtracts it for a physical strike",
+0x008,0x4,s32,defense_bonus,high,"Side::CalculateDetailDefense 0x00349DA4 stores the bonus words + terrain defense here; GetSimplePower 0x00525664 subtracts it after the skill step",
+0x00C,0x4,s32,resistance,high,"Side::CalculateDetailDefense 0x00349DD0 stores Unit::GetMdefImpl here; GetSimplePower subtracts it for a magic strike (side flag 0x20)",
+0x010,0x4,s32,resistance_bonus,high,"Side::CalculateDetailDefense 0x00349DE0 stores the bonus words + terrain defense here",
+0x014,0x2,s16,hit,high,"Side::CalculateDetailHit stores the hit here (Unit::GetHit + triangle + bonuses, floored at 0 at 0x003491D8)",
+0x016,0x2,s16,crit,high,"Side::CalculateDetail 0x00348808 stores the critical here",
+0x018,0x2,s16,avoid,high,"Side::CalculateDetailAvoid 0x0034927C stores Unit::GetAvoid + terrain + bonuses here",
+0x01A,0x2,s16,crit_avoid,high,"Side::CalculateDetail 0x0034889C stores the critical avoid here",
+0x01C,0x4,s32,attack_speed,high,"Side::CalculateDetail 0x00348938 stores Unit::GetContinuous + a bonus word here; GetSimpleTimes 0x00525BD8 compares it",
+0x020,0x4,s32,defense_speed,high,"Side::CalculateDetail 0x00348994 stores Unit::GetUnderContinuous + a bonus word here; GetSimpleTimes adds 5 to the other side's",

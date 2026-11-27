@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 05:30:00 -0500
+Subject: [PATCH] core: Fire Emblem Fates randomizer: label pointers in person
+ files (laid in memory after the game stores the file)
+
+Round 74 (docs/ROUND74_PLAN.md A3, docs/rando/FULL_BLOCK.md section 2, owner
+OK "Yes, start round 74"): a chapter person file (GameData/Person/**) whose
+cells include label pointers (p lines: the full swap's aid, mpid_name and
+mpid_help of the HANDOVER rows and the chapter copies, written only for a run
+made with look = full) is no longer kept original. It takes the in-memory path
+placement files with label pointers take since round 58: never patched in the
+read; found in the Person archive list by its name (patch 0018) once the game
+stored it at a new data start, then every cell of the file (its v cells too)
+checked against the old values / old label text and laid at the first system
+call, all or nothing (fates_rando::apply_file: g targets from GameData's data
+start, s targets from the person file's own data start). A guard that fails
+keeps the file original with a notice, as before.
+
+The decision is now one function, fates_rando_session::first_way(kind,
+has_ptrs) -> Way::{InRead, Late, Refused}, with late_ok(kind) for the
+too-big fallback. Map settings files with label pointers are still refused.
+
+Off means original: a person file without p cells (every run the owner's
+page can make, every run made before round 74) is patched in the read
+exactly as before; no new code runs for it.
+
+New tests person_file_label_pointers_are_laid_in_memory_all_or_nothing
+(fates_rando: g, s and v cells on a made-up person file found in the Person
+list, a failing guard writes nothing, revert puts every cell back) and
+person_files_with_label_pointers_take_the_in_memory_way (fates_rando_session).
+---
+ crates/zakuro-core/src/fates_rando.rs         | 73 +++++++++++++++++++++++-
+ crates/zakuro-core/src/fates_rando_session.rs | 83 +++++++++++++++++++++------
+ 2 files changed, 136 insertions(+), 20 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 5a108e6..f919138 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -36,7 +36,11 @@
+ //! (engine round E1) are patched only in the game's own read, like the placements. Their
+ //! `v` cells may also lie in the file's string pool (offset at or past the pool start): the
+ //! music track writes a new song name over the old one in place, never longer (docs/collab/
+-//! E1_MUSIC_GROK.md); a `p` cell in such a file is refused (the file is served unchanged).
++//! E1_MUSIC_GROK.md); a `p` cell in a map settings file is refused (the file is served
++//! unchanged). Round 74 (docs/rando/FULL_BLOCK.md section 2): a person file with `p` cells
++//! (only in a run made with look = full) is never patched in the read: it is laid in memory
++//! after the game stores it, all its cells together, the way placement files with label
++//! pointers are (`fates_rando_session::first_way`).
+ //!
+ //! `p` cells are pointers to label text (a placement's class or item, for example). In
+ //! memory a pointer is "data start + offset", so the new value is GameData's data start
+@@ -1020,4 +1024,71 @@ p 10 - 4a49445f41 g 100 -\nend 4\n";
+         assert_eq!(person_now(&mut m, "r021"), Some(b1));
+         assert_eq!(person_now(&mut m, "R023"), None);
+     }
++
++    /// round 74 (docs/rando/FULL_BLOCK.md section 2): a chapter person file with label
++    /// pointers, found in the Person list by its name and laid in memory after the game
++    /// stored it: a `g` cell (a label in GameData's pool), an `s` cell (a label in the file's
++    /// own pool) and a `v` cell, all or nothing, and put back by a revert. Made-up labels.
++    #[test]
++    fn person_file_label_pointers_are_laid_in_memory_all_or_nothing() {
++        let mut m = game();
++        // the person file R021 at data start PB: name pointer at +0 (the archive name), the
++        // aid pointer at +0x10 -> its own "AID_A" at +0x60, the name pointer at +0x14 -> its own
++        // "MPID_A" at +0x68, a byte at +0x20, its own "MPID_B" at +0x70
++        const PB: u32 = 0x3200_0020;
++        let mut blk = vec![0u8; 0x80];
++        blk[0..4].copy_from_slice(&(PB + 0x30).to_le_bytes());
++        blk[0x30..0x35].copy_from_slice(b"R021\0");
++        blk[0x10..0x14].copy_from_slice(&(PB + 0x60).to_le_bytes());
++        blk[0x14..0x18].copy_from_slice(&(PB + 0x68).to_le_bytes());
++        blk[0x20] = 5;
++        blk[0x60..0x66].copy_from_slice(b"AID_A\0");
++        blk[0x68..0x6F].copy_from_slice(b"MPID_A\0");
++        blk[0x70..0x77].copy_from_slice(b"MPID_B\0");
++        m.put(PB, &blk);
++        let mut node = vec![0u8; 12];
++        node[0..4].copy_from_slice(&PB.to_le_bytes());
++        m.put(0x2300_0000, &node);
++        m.put(PERSON_LIST, &0x2300_0000u32.to_le_bytes());
++        // GameData's pool gets "AID_B" at +0x120
++        let mut gdl = [0u8; 6];
++        gdl.copy_from_slice(b"AID_B\0");
++        m.write(GD + 0x120, &gdl);
++        let text = "fates-rando-patch 1
++seed r74test
++options {}
++gamedata-sha256 00
++file person GameData/Person/R021.bin.lz
++v 20 05 07
++p 10 4149445f41 4149445f42 g 120 60
++p 14 4d5049445f41 4d5049445f42 s 70 68
++end 3
++";
++        let patch = Patch::parse(text).unwrap();
++        let f = &patch.files[0];
++        assert_eq!(f.kind, Kind::Person);
++        let base = person_now(&mut m, "R021").unwrap();
++        assert_eq!(base, PB);
++        let gd = gamedata_start(&mut m).unwrap();
++        // a guard that fails (another mod changed the name pointer): nothing is written
++        let mut other = game();
++        let mut blk2 = blk.clone();
++        blk2[0x14..0x18].copy_from_slice(&(PB + 0x70).to_le_bytes());
++        other.put(PB, &blk2);
++        other.write(GD + 0x120, &gdl);
++        let before = other.writes;
++        assert!(apply_file(&mut other, f, PB, gd, false).is_err());
++        assert_eq!(other.writes, before);
++        // laid: the g cell points into GameData, the s cell into the file, the byte changed
++        assert_eq!(apply_file(&mut m, f, base, gd, false), Ok(3));
++        assert_eq!(m.u32_at(PB + 0x10), GD + 0x120);
++        assert_eq!(m.u32_at(PB + 0x14), PB + 0x70);
++        let name_at = m.u32_at(PB + 0x14);
++        assert_eq!(m.cstr(name_at, 16).unwrap(), b"MPID_B");
++        assert_eq!(m.r32(PB + 0x20).unwrap() & 0xFF, 7);
++        // and put back
++        assert_eq!(apply_file(&mut m, f, base, gd, true), Ok(3));
++        assert_eq!((m.u32_at(PB + 0x10), m.u32_at(PB + 0x14)), (PB + 0x60, PB + 0x68));
++        assert_eq!(m.r32(PB + 0x20).unwrap() & 0xFF, 5);
++    }
+ }
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 481c277..6dacfaf 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -754,29 +754,58 @@ pub fn overlay_read(system: &mut System, path: &str, offset: u64, data: &mut [u8
+     }
+ }
+ 
++/// how a file patched around the game's read is laid first.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Way {
++    /// patched inside the game's read (a too-big result still falls back to `Late` when
++    /// `late_ok`)
++    InRead,
++    /// laid in memory at the first system call after the game stored the file
++    Late,
++    /// kept original, with a notice
++    Refused,
++}
++
++/// files that have an in-memory path: placement files, and (round 60) chapter person files,
++/// found in the Person archive list by their name (patch 0018). Map settings have none:
++/// they are laid in the read or not at all, and say so (engine round E1).
++pub fn late_ok(kind: fates_rando::Kind) -> bool {
++    matches!(kind, fates_rando::Kind::Dispos | fates_rando::Kind::Person)
++}
++
++/// the first way a file is laid. Label pointers (class and item labels) are laid in memory
++/// after the game stores the file, never in the read: the round 58 robot check found them
++/// wrong in memory on every map whose file was patched in the read (A004: two units joined
++/// with no weapon), while the in-memory path laid every cell of every other file. Round 74
++/// (docs/rando/FULL_BLOCK.md section 2): a person file with label pointers (the full swap's
++/// aid / name / help cells, only in a run made with look = full) takes the same in-memory
++/// path as a placement file, all its cells together (its `v` cells too, all or nothing);
++/// a person file without them (every run the owner's page can make) is patched in the read
++/// exactly as before.
++pub fn first_way(kind: fates_rando::Kind, has_ptrs: bool) -> Way {
++    match (has_ptrs, late_ok(kind)) {
++        (false, _) => Way::InRead,
++        (true, true) => Way::Late,
++        (true, false) => Way::Refused,
++    }
++}
++
+ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     let p = &system.rando.placements[k];
+     let run = system.rando.run.as_ref()?;
+     let f = run.patch.files.get(p.file)?.clone();
+-    // label pointers (class and item labels) are laid in memory after the game stores the
+-    // file, never in the read: the round 58 robot check found them wrong in memory on every
+-    // map whose file was patched in the read (A004: two units joined with no weapon), while
+-    // the in-memory path laid every cell of every other file
+-    // (engine round E1) map settings have no in-memory path: they are laid in the read or
+-    // not at all, and say so
+-    let placement = f.kind == fates_rando::Kind::Dispos;
+-    // round 60: a chapter person file too big for the read is laid in memory like a
+-    // placement file (round 59 check: Seal of Flames R013 and R023, a few bytes over: "chapter
+-    // people kept original"); found in the Person archive list by its name (patch 0018)
+-    let late_ok = placement || (f.kind == fates_rando::Kind::Person && f.ptrs.is_empty());
+-    if !f.ptrs.is_empty() && !placement {
+-        notice(system, format!("{}: kept original (label pointers are laid only in placement files)", f.rel));
+-        return None;
+-    }
+-    if !f.ptrs.is_empty() {
+-        log::info!("fates_rando: {} has label pointers; laid in memory at the next system call after the game stores it", f.rel);
+-        system.rando.placements[k].late = true;
+-        return None;
++    let late_ok = late_ok(f.kind);
++    match first_way(f.kind, !f.ptrs.is_empty()) {
++        Way::Refused => {
++            notice(system, format!("{}: kept original (label pointers are laid only in placement and person files)", f.rel));
++            return None;
++        }
++        Way::Late => {
++            log::info!("fates_rando: {} has label pointers; laid in memory at the next system call after the game stores it", f.rel);
++            system.rando.placements[k].late = true;
++            return None;
++        }
++        Way::InRead => {}
+     }
+     let title = system.title.as_ref()?;
+     let stored = if let Some(layered) = title.layered.as_ref() {
+@@ -1737,4 +1766,20 @@ end 0
+         assert_eq!(&whole[150..250], &patched[..]);
+         assert!(whole[250..].iter().all(|&b| b == 0));
+     }
++
++    /// round 74: a person file with label pointers goes the in-memory way (all its cells after
++    /// the game stored it); without them every file goes as before; map settings with them
++    /// are refused as before.
++    #[test]
++    fn person_files_with_label_pointers_take_the_in_memory_way() {
++        use fates_rando::Kind;
++        assert_eq!(first_way(Kind::Person, true), Way::Late);
++        assert_eq!(first_way(Kind::Dispos, true), Way::Late);
++        assert_eq!(first_way(Kind::MapConfig, true), Way::Refused);
++        for k in [Kind::Person, Kind::Dispos, Kind::MapConfig] {
++            assert_eq!(first_way(k, false), Way::InRead, "off: no pointer cell, the read path as before");
++        }
++        // a too-big result falls back to memory only where an in-memory path exists
++        assert!(late_ok(Kind::Person) && late_ok(Kind::Dispos) && !late_ok(Kind::MapConfig));
++    }
+ }
+-- 
+2.55.0.windows.5
+

@@ -1,0 +1,13 @@
+Fates SE (USA) container + code scout, 2026-11-10 (read-only; no game bytes kept)
+- CCI 2 GiB, decrypted (NoCrypto) all partitions. P0 game 0004000000179800 CTR-P-BFZE "Iron15";
+  P1 manual; P6/P7 update data (SNAKE = New3DS sysmodules, so title carries N3DS flags).
+- code.bin 6,287,360 B (BLZ 3,421,016). .text 0x100000 5,308,700 B; .rodata 0x611000 664,496 B;
+  .data 0x6B4000 307,024 B; bss 507,432. Awakening: .text 3,513,224 / .rodata 375,432 / .data 201,960.
+- RomFS: 21,880 files, 1.80 GB; debug/name.StackTrace + debug/addr.StackTrace = FULL SYMBOL MAP
+  (26,122 demangled C++ names, build 2015/11/17 rev 27274). Awakening has no such file.
+- funcmap.py (Awakening tool, constants patched) on Fates: 27,324 starts; 25,653 equal a symbol.
+- Library split by symbol name: game ~16.5k (+1.2k static init), nn:: SDK 2,170, NEX 2,099 (NEX_3_8_3),
+  Pia 1,676, NW4C nw:: 1,220, rt/std ~430, Live2D ~440, Mobiclip mw::mo ~100, pead 121.
+- Exact normalized-byte matches vs Awakening (>=64 B, unique): 508 SDK, 130 nw::snd, 24 NEX, 2 Pia, ~320 game/util.
+- Routes on cart: Dispos/Scripts prefixes A (Birthright?), B (Conquest?), C (Revelation?), X child paralogues,
+  M/P/Z misc; StaffRollDataAB vs StaffRollDataC. DLC not on cart; amiibo scripts (Ike/Lucina/Marth/Robin).

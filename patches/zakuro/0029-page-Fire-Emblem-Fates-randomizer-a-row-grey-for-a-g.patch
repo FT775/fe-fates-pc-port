@@ -1,0 +1,147 @@
+From fc53648e2b85f64b4a4403bac5092cb4c115c199 Mon Sep 17 00:00:00 2001
+From: "fef engine.py" <engine@localhost>
+Date: Sat, 21 Nov 2026 20:01:39 -0500
+Subject: [PATCH] page: Fire Emblem Fates randomizer: a row grey for a game
+ (grey_for), Seal of Flames greys Children
+
+---
+ crates/zakuro/src/rando_page.rs | 77 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+index 97ee17d..d42d0fa 100644
+--- a/crates/zakuro/src/rando_page.rs
++++ b/crates/zakuro/src/rando_page.rs
+@@ -175,6 +175,22 @@ pub struct Row {
+     /// shown greyed, always its default (Children: not built).
+     pub fixed: bool,
+     pub indent: bool,
++    /// round 62: games this row cannot be used in -> the reason (shown grey at its default
++    /// there; Seal of Flames: Children).
++    pub grey_for: std::collections::BTreeMap<String, String>,
++}
++
++/// round 62: the rows as the page shows them for `game` (None = Fire Emblem Fates): a row
++/// with a `grey_for` entry for that game is fixed at its default, its label says why.
++pub fn rows_for(rows: &[Row], game: Option<&str>) -> Vec<Row> {
++    rows.iter().cloned().map(|mut row| {
++        if let Some(why) = game.and_then(|game| row.grey_for.get(game)).cloned() {
++            row.fixed = true;
++            row.all = row.default.clone();
++            row.label = format!("{} ({why})", row.label);
++        }
++        row
++    }).collect()
+ }
+ 
+ /// `rando.py schema`'s JSON -> the rows (format 1).
+@@ -207,6 +223,9 @@ pub fn parse_schema(text: &str) -> Result<Vec<Row>, String> {
+             all: row.get("all").cloned().unwrap_or_else(|| default.clone()),
+             fixed: row.get("fixed").and_then(Value::as_bool).unwrap_or(false),
+             indent: row.get("indent").and_then(Value::as_bool).unwrap_or(false),
++            grey_for: row.get("grey_for").and_then(Value::as_object).map(|map| map.iter()
++                .filter_map(|(game, why)| why.as_str().map(|why| (game.clone(), why.to_owned()))).collect())
++                .unwrap_or_default(),
+             key,
+             kind,
+             default,
+@@ -472,6 +491,8 @@ impl Prebuild {
+ pub struct RandoPage {
+     rows: Rows,
+     form: Option<RandoForm>,
++    /// round 62: the game the form's rows were fitted to (rows_for).
++    form_game: Option<String>,
+     /// the New Game page is open: the core waits for its answer.
+     pub new_game: bool,
+     /// the menu's Randomizer window is open.
+@@ -514,6 +535,7 @@ impl Default for RandoPage {
+         RandoPage {
+             rows: Rows::Unasked,
+             form: None,
++            form_game: None,
+             new_game: false,
+             this_run_open: false,
+             status: None,
+@@ -567,11 +589,12 @@ impl RandoPage {
+             match receive.try_recv() {
+                 Ok(Ok(found)) => {
+                     log::info!(target: "zakuro::rando", "the randomizer page has {} rows ({} via {})", found.rows.len(), found.tool.display(), found.python.0);
+-                    let mut form = RandoForm::new(found.rows.clone());
++                    let mut form = RandoForm::new(rows_for(&found.rows, self.game.as_deref()));
+                     if let Some(text) = data.and_then(|data| std::fs::read_to_string(last_path(data)).ok()) {
+                         form.restore(&text);
+                     }
+                     self.form = Some(form);
++                    self.form_game = self.game.clone();
+                     self.rows = Rows::Ready(found);
+                 }
+                 Ok(Err(why)) => {
+@@ -582,6 +605,23 @@ impl RandoPage {
+                 Err(TryRecvError::Disconnected) => self.rows = Rows::Missing("The randomizer could not be asked; the game plays as the original.".into()),
+             }
+         }
++        self.fit_game();
++    }
++
++    /// round 62: the form is made again when the game changed (Fates <-> Seal of Flames),
++    /// keeping every value the new rows allow (a row grey for the new game goes to its default).
++    fn fit_game(&mut self) {
++        let Rows::Ready(found) = &self.rows else { return };
++        if self.form.is_none() || self.form_game == self.game {
++            return;
++        }
++        let old = self.form.take().unwrap();
++        let mut form = RandoForm::new(rows_for(&found.rows, self.game.as_deref()));
++        for row in &found.rows {
++            form.set(&row.key, old.get(&row.key).clone());
++        }
++        self.form = Some(form);
++        self.form_game = self.game.clone();
+     }
+ 
+     /// the core picked up the mode pick: open the page (the game waits).
+@@ -1272,6 +1312,41 @@ mod tests {
+         assert_eq!(form.get("enemy_classes"), &json!(true));
+     }
+ 
++    /// round 62: Seal of Flames greys Children (grey_for), Fates is untouched.
++    #[test]
++    fn a_row_grey_for_a_game_is_fixed_there() {
++        let schema = SCHEMA.replace(
++            r#"{"key": "children", "label": "Children (not built)", "kind": "onoff", "default": false, "all": false, "fixed": true, "flag": "--children"}"#,
++            r#"{"key": "children", "label": "Children", "kind": "onoff", "default": false, "all": true, "flag": "--children", "grey_for": {"seal": "x"}}"#);
++        let rows = parse_schema(&schema).unwrap();
++        let fates = rows_for(&rows, None);
++        let seal = rows_for(&rows, Some("seal"));
++        assert_eq!(fates, rows);
++        let child = |rows: &[Row]| rows.iter().find(|row| row.key == "children").unwrap().clone();
++        assert!(!child(&fates).fixed && child(&fates).label == "Children");
++        assert!(child(&seal).fixed && child(&seal).label == "Children (x)" && child(&seal).all == json!(false));
++        let mut form = RandoForm::new(seal.clone());
++        form.everything_on();
++        assert_eq!(form.get("children"), &json!(false));
++        assert!(!form.set("children", json!(true)));
++        assert_eq!(form.answers_preview("s1")["children"], json!(false));
++        let mut form = RandoForm::new(fates);
++        form.everything_on();
++        assert_eq!(form.get("children"), &json!(true));
++        // the page remakes the form when the game changes, keeping what the new rows allow
++        let mut page = RandoPage::default();
++        page.rows = Rows::Ready(Found { python: (String::new(), Vec::new()), tool: PathBuf::new(), rows: rows.clone() });
++        page.form = Some(form);
++        page.game = Some("seal".into());
++        page.fit_game();
++        assert_eq!(page.form.as_ref().unwrap().get("children"), &json!(false));
++        assert_eq!(page.form.as_ref().unwrap().get("enemy_classes"), &json!(true));
++        page.game = None;
++        page.fit_game();
++        assert_eq!(page.form.as_ref().unwrap().get("children"), &json!(false));
++        assert!(page.form.as_ref().unwrap().on());
++    }
++
+     #[test]
+     fn data_files_live_in_the_data_folder() {
+         let data = Path::new("D:/x");
+-- 
+2.55.0.windows.5
+

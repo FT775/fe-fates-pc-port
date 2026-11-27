@@ -1,0 +1,3 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,u32,link_00,low,"Unit::GetDualSupport 0x0052E9A8 and Unit::GetDoubleCapability use the family record only when this word is not 0 (meaning not traced)",
+0x014,0x4,u32,link_14,low,"Unit::GetDualSupport 0x0052E9B0: the family record is used only when this word is not 0 too (meaning not traced)",

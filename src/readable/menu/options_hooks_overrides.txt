@@ -1,0 +1,30 @@
+The three override bodies that wire W1 and W2 (docs/OPTIONS_WIRING.md section 4). NOT a C file on
+purpose: nothing in git stages or compiles it, so the shared capture library and every library built
+from git have no override on GameConfigData::Reset, ::Deserialize or ::Serialize.
+
+Only the OK A test tree (build/oka/tree, a copy of git that is never committed, F-032) uses it: copy
+the lines between the two marks below into a new file src/readable/menu/menu_options_overrides.c of
+that tree, add its three registry rows (config/readable/functions.csv, kind override, source that
+file) and refresh that tree's targets.csv (tools/harness/gen_stubs.py --refresh), then arm the three
+gate entries in that tree's src/readable/core/writer.c (config_options, config_options_hook,
+config_save_guard; nothing else). These bodies do not use FE_ENTRY (they are not readers), so that
+tree's tools/readable/check.py lint reports them; the tree is built with tools/harness/parallel.py
+build only.
+
+----- 8< ----- menu_options_overrides.c -----
+/* OK A test tree only (never git): wires W1 and W2 (src/readable/menu/menu_options_hook.c). */
+
+#include "menu_writer.h"
+
+RECOMP_OVERRIDE(0x001D06DC) { /* GameConfigData::Reset */
+    config_options_hook(ctx, RECOMP_ORIGINAL(0x001D06DC));
+}
+
+RECOMP_OVERRIDE(0x001D0374) { /* GameConfigData::Deserialize */
+    config_options_hook(ctx, RECOMP_ORIGINAL(0x001D0374));
+}
+
+RECOMP_OVERRIDE(0x0050AEA0) { /* GameConfigData::Serialize */
+    config_serialize_guard(ctx, RECOMP_ORIGINAL(0x0050AEA0));
+}
+----- 8< -----

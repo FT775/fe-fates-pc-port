@@ -1,0 +1,392 @@
+diff --git a/crates/zakuro/src/fe_options.rs b/crates/zakuro/src/fe_options.rs
+new file mode 100644
+index 0000000..789e80e
+--- /dev/null
++++ b/crates/zakuro/src/fe_options.rs
+@@ -0,0 +1,266 @@
++//! The FE options page's file. The menu stores values. It does not apply them.
++//!
++//! The game-side hooks are blank. Nothing here reads a save or Zakuro's
++//! settings file.
++
++use std::fs;
++use std::io::Write;
++use std::path::{Path, PathBuf};
++
++/// Where PLAY points this page. The name of the file is `port.options_file`
++/// in config/game.json (`fe14-options.txt`). PLAY does not set the variable
++/// yet; until it does, the page writes nothing.
++pub const ENV_OPTIONS: &str = "FE_OPTIONS";
++
++/// The same path under the game's own prefix, if PLAY uses that instead.
++pub const ENV_OPTIONS_PREFIXED: &str = "FEF_OPTIONS";
++
++/// Display switches. Off is 0. On is 1. Never written to the mark.
++pub const DISPLAY: &[(&str, &str)] = &[
++    ("stance_forecast", "Show whether an ally would strike or block"),
++    ("growth_display", "Show growths on the status screen"),
++    ("danger_zone", "Show the danger zone"),
++    ("animation_skip", "Skip the battle picture"),
++    ("vein_highlight", "Highlight a dragon vein"),
++];
++
++/// Run switches. Stored per save slot. Not applied: the hooks are blank.
++pub const RUN: &[(&str, u8, &str)] = &[
++    ("dual_strike", 2, "Ally strike: game, always, never"),
++    ("dual_guard", 2, "Ally block: game, always, never"),
++    ("death_rule", 2, "Death rule: leave the save, back next chapter, back next turn"),
++];
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Options {
++    pub display: [u8; 5],
++    pub run: [u8; 3],
++    /// lines this page does not own, kept so a write does not wipe them.
++    pub rest: Vec<String>,
++}
++
++impl Default for Options {
++    fn default() -> Self {
++        Self { display: [0; 5], run: [0; 3], rest: Vec::new() }
++    }
++}
++
++impl Options {
++    pub fn is_default(&self) -> bool {
++        self.display == [0; 5] && self.run == [0; 3] && self.rest.is_empty()
++    }
++}
++
++/// The path PLAY set, if it set one. Never a path inside Zakuro's settings.
++pub fn options_path() -> Option<PathBuf> {
++    std::env::var_os(ENV_OPTIONS)
++        .or_else(|| std::env::var_os(ENV_OPTIONS_PREFIXED))
++        .map(PathBuf::from)
++        .filter(|path| !path.as_os_str().is_empty())
++}
++
++/// The mark sits next to the options file. One block per slot.
++pub fn mark_path(options: &Path) -> PathBuf {
++    let name = options
++        .file_name()
++        .and_then(|name| name.to_str())
++        .map(|name| format!("{name}.mark"))
++        .unwrap_or_else(|| "fe14-options.txt.mark".to_owned());
++    options.with_file_name(name)
++}
++
++pub fn load(path: &Path) -> Options {
++    let text = fs::read_to_string(path).unwrap_or_default();
++    parse(&text)
++}
++
++pub fn parse(text: &str) -> Options {
++    let mut options = Options::default();
++    for line in text.lines() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() || trimmed.starts_with('#') {
++            options.rest.push(line.to_owned());
++            continue;
++        }
++        let Some((key, value)) = trimmed.split_once('=') else {
++            options.rest.push(line.to_owned());
++            continue;
++        };
++        let key = key.trim();
++        let value = value.trim();
++        if let Some(index) = DISPLAY.iter().position(|(name, _)| *name == key) {
++            options.display[index] = parse_max(value, 1).unwrap_or(0);
++        } else if let Some(index) = RUN.iter().position(|(name, _, _)| *name == key) {
++            let max = RUN[index].1;
++            options.run[index] = parse_max(value, max).unwrap_or(0);
++        } else {
++            options.rest.push(line.to_owned());
++        }
++    }
++    options
++}
++
++fn parse_max(value: &str, max: u8) -> Option<u8> {
++    let number: u8 = value.parse().ok()?;
++    (number <= max).then_some(number)
++}
++
++pub fn render(options: &Options) -> String {
++    let mut out = String::from("# FE options. 0 is off, and off is the original game.\n");
++    for (index, (key, _)) in DISPLAY.iter().enumerate() {
++        out.push_str(&format!("{key} = {}\n", options.display[index]));
++    }
++    for (index, (key, _, _)) in RUN.iter().enumerate() {
++        out.push_str(&format!("{key} = {}\n", options.run[index]));
++    }
++    if !options.rest.is_empty() {
++        out.push('\n');
++        for line in &options.rest {
++            out.push_str(line);
++            if !line.ends_with('\n') {
++                out.push('\n');
++            }
++        }
++    }
++    out
++}
++
++/// Write only when a value is set, or when the file already exists so turning
++/// a switch back off sticks. A missing file of all zeros is left missing.
++pub fn store(path: &Path, options: &Options) -> std::io::Result<()> {
++    if options.is_default() && !path.exists() {
++        return Ok(());
++    }
++    atomic(path, render(options).as_bytes())
++}
++
++/// Display values are not written. A slot of all zeros drops its block.
++pub fn store_mark(path: &Path, slot: u8, run: [u8; 3]) -> std::io::Result<()> {
++    let mut blocks = load_mark(path);
++    if run == [0; 3] {
++        blocks.remove(&slot);
++    } else {
++        blocks.insert(slot, run);
++    }
++    if blocks.is_empty() {
++        if path.exists() {
++            fs::remove_file(path)?;
++        }
++        return Ok(());
++    }
++    let mut text = String::from("# Run options per save slot. Display options are not here.\n");
++    let mut slots: Vec<_> = blocks.keys().copied().collect();
++    slots.sort_unstable();
++    for slot in slots {
++        let run = blocks[&slot];
++        text.push_str(&format!("[slot {slot}]\n"));
++        for (index, (key, _, _)) in RUN.iter().enumerate() {
++            text.push_str(&format!("{key} = {}\n", run[index]));
++        }
++    }
++    atomic(path, text.as_bytes())
++}
++
++pub fn load_mark(path: &Path) -> std::collections::BTreeMap<u8, [u8; 3]> {
++    let text = fs::read_to_string(path).unwrap_or_default();
++    parse_mark(&text)
++}
++
++pub fn parse_mark(text: &str) -> std::collections::BTreeMap<u8, [u8; 3]> {
++    let mut blocks = std::collections::BTreeMap::new();
++    let mut slot: Option<u8> = None;
++    let mut run = [0u8; 3];
++    let flush = |blocks: &mut std::collections::BTreeMap<u8, [u8; 3]>, slot: &mut Option<u8>, run: &mut [u8; 3]| {
++        if let Some(slot) = slot.take() {
++            if *run != [0; 3] {
++                blocks.insert(slot, *run);
++            }
++        }
++        *run = [0; 3];
++    };
++    for line in text.lines() {
++        let trimmed = line.trim();
++        if let Some(rest) = trimmed.strip_prefix("[slot ").and_then(|rest| rest.strip_suffix(']')) {
++            flush(&mut blocks, &mut slot, &mut run);
++            slot = rest.trim().parse().ok();
++            continue;
++        }
++        let Some(slot_now) = slot else { continue };
++        let _ = slot_now;
++        let Some((key, value)) = trimmed.split_once('=') else { continue };
++        if let Some(index) = RUN.iter().position(|(name, _, _)| *name == key.trim()) {
++            run[index] = parse_max(value.trim(), RUN[index].1).unwrap_or(0);
++        }
++    }
++    flush(&mut blocks, &mut slot, &mut run);
++    blocks
++}
++
++fn atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
++    if let Some(parent) = path.parent() {
++        if !parent.as_os_str().is_empty() {
++            fs::create_dir_all(parent)?;
++        }
++    }
++    let tmp = path.with_extension("tmp");
++    let mut file = fs::File::create(&tmp)?;
++    file.write_all(bytes)?;
++    file.sync_all()?;
++    fs::rename(&tmp, path)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_missing_file_is_all_off() {
++        let options = parse("");
++        assert!(options.is_default());
++        assert_eq!(options.display, [0; 5]);
++        assert_eq!(options.run, [0; 3]);
++    }
++
++    #[test]
++    fn a_bad_value_stays_off() {
++        let options = parse("stance_forecast = 9\ndeath_rule = no\n");
++        assert_eq!(options.display[0], 0);
++        assert_eq!(options.run[2], 0);
++    }
++
++    #[test]
++    fn known_values_are_typed_and_capped() {
++        let options = parse("stance_forecast = 1\ndual_strike = 2\ndeath_rule = 2\nvein_highlight = 1\n");
++        assert_eq!(options.display[0], 1);
++        assert_eq!(options.display[4], 1);
++        assert_eq!(options.run[0], 2);
++        assert_eq!(options.run[2], 2);
++    }
++
++    #[test]
++    fn a_line_this_page_does_not_own_is_kept() {
++        let options = parse("# note\nfuture_key = 1\nstance_forecast = 1\n");
++        assert_eq!(options.display[0], 1);
++        assert!(options.rest.iter().any(|line| line.contains("future_key")));
++        let written = render(&options);
++        assert!(written.contains("future_key = 1"));
++        assert!(written.contains("stance_forecast = 1"));
++    }
++
++    #[test]
++    fn the_mark_is_per_slot_and_has_no_display_key() {
++        let text = "[slot 2]\ndual_strike = 1\nstance_forecast = 1\n\n[slot 4]\ndeath_rule = 2\n";
++        let blocks = parse_mark(text);
++        assert_eq!(blocks.get(&2).copied(), Some([1, 0, 0]));
++        assert_eq!(blocks.get(&4).copied(), Some([0, 0, 2]));
++        assert!(!format!("{blocks:?}").contains("stance"));
++        let rendered_slot_2 = blocks[&2];
++        assert_eq!(rendered_slot_2[0], 1);
++    }
++
++    #[test]
++    fn an_empty_slot_is_not_stored() {
++        let blocks = parse_mark("[slot 3]\ndual_strike = 0\ndual_guard = 0\ndeath_rule = 0\n");
++        assert!(blocks.is_empty());
++    }
++}
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 07fa791..d26ffdd 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -5,6 +5,7 @@
+ mod audio;
+ mod camera;
+ mod cli;
++mod fe_options;
+ mod gamepad;
+ mod gui;
+ mod input;
+@@ -1686,6 +1687,7 @@ impl App {
+             }
+             let own = program_id.is_some_and(|id| settings.has_own(id));
+             actions.extend(menus.settings(ui.ctx(), settings, own));
++            menus.fe_options_page(ui.ctx());
+             actions.extend(menus.game_settings(ui.ctx(), settings));
+             if menus.multiplayer_open {
+                 actions.extend(menus.multiplayer(ui.ctx(), settings, room.as_ref()));
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index c50f06e..f14b45b 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -71,6 +71,8 @@ pub struct Menus {
+     pub menu_open: bool,
+     /// the cheats window, and the cheat being written in it.
+     pub cheats_open: bool,
++    /// the FE options page. It writes our file, never Zakuro's settings.
++    pub fe_options_open: bool,
+     cheat_name: String,
+     cheat_code: String,
+     pub settings_open: bool,
+@@ -207,7 +209,7 @@ fn cover(area: Vec2, picture: [usize; 2]) -> egui::Rect {
+ impl Menus {
+     /// whether something is open that stops the game while it is.
+     pub fn over_game(&self) -> bool {
+-        self.menu_open || self.settings_open || self.game_settings.is_some()
++        self.menu_open || self.settings_open || self.game_settings.is_some() || self.fe_options_open
+     }
+ 
+     /// the library, filling the window. waiting are the games waiting for
+@@ -483,6 +485,9 @@ impl Menus {
+                 if wide(ui, "Settings") {
+                     self.settings_open = true;
+                 }
++                if wide(ui, "FE options") {
++                    self.fe_options_open = true;
++                }
+                 if let Some(program_id) = program_id.filter(|_| wide(ui, "Settings for this game")) {
+                     self.game_settings = Some((program_id, name.to_owned()));
+                 }
+@@ -690,6 +695,67 @@ impl Menus {
+         actions
+     }
+ 
++    /// the FE options page. Stores values only. Does not read a save, does
++    /// not write Zakuro's settings, and does not rebuild anything.
++    pub fn fe_options_page(&mut self, ctx: &egui::Context) {
++        if !self.fe_options_open {
++            return;
++        }
++        let mut open = true;
++        let path = crate::fe_options::options_path();
++        let mut options = path.as_deref().map(crate::fe_options::load).unwrap_or_default();
++        let slot = self.slot.clamp(1, 9);
++        let mark = path.as_deref().map(crate::fe_options::mark_path);
++        let mut run = mark.as_deref().and_then(|path| crate::fe_options::load_mark(path).get(&slot).copied()).unwrap_or(options.run);
++        let before_display = options.display;
++        let before_run = run;
++        egui::Window::new("FE options")
++            .collapsible(false)
++            .resizable(false)
++            .open(&mut open)
++            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
++            .show(ctx, |ui| {
++                ui.label(RichText::new("Off is the original game. Nothing here is applied yet.").weak());
++                match &path {
++                    Some(path) => ui.label(RichText::new(path.display().to_string()).monospace().weak()),
++                    None => ui.label(RichText::new("PLAY has not set FE_OPTIONS, so this page will not write.").color(Color32::from_rgb(230, 160, 80))),
++                };
++                ui.add_space(6.0);
++                ui.label(RichText::new("Display").strong());
++                for (index, (_, label)) in crate::fe_options::DISPLAY.iter().enumerate() {
++                    let mut on = options.display[index] != 0;
++                    if ui.checkbox(&mut on, *label).changed() {
++                        options.display[index] = u8::from(on);
++                    }
++                }
++                ui.add_space(6.0);
++                ui.label(RichText::new(format!("Run options, slot {slot}")).strong());
++                ui.label(RichText::new("Saved for this slot only. Not written into the game's save.").weak());
++                for (index, (_, max, label)) in crate::fe_options::RUN.iter().enumerate() {
++                    ui.add(egui::Slider::new(&mut run[index], 0..=*max).text(*label));
++                }
++            });
++        self.fe_options_open = open;
++        if options.display == before_display && run == before_run {
++            return;
++        }
++        options.run = run;
++        let Some(path) = path else {
++            self.message = Some("FE options were not saved. PLAY has not set FE_OPTIONS.".to_owned());
++            return;
++        };
++        if let Err(error) = crate::fe_options::store(&path, &options) {
++            self.message = Some(format!("Could not write {}: {error}", path.display()));
++            return;
++        }
++        if run != before_run {
++            let mark = crate::fe_options::mark_path(&path);
++            if let Err(error) = crate::fe_options::store_mark(&mark, slot, run) {
++                self.message = Some(format!("Could not write {}: {error}", mark.display()));
++            }
++        }
++    }
++
+     /// the settings window, when open. own says the running game has
+     /// settings of its own, which go over these.
+     pub fn settings(&mut self, ctx: &egui::Context, settings: &mut Settings, own: bool) -> Vec<Action> {

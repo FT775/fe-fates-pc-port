@@ -1,0 +1,641 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 14:05:00 -0500
+Subject: [PATCH 0025] core: Fire Emblem Fates randomizer: Nuzlocke gate is the
+ army, not the camera byte; fallen moved at system calls; graveyard turn and
+ name
+
+Round 61. The Nuzlocke frame of 0024 ran only while GameConfigData +0xB was
+not 1. That byte is the map camera angle option (CameraBase::
+GetGameConfigAngle 0x003E06E0 reads it as 0, 1 or 2; GameConfigData::Reset
+sets 1), so a game saved with the default angle (every Birthright save of the
+robot) never ran it: the fallen stayed in the army and Casual was kept.
+
+- fates_nuzlocke::in_game: a game is loaded when the unit pool holds a
+  player army (force 0, 3 or 4 has a unit). MainSequence ProcSequence::
+  GameReset (0x001B6CBC) calls UnitPool::Reset (0x004F6198) before every
+  title: forces 0-8 emptied, all 250 units in force 9.
+- Nuz::sweep from before_svc: a graveyard person found in force 0 or 3 with
+  no map actor is moved to force 4 at a system call, so a battle save's
+  fallen unit is moved after its units are read and before the map draws
+  it. Every army unit is checked for 1200 frames after a save, state, new
+  game or chapter start (Nuz::rearm, chapter change); at other times only
+  the units of fallen people seen at the last frame (one force byte each).
+  map::Dispos::Data::CreateSortie (0x0039E0xx) takes a person the chapter's
+  player-side placement names from force 4 when they are not in force 3;
+  that is the Revelation "drawn on the map now" line of round 60, now
+  undone at the next system call.
+- a death is written only for a person seen alive in the army in this game
+  (since the game started or was loaded), so a fallen list from another game
+  is never written; the entry carries the map's turn (map::Situation
+  *0x006D7ED0 +0xC) and the person's name from the rules' new "names" pairs
+  (tools/randomizer/nuzlocke.py make_rules).
+- a New Game mode pick closes the Nuzlocke game of the game before (its
+  Classic lock no longer touches the new game while the page is open).
+- a PLAY RANDOMIZED profile with Nuzlocke on keeps the run
+  "profile-nuzlocke" (a patch of no cells + nuzlocke.json, written by
+  tools/play/rando.py into the profile's data folder): a New Game answered
+  "Randomizer off" lays it (no memory change) and starts a Nuzlocke game.
+  No such folder = off as before.
+
+With Nuzlocke off nothing new runs (Session.nuz stays None).
+cargo test -p zakuro-core --lib: 197 passed (fates_: 45; new: the gate is
+the army, deaths need a living sighting and carry turn and name, the
+sweep, a profile with Nuzlocke).
+---
+ crates/zakuro-core/src/fates_nuzlocke.rs      | 258 ++++++++++++++++--
+ crates/zakuro-core/src/fates_rando_session.rs |  90 +++++-
+ 2 files changed, 326 insertions(+), 22 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_nuzlocke.rs b/crates/zakuro-core/src/fates_nuzlocke.rs
+index aa282cc..61a9f2a 100644
+--- a/crates/zakuro-core/src/fates_nuzlocke.rs
++++ b/crates/zakuro-core/src/fates_nuzlocke.rs
+@@ -6,14 +6,16 @@
+ //! (started at the New Game mode pick, or loaded from a save / save state whose side file
+ //! names its game id). With Nuzlocke off this module reads and writes nothing.
+ //!
+-//! Once per frame, while a game is going on (GameConfigData +0xB is not 1), it reads the
+-//! army lists of the unit pool (`UnitPool` 0x006D9F40 +4: 12-byte forces, +0 first, +4
++//! Once per frame, while a game is loaded (round 61: the unit pool holds a player army, see
++//! `in_game`; round 60 waited on GameConfigData +0xB, which is the map camera angle option),
++//! it reads the army lists of the unit pool (`UnitPool` 0x006D9F40 +4: 12-byte forces, +0 first, +4
+ //! last, +8 index; units linked by +0x10 prev / +0x14 next, +0xA4 their force, +0x9C their
+ //! Person, whose +0x8 is the PID_ label):
+ //!
+ //! 1. **A death is written at once.** Force 4 holds the player's fallen (`Unit::TransferImpl`
+-//!    0x003D5308 runs `unit::Enhance::Dead` only for force 4). Every person seen there who is
+-//!    not in the graveyard yet is written to `<data>/rando/<title>/nuzlocke/<game id>.json`
++//!    0x003D5308 runs `unit::Enhance::Dead` only for force 4). Every person seen there who was
++//!    seen alive in the army (force 0 or 3) earlier in this game and is not in the graveyard yet
++//!    is written, with the map's turn and the person's name from the rules (round 61), to `<data>/rando/<title>/nuzlocke/<game id>.json`
+ //!    (temp file + rename) in the frame it is seen, before the game can write any save.
+ //!    Never written: the people in the rules' `game_over_not_recorded` (Corrin: that death
+ //!    ends the game, and the chapter is replayed as usual).
+@@ -23,6 +25,10 @@
+ //!    `Force::Remove`, `Force::JoinLast`), so a reset, a reload, an older save, a battle save
+ //!    or a save state never brings them back. Only a unit with no map actor (+0xB8 == 0) is
+ //!    moved: a unit already drawn on a map waits (said once in the log) until it has none.
++//!    Round 61: for some frames after a save, a state or a new game was read, the same move is
++//!    also tried at every system call (`Nuz::sweep`, from `fates_rando_session::before_svc`),
++//!    so a battle save's fallen unit is moved after its units are read and before the map
++//!    draws it.
+ //! 3. **Classic is locked.** GameUserData +0x28 bits 0x4 (Casual) and 0x8 (Phoenix) are
+ //!    cleared whenever they are seen set: the New Game's pick and My Castle's mode switch
+ //!    are both undone to Classic, and the log says so (the run is never voided).
+@@ -30,7 +36,7 @@
+ use std::collections::HashSet;
+ use std::path::{Path, PathBuf};
+ 
+-use crate::fates_rando::{Guest, GAME_CONFIG, TITLE};
++use crate::fates_rando::{Guest, TITLE};
+ 
+ /// the rules file `rando.py make` writes beside the run's patch.
+ pub const RULES_FILE: &str = "nuzlocke.json";
+@@ -42,6 +48,11 @@ pub const LEDGER_TOOL: &str = "rando-nuzlocke-v1";
+ pub const UNIT_POOL: u32 = 0x006D_9F40;
+ /// `G_GameUserData`; +0x28 the mode flags, +0xC the chapter row.
+ pub const GAME_USER_DATA: u32 = 0x006D_A248;
++/// `*0x006D7ED0` the map's situation (`map::Situation::TurnEnd` 0x003A6850): +0x8 the phase
++/// (force), +0xC the turn (u16, 1..999).
++pub const MAP_SITUATION: u32 = 0x006D_7ED0;
++/// frames after a load in which `sweep` runs at every system call.
++pub const SWEEP_FRAMES: u32 = 1200;
+ pub const FORCE_PLAYER: u8 = 0;
+ pub const FORCE_RESERVE: u8 = 3;
+ pub const FORCE_DEAD: u8 = 4;
+@@ -58,6 +69,10 @@ const MAX_UNITS: u32 = 512;
+ pub struct Dead {
+     pub pid: String,
+     pub chapter: String,
++    /// the map's turn when it fell (0 = not known)
++    pub turn: u32,
++    /// the person's name from the rules' `names` (empty = not known)
++    pub name: String,
+     pub cause: String,
+     pub at: String,
+ }
+@@ -85,6 +100,22 @@ pub struct Nuz {
+     pub events: Vec<Event>,
+     /// people whose re-kill waits for their map actor to go (said once each)
+     waiting: HashSet<String>,
++    /// people seen alive in the army (force 0 or 3) in this game since it was started or
++    /// loaded: only they are written when seen in force 4 (round 61), so a fallen list left
++    /// in memory from another game is never written into this one
++    seen_alive: HashSet<String>,
++    /// key -> display name, from the rules' `names` pairs (round 61)
++    names: Vec<(String, String)>,
++    /// frames left in which `sweep` runs at every system call (round 61)
++    pub armed: u32,
++    /// the chapter seen last frame (GameUserData +0xC): a new chapter arms the sweep, because
++    /// `map::Dispos::Data::CreateSortie` (0x0039E0xx) takes a person the chapter's player-side
++    /// placement names from force 4 when they are not in force 3 (round 61)
++    last_chapter: String,
++    /// the units of graveyard people seen in forces 0, 3 and 4 at the last frame: between
++    /// frames `sweep` checks only these (one force read each), so a fallen unit the game takes
++    /// back into the army mid-frame is moved at the next system call (round 61)
++    dead_units: Vec<u32>,
+     /// counters for the log and tests
+     pub kills: u32,
+     pub mode_undone: u32,
+@@ -251,9 +282,13 @@ impl Nuz {
+         if never_recorded.is_empty() {
+             never_recorded = str_list(&rules, "game_over_not_recorded");
+         }
++        let flat = str_list(&rules, "names");
++        let names = flat.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
+         Nuz {
+             gid: gid.to_string(), run: run.to_string(), path, rules, recruits, never_recorded,
+-            started: now(), dead: Vec::new(), events: Vec::new(), waiting: HashSet::new(), kills: 0, mode_undone: 0,
++            started: now(), dead: Vec::new(), events: Vec::new(), waiting: HashSet::new(),
++            seen_alive: HashSet::new(), names, armed: SWEEP_FRAMES, last_chapter: String::new(), dead_units: Vec::new(), kills: 0,
++            mode_undone: 0,
+         }
+     }
+ 
+@@ -298,6 +333,8 @@ impl Nuz {
+                 n.dead.push(Dead {
+                     pid,
+                     chapter: field(&o, "chapter").unwrap_or_default(),
++                    turn: field(&o, "turn").and_then(|t| t.parse().ok()).unwrap_or(0),
++                    name: field(&o, "name").unwrap_or_default(),
+                     cause: field(&o, "cause").unwrap_or_else(|| "battle".into()),
+                     at: field(&o, "at").unwrap_or_default(),
+                 });
+@@ -313,6 +350,11 @@ impl Nuz {
+         Ok(n)
+     }
+ 
++    /// the display name of a person key (the rules' `names`), or "".
++    pub fn name_of(&self, pid: &str) -> String {
++        self.names.iter().find(|(k, _)| k == pid).map(|(_, n)| n.clone()).unwrap_or_default()
++    }
++
+     pub fn is_dead(&self, pid: &str) -> bool {
+         self.dead.iter().any(|d| d.pid == pid)
+     }
+@@ -327,8 +369,8 @@ impl Nuz {
+         let mut s = String::new();
+         s.push_str("{\n");
+         s.push_str(&format!(" \"dead\": [{}],\n", self.dead.iter().map(|d| format!(
+-            "\n  {{\"at\": \"{}\", \"cause\": \"{}\", \"chapter\": \"{}\", \"name\": \"\", \"pid\": \"{}\", \"turn\": 0}}",
+-            esc(&d.at), esc(&d.cause), esc(&d.chapter), esc(&d.pid))).collect::<Vec<_>>().join(",")));
++            "\n  {{\"at\": \"{}\", \"cause\": \"{}\", \"chapter\": \"{}\", \"name\": \"{}\", \"pid\": \"{}\", \"turn\": {}}}",
++            esc(&d.at), esc(&d.cause), esc(&d.chapter), esc(&d.name), esc(&d.pid), d.turn)).collect::<Vec<_>>().join(",")));
+         s.push_str(&format!(" \"events\": [{}],\n", self.events.iter().map(|e| format!(
+             "\n  {{\"at\": \"{}\", \"detail\": \"{}\", \"what\": \"{}\"}}", esc(&e.at), esc(&e.detail), esc(&e.what)))
+             .collect::<Vec<_>>().join(",")));
+@@ -375,27 +417,44 @@ impl Nuz {
+             }
+             return notes;
+         };
+-        // 1. deaths
++        // 1. deaths (only of people seen alive in this game: round 61)
+         let chapter = chapter(g);
++        if chapter != self.last_chapter {
++            // a chapter starts: its placements may take a fallen person out of force 4 (round 61)
++            self.last_chapter = chapter.clone();
++            self.armed = self.armed.max(SWEEP_FRAMES);
++        }
+         for unit in force_units(g, pool, FORCE_DEAD) {
+             let Some(pid) = unit_pid(g, unit) else { continue };
+-            if self.is_dead(&pid) || self.never_recorded.contains(&pid) {
++            if self.is_dead(&pid) || self.never_recorded.contains(&pid) || !self.seen_alive.contains(&pid) {
+                 continue;
+             }
+-            log::info!("fates_rando: Nuzlocke: {pid} fell in {chapter}: written to the graveyard");
+-            self.dead.push(Dead { pid: pid.clone(), chapter: chapter.clone(), cause: "battle".into(), at: now() });
+-            self.event("death", &format!("{pid} in {chapter}, turn 0 (battle)"));
++            let turn = turn(g);
++            let name = self.name_of(&pid);
++            let who = if name.is_empty() { pid.clone() } else { format!("{name} ({pid})") };
++            log::info!("fates_rando: Nuzlocke: {who} fell in {chapter}, turn {turn}: written to the graveyard");
++            let shown = if name.is_empty() { pid.clone() } else { name.clone() };
++            self.event("death", &format!("{shown} in {chapter}, turn {turn} (battle)"));
++            self.dead.push(Dead { pid: pid.clone(), chapter: chapter.clone(), turn, name, cause: "battle".into(), at: now() });
+             changed = true;
+         }
+         // 2. the fallen stay fallen
++        self.dead_units.clear();
++        for unit in force_units(g, pool, FORCE_DEAD) {
++            if unit_pid(g, unit).is_some_and(|p| self.is_dead(&p)) {
++                self.dead_units.push(unit);
++            }
++        }
+         for force in [FORCE_PLAYER, FORCE_RESERVE] {
+             for unit in force_units(g, pool, force) {
+                 let Some(pid) = unit_pid(g, unit) else { continue };
+                 if !self.is_dead(&pid) {
++                    self.seen_alive.insert(pid);
+                     continue;
+                 }
+                 match kill(g, pool, unit) {
+                     Ok(()) => {
++                        self.dead_units.push(unit);
+                         self.kills += 1;
+                         self.waiting.remove(&pid);
+                         log::info!("fates_rando: Nuzlocke: {pid} is in the graveyard: moved to the fallen again");
+@@ -403,6 +462,7 @@ impl Nuz {
+                         changed = true;
+                     }
+                     Err(why) => {
++                        self.dead_units.push(unit);
+                         if self.waiting.insert(pid.clone()) {
+                             notes.push(format!("Nuzlocke: {pid} is in the graveyard but {why}; it is moved as soon as it can be"));
+                         }
+@@ -418,12 +478,67 @@ impl Nuz {
+         notes
+     }
+ 
++    /// round 61: the fallen-stay-fallen move alone, for a system call in the frames after a
++    /// load (`armed`): a battle save's units are read before the map draws them, so a fallen
++    /// unit is moved while it has no map actor yet. Returns the moves made (each logged, and
++    /// the graveyard's log written).
++    pub fn sweep(&mut self, g: &mut dyn Guest) -> u32 {
++        if self.dead.is_empty() || (self.armed == 0 && self.dead_units.is_empty()) {
++            return 0;
++        }
++        let Some(pool) = g.r32(UNIT_POOL + 4).filter(|&p| p != 0) else { return 0 };
++        // not armed: only the known units of fallen people, by their force byte
++        let suspects: Vec<u32> = if self.armed == 0 {
++            let bad: Vec<u32> = self.dead_units.iter().copied().filter(|&u| {
++                g.r32(u.wrapping_add(0xA4)).filter(|&f| f != 0).and_then(|f| r8(g, f.wrapping_add(8)))
++                    .is_some_and(|i| i == FORCE_PLAYER || i == FORCE_RESERVE)
++            }).collect();
++            if bad.is_empty() {
++                return 0;
++            }
++            bad
++        } else {
++            if !in_game(g) {
++                return 0;
++            }
++            Vec::new()
++        };
++        let mut moved = 0;
++        for force in [FORCE_PLAYER, FORCE_RESERVE] {
++            for unit in force_units(g, pool, force) {
++                if self.armed == 0 && !suspects.contains(&unit) {
++                    continue;
++                }
++                let Some(pid) = unit_pid(g, unit) else { continue };
++                if self.is_dead(&pid) && kill(g, pool, unit).is_ok() {
++                    moved += 1;
++                    self.kills += 1;
++                    self.waiting.remove(&pid);
++                    log::info!("fates_rando: Nuzlocke: {pid} is in the graveyard: moved to the fallen again (at a system call)");
++                    self.event("dead again", &format!("{pid} was alive in the loaded game (force {force}): fallen again"));
++                }
++            }
++        }
++        if moved > 0 {
++            let _ = self.save();
++        }
++        moved
++    }
++
++    /// round 61: a save, a state or a new game of this Nuzlocke game was read: `sweep` runs
++    /// at every system call for the next frames, and who was seen alive is learnt again.
++    pub fn rearm(&mut self) {
++        self.armed = SWEEP_FRAMES;
++        self.seen_alive.clear();
++    }
++
+     /// the readable log (the Esc page's "This run").
+     pub fn text(&self) -> String {
+         let mut out = format!("Nuzlocke game {} (run {}), started {}\nGraveyard ({}):\n", self.gid, self.run,
+                               self.started, self.dead.len());
+         for d in &self.dead {
+-            out.push_str(&format!("  {}: {} ({})\n", d.pid, d.chapter, d.at));
++            let who = if d.name.is_empty() { d.pid.clone() } else { d.name.clone() };
++            out.push_str(&format!("  {}: {}, turn {} ({})\n", who, d.chapter, d.turn, d.at));
+         }
+         out
+     }
+@@ -529,6 +644,19 @@ pub fn chapter(g: &mut dyn Guest) -> String {
+     }
+ }
+ 
++/// the map's turn (`map::Situation` +0xC), or 0 when there is no map situation or the
++/// number is not a turn (1..999).
++pub fn turn(g: &mut dyn Guest) -> u32 {
++    let Some(sit) = g.r32(MAP_SITUATION).filter(|&a| a != 0) else { return 0 };
++    if !g.readable(sit.wrapping_add(0xC), 2) {
++        return 0;
++    }
++    let mut b = [0u8; 2];
++    g.read(sit.wrapping_add(0xC), &mut b);
++    let t = u16::from_le_bytes(b) as u32;
++    if (1..=999).contains(&t) { t } else { 0 }
++}
++
+ /// moves `unit` (force 0 or 3, no map actor) to force 4 as `Unit::TransferImpl(unit, 4, 1)`
+ /// does: from force 0 the dead path (Unit +0xC &= ~0xA8, +0x8 &= DEAD_STATE_MASK,
+ /// `unit::Enhance::Dead` on Unit +0x28, +0x12D and +0x135 cleared); from force 3 the list
+@@ -604,15 +732,27 @@ pub fn kill(g: &mut dyn Guest, pool: u32, unit: u32) -> Result<(), String> {
+     Ok(())
+ }
+ 
+-/// GameConfigData +0xB is not 1: a game is going on (the title and the mode pick have 1).
++/// a game is loaded: the unit pool holds a player army (force 0, 3 or 4 has a unit).
++///
++/// Round 61: before every title the game runs `MainSequence` `ProcSequence::GameReset`
++/// (0x001B6CBC), which calls `UnitPool::Reset` (0x004F6198): every force is emptied and all
++/// 250 units go to force 9 (the free list). A New Game puts Corrin in the army, a save load
++/// fills it (`UnitPool::Deserialize`). Round 60 waited on GameConfigData +0xB instead, but
++/// that byte is the map camera angle option (`CameraBase::GetGameConfigAngle` 0x003E06E0 reads
++/// it as 0, 1 or 2; `GameConfigData::Reset` sets it to 1): a save made with the default angle
++/// (every Birthright save of the robot) kept the Nuzlocke frame off for good.
+ pub fn in_game(g: &mut dyn Guest) -> bool {
+-    let Some(cfg) = g.r32(GAME_CONFIG).filter(|&c| c != 0) else { return false };
+-    matches!(r8(g, cfg.wrapping_add(0xB)), Some(b) if b != 1)
++    let Some(pool) = g.r32(UNIT_POOL + 4).filter(|&p| p != 0) else { return false };
++    [FORCE_PLAYER, FORCE_RESERVE, FORCE_DEAD].into_iter().any(|f| {
++        let at = pool.wrapping_add(12 * f as u32);
++        g.readable(at, 4) && g.r32(at).unwrap_or(0) != 0
++    })
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::fates_rando::GAME_CONFIG;
+     use std::collections::BTreeMap;
+ 
+     #[derive(Default)]
+@@ -727,6 +867,7 @@ mod tests {
+         let data = tmp("deaths");
+         let mut m = game();
+         let mut n = Nuz::new_game(&data, "s-1", RULES.into()).unwrap();
++        n.seen_alive.insert("PID_4".into()); // it was in the army before it fell
+         assert!(gid_ok(&n.gid));
+         assert!(n.path.ends_with(format!("rando/0004000000179800/nuzlocke/{}.json", n.gid)));
+         assert!(in_game(&mut m));
+@@ -810,11 +951,13 @@ mod tests {
+         // PID_0 (Corrin in the rules) falls: not written
+         kill(&mut m, POOL, unit(0)).unwrap();
+         let mut n = Nuz::new_game(&data, "s-1", RULES.into()).unwrap();
++        n.seen_alive.extend(["PID_0".to_string(), "PID_4".to_string()]);
+         n.frame(&mut m);
+         assert!(!n.is_dead("PID_0"));
+         assert!(n.is_dead("PID_4"));
+         // PID_2 in the graveyard but drawn on the map: said once, moved when the actor goes
+-        n.dead.push(Dead { pid: "PID_2".into(), chapter: "X".into(), cause: "battle".into(), at: String::new() });
++        n.dead.push(Dead { pid: "PID_2".into(), chapter: "X".into(), turn: 0, name: String::new(), cause: "battle".into(),
++                           at: String::new() });
+         m.write(unit(2) + 0xB8, &1u32.to_le_bytes());
+         assert_eq!(n.frame(&mut m).len(), 1);
+         assert!(n.frame(&mut m).is_empty(), "said once");
+@@ -829,7 +972,8 @@ mod tests {
+     fn graveyard_file_round_trip_and_python_format() {
+         let data = tmp("file");
+         let mut n = Nuz::new_game(&data, "s-\"q", RULES.into()).unwrap();
+-        n.dead.push(Dead { pid: "PID_X".into(), chapter: "A00\"1".into(), cause: "battle".into(), at: "t".into() });
++        n.dead.push(Dead { pid: "PID_X".into(), chapter: "A00\"1".into(), turn: 7, name: "Kaze \"K\"".into(),
++                           cause: "battle".into(), at: "t".into() });
+         n.save().unwrap();
+         let text = std::fs::read_to_string(&n.path).unwrap();
+         assert!(text.contains("\"tool\": \"rando-nuzlocke-v1\""));
+@@ -859,6 +1003,82 @@ mod tests {
+         assert_eq!(n.never_recorded, ["PID_%83v"]);
+     }
+ 
++    /// round 61: the gate is the unit pool's army, not GameConfigData +0xB (the camera angle)
++    #[test]
++    fn the_gate_is_the_army_not_the_camera_byte() {
++        let mut m = game();
++        m.write(CFG + 0xB, &[1]); // the default camera angle, as in every Birthright save
++        assert!(in_game(&mut m), "a loaded army is a game, whatever the camera angle");
++        // GameReset's UnitPool::Reset: forces 0..8 emptied
++        for f in 0..9u32 {
++            m.write(POOL + 12 * f, &0u32.to_le_bytes());
++            m.write(POOL + 12 * f + 4, &0u32.to_le_bytes());
++        }
++        assert!(!in_game(&mut m), "the title: no army");
++        m.write(UNIT_POOL + 4, &0u32.to_le_bytes());
++        assert!(!in_game(&mut m), "no pool yet");
++    }
++
++    /// round 61: a fallen list in memory that this game never saw alive is not written; a
++    /// death of someone seen alive is written with its turn and name; the sweep moves the
++    /// fallen while armed only
++    #[test]
++    fn deaths_need_a_living_sighting_and_carry_turn_and_name() {
++        let data = tmp("turn");
++        let mut m = game();
++        const SIT: u32 = 0x3500_0000;
++        m.put(MAP_SITUATION, &SIT.to_le_bytes());
++        let mut sit = vec![0u8; 0x20];
++        sit[0xC..0xE].copy_from_slice(&3u16.to_le_bytes());
++        m.put(SIT, &sit);
++        let rules = "{\"game_over_not_recorded\": [\"PID_0\"], \"names\": [[\"PID_1\", \"Felicia\"], [\"PID_4\", \"Kaze\"]], \
++                     \"nuzlocke\": true, \"recruits\": \"all\", \"version\": 1}";
++        let mut n = Nuz::new_game(&data, "s-1", rules.into()).unwrap();
++        assert_eq!(n.name_of("PID_1"), "Felicia");
++        n.frame(&mut m);
++        assert!(n.dead.is_empty(), "PID_4 was never seen alive in this game: not written");
++        // PID_1 (seen alive in force 0 by that frame) falls on turn 3
++        kill(&mut m, POOL, unit(1)).unwrap();
++        n.frame(&mut m);
++        assert_eq!(n.dead.len(), 1);
++        assert_eq!((n.dead[0].pid.as_str(), n.dead[0].turn, n.dead[0].name.as_str()), ("PID_1", 3, "Felicia"));
++        let text = std::fs::read_to_string(&n.path).unwrap();
++        assert!(text.contains("\"name\": \"Felicia\"") && text.contains("\"turn\": 3"), "{text}");
++        assert!(n.text().contains("Felicia: A007, turn 3"));
++        // a turn that is not one reads 0
++        m.write(SIT + 0xC, &0u16.to_le_bytes());
++        assert_eq!(turn(&mut m), 0);
++        // the sweep: PID_2 in the graveyard; armed -> moved at once, not armed -> nothing
++        n.dead.push(Dead { pid: "PID_2".into(), chapter: "X".into(), turn: 1, name: String::new(), cause: "battle".into(),
++                           at: String::new() });
++        n.armed = 0;
++        assert_eq!(n.sweep(&mut m), 0);
++        n.rearm();
++        assert!(n.seen_alive.is_empty());
++        assert_eq!(n.sweep(&mut m), 1);
++        assert!(!pids(&mut m, 0).contains(&"PID_2".to_string()));
++        assert_eq!(n.sweep(&mut m), 0);
++        // not armed: a fallen unit the game takes back into the army (CreateSortie from force 4)
++        // is moved at the next system call; the frame before learnt its unit
++        n.armed = 0;
++        n.frame(&mut m);
++        assert!(n.dead_units.contains(&unit(2)));
++        let f4 = POOL + 48;
++        let prev = m.r32(unit(2) + 0x10).unwrap();
++        // unlink unit 2 (last of force 4) and join it to force 3 after unit 3
++        m.write(f4 + 4, &prev.to_le_bytes());
++        m.write(prev + 0x14, &0u32.to_le_bytes());
++        m.write(unit(2) + 0x10, &unit(3).to_le_bytes());
++        m.write(unit(3) + 0x14, &unit(2).to_le_bytes());
++        m.write(POOL + 36 + 4, &unit(2).to_le_bytes());
++        m.write(unit(2) + 0xA4, &(POOL + 36).to_le_bytes());
++        assert!(pids(&mut m, 3).contains(&"PID_2".to_string()));
++        assert_eq!(n.sweep(&mut m), 1);
++        assert!(!pids(&mut m, 3).contains(&"PID_2".to_string()));
++        assert!(pids(&mut m, 4).contains(&"PID_2".to_string()));
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
+     #[test]
+     fn rules_file_means_nuzlocke_on() {
+         let d = tmp("rules");
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 890ebb3..65f3405 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -98,6 +98,10 @@ pub struct Session {
+     pub nuz: Option<crate::fates_nuzlocke::Nuz>,
+ }
+ 
++/// round 61: the run a PLAY RANDOMIZED profile with Nuzlocke on keeps in its own data folder
++/// (`Session::profile_nuzlocke`): no table cells, only the Nuzlocke rules.
++pub const PROFILE_NUZLOCKE: &str = "profile-nuzlocke";
++
+ /// a mode-word change at most this many frames after a save slot was read is a load.
+ const LOAD_WINDOW: u32 = 2;
+ 
+@@ -185,6 +189,12 @@ impl Session {
+             log::info!("fates_rando: the mode word changed in the frame a save was read: a load, not a new game");
+             return Pick::None;
+         }
++        // round 61: a new game is picked: the Nuzlocke game of the game before ends here (its
++        // Classic lock must not touch the new game while the page is open); a Nuzlocke run
++        // answered for the new game starts its own (`answer`)
++        if self.nuz.take().is_some() {
++            log::info!("fates_rando: New Game picked: the Nuzlocke game of the game before is closed");
++        }
+         if self.interactive {
+             self.pending = true;
+             return Pick::Page;
+@@ -273,7 +283,7 @@ impl Session {
+         self.pending = false;
+         if json_field(answer, "randomizer").as_deref() != Some("true") {
+             self.original(g);
+-            return Ok(None);
++            return self.profile_nuzlocke(g, data);
+         }
+         let mut seed = json_field(answer, "seed").unwrap_or_default();
+         if seed.is_empty() {
+@@ -303,6 +313,33 @@ impl Session {
+         Ok(Some(id))
+     }
+ 
++    /// round 61: a PLAY RANDOMIZED profile with Nuzlocke on (tools/play/rando.py writes the
++    /// run `PROFILE_NUZLOCKE`: a patch of no cells and the rules file into the profile's own
++    /// data folder): a New Game answered "Randomizer off" there lays that run (nothing in
++    /// memory changes) and starts a Nuzlocke game, so its saves name the game like any
++    /// Nuzlocke run's. No such run folder (every other data folder) = Ok(None) as before.
++    fn profile_nuzlocke(&mut self, g: &mut dyn Guest, data: &Path) -> Result<Option<String>, String> {
++        let dir = run_dir(data, PROFILE_NUZLOCKE);
++        if !dir.join("patch.txt").is_file() || !dir.join(crate::fates_nuzlocke::RULES_FILE).is_file() {
++            return Ok(None);
++        }
++        let rules = match crate::fates_nuzlocke::read_rules(&dir) {
++            Some(Ok(r)) => r,
++            Some(Err(e)) => return Err(format!("Nuzlocke (PLAY RANDOMIZED profile) could not start: {e}")),
++            None => return Ok(None),
++        };
++        self.lay(g, data, PROFILE_NUZLOCKE)?;
++        match crate::fates_nuzlocke::Nuz::new_game(data, PROFILE_NUZLOCKE, rules) {
++            Ok(n) => {
++                log::info!("fates_rando: Nuzlocke game {} started for this PLAY RANDOMIZED profile (graveyard {})",
++                           n.gid, n.path.display());
++                self.nuz = Some(n);
++            }
++            Err(e) => self.note(format!("Nuzlocke could not start: {e}")),
++        }
++        Ok(Some(PROFILE_NUZLOCKE.to_string()))
++    }
++
+     /// the Nuzlocke game save `path` names (engine round E2), once its run is laid.
+     fn nuz_for_slot(&mut self, data: &Path, path: &str) {
+         let want = fates_rando::slot_nuz(data, path);
+@@ -316,7 +353,9 @@ impl Session {
+             self.nuz = None;
+             return;
+         };
+-        if self.nuz.as_ref().is_some_and(|n| n.gid == gid) {
++        if let Some(n) = self.nuz.as_mut().filter(|n| n.gid == gid) {
++            // round 61: the same game read again (a reload): its fallen are swept again
++            n.rearm();
+             return;
+         }
+         let rules = crate::fates_nuzlocke::read_rules(&run_dir(data, &run)).and_then(Result::ok);
+@@ -399,6 +438,9 @@ impl Session {
+                 }
+                 self.run = Some(r);
+                 self.nuz = keep;
++                if let Some(n) = self.nuz.as_mut() {
++                    n.rearm();
++                }
+             }
+             Err(e) => self.note(format!("the state's randomized game {id} is missing ({e}); its tables stay as saved")),
+         }
+@@ -419,7 +461,11 @@ pub fn after_frame(system: &mut System) {
+         return;
+     }
+     after_frame_inner(system);
+-    // engine round E2: the active Nuzlocke game's frame (nothing without one)
++    // engine round E2: the active Nuzlocke game's frame (nothing without one); round 61: while
++    // the unit pool holds a player army (`fates_nuzlocke::in_game`), not GameConfigData +0xB
++    if let Some(n) = system.rando.nuz.as_mut() {
++        n.armed = n.armed.saturating_sub(1);
++    }
+     if system.rando.nuz.is_some() && crate::fates_nuzlocke::in_game(&mut system.memory) {
+         let notes = system.rando.nuz.as_mut().map(|n| n.frame(&mut system.memory)).unwrap_or_default();
+         for t in notes {
+@@ -773,6 +819,15 @@ fn stored_at(g: &mut dyn fates_rando::Guest, kind: fates_rando::Kind, name: &str
+ /// names it, or, round 60, the Person archive list has it), its cells are checked and laid
+ /// in memory (round 50's in-memory apply).
+ pub fn before_svc(system: &mut System) {
++    // round 61: a Nuzlocke game's fallen are moved at every system call: in the frames after
++    // a save, state, new game or chapter start every army unit is checked (a battle save's
++    // units are read before the map draws them; the frame hook alone comes too late), at
++    // other times only the units of fallen people seen at the last frame (`Nuz::sweep`)
++    if system.rando.nuz.is_some() {
++        if let Some(n) = system.rando.nuz.as_mut() {
++            n.sweep(&mut system.memory);
++        }
++    }
+     if system.rando.waits.is_empty() {
+         return;
+     }
+@@ -1389,6 +1444,35 @@ gamedata-sha256 00\nfile gamedata GameData/GameData.bin.lz\nv 10 07 {new:02x}\ne
+         panic!("Python must not run for a run already made")
+     }
+ 
++    /// round 61: a PLAY RANDOMIZED profile with Nuzlocke on: "Randomizer off" lays the
++    /// profile's empty run and starts a Nuzlocke game; memory is unchanged; without the run
++    /// folder "off" stays Ok(None)
++    #[test]
++    fn a_profile_with_nuzlocke_starts_a_nuzlocke_game_on_off() {
++        let data = top("profile");
++        let mut m = game();
++        let before = m.mem();
++        let mut s = Session::default();
++        let off = r#"{"randomizer": false}"#;
++        assert_eq!(s.answer(&mut m, &data, off, &mut no_make), Ok(None));
++        let dir = run_dir(&data, PROFILE_NUZLOCKE);
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("patch.txt"), "fates-rando-patch 1
++seed profile
++options {}
++gamedata-sha256 -
++end 0
++").unwrap();
++        assert_eq!(s.answer(&mut m, &data, off, &mut no_make), Ok(None), "no rules file: as before");
++        std::fs::write(dir.join(crate::fates_nuzlocke::RULES_FILE), "{\"nuzlocke\": true, \"recruits\": \"all\"}").unwrap();
++        assert_eq!(s.answer(&mut m, &data, off, &mut no_make), Ok(Some(PROFILE_NUZLOCKE.to_string())));
++        assert_eq!(s.active().as_deref(), Some(PROFILE_NUZLOCKE));
++        let n = s.nuz.as_ref().expect("a Nuzlocke game");
++        assert!(n.path.is_file(), "its graveyard is written at once");
++        assert_eq!(m.blocks[&GD_FILE], before[&GD_FILE], "no table cell");
++        let _ = std::fs::remove_dir_all(&data);
++    }
++
+     #[test]
+     fn the_test_hook_answers_the_mode_pick_like_the_page() {
+         let data = top("hook");
+-- 
+2.55.0.windows.5
+

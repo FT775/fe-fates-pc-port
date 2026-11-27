@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe14 <engine@localhost>
+Date: Thu, 19 Nov 2026 23:26:29 -0500
+Subject: [PATCH 06/21] frontend: Fire Emblem Fates' first run starts with the
+ port's picks
+
+The Fates port's owner chose (its docs/DECISIONS.md F-041, engine build
+OK 2026-11-19) 60 fps battles, the 3D at 3x with the slider up to 8x, and
+the top screen 16:9 together with the extra that draws the 3D for it, as
+the defaults of the shipped program. Zakuro keeps its settings in
+%APPDATA%\zakuro\settings.toml whatever --data says, and the extras were a
+player cheat file copied by hand, so a default needs a change here:
+
+- zakuro-core enhancements.txt lists the port's four extras for
+  0004000000179800 rev0 (60 fps battles, 16:9 top screen, faster battles
+  150%, 60 fps story scenes, test), the same codes as the port's
+  tools/extras/usa_extras.py build writes (our own words, no original
+  bytes). They are built-in enhancements: never in the player's cheat
+  file, on and off by name in settings.toml, and off puts the bytes back.
+  Their credit line names the port, not the GBAtemp thread.
+- Settings::load() starts from Settings::first_run() when there is no
+  settings file (NotFound only): the defaults, plus for Fates its own
+  top shape 16:9 and the enhancements 60 fps battles and 16:9 top screen.
+  Resolution stays the default 3 and the slider 1..=8. Faster battles and
+  60 fps story scenes stay off. A settings file that is there, even an
+  empty or unreadable one, is used as before and never replaced; the
+  first run's settings are written when Zakuro first saves (console id).
+
+Tests added (settings, enhancements); not run here, only the port's
+standalone program was built (owner's OK covers that build only).
+---
+ crates/zakuro-core/src/enhancements.rs  | 28 +++++++++++-
+ crates/zakuro-core/src/enhancements.txt | 59 +++++++++++++++++++++++++
+ crates/zakuro/src/settings.rs           | 47 +++++++++++++++++++-
+ 3 files changed, 132 insertions(+), 2 deletions(-)
+
+diff --git a/crates/zakuro-core/src/enhancements.rs b/crates/zakuro-core/src/enhancements.rs
+index 2a8d39e..d45d433 100644
+--- a/crates/zakuro-core/src/enhancements.rs
++++ b/crates/zakuro-core/src/enhancements.rs
+@@ -9,6 +9,10 @@ use crate::cheats::Cheat;
+ /// about it, and its code.
+ const LIST: &str = include_str!("enhancements.txt");
+ 
++/// who the Fire Emblem Fates port's own extras are by, which did not come
++/// from the 60 FPS thread.
++pub const FATES_PORT: &str = "the Fates port";
++
+ /// one enhancement for a game.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Enhancement {
+@@ -64,7 +68,11 @@ pub fn cheats(program_id: u64, build: &str, on: &[String]) -> Vec<Cheat> {
+     for_title(program_id, build)
+         .into_iter()
+         .map(|enhancement| {
+-            let credit = format!("Code by {}, from the 60 FPS thread on GBAtemp.", enhancement.author);
++            let credit = if enhancement.author == FATES_PORT {
++                "Made by the Fates port from this game's own code (its docs/EXTRAS.md).".to_owned()
++            } else {
++                format!("Code by {}, from the 60 FPS thread on GBAtemp.", enhancement.author)
++            };
+             let notes = [enhancement.note, credit].into_iter().filter(|line| !line.is_empty()).collect();
+             let mut cheat = Cheat::new(&enhancement.name, enhancement.lines, notes);
+             cheat.builtin = true;
+@@ -96,6 +104,24 @@ mod tests {
+         assert_eq!(cheats[0].notes.len(), 2);
+     }
+ 
++    /// the Fates port's extras are for the Special Edition (USA) cartridge,
++    /// rev0, with the port's credit, and only the ones named are on.
++    #[test]
++    fn the_fates_port_extras_are_for_its_cartridge() {
++        let fates = 0x0004_0000_0017_9800;
++        let names: Vec<String> = for_title(fates, "rev0").into_iter().map(|enhancement| enhancement.name).collect();
++        assert_eq!(names, [
++            "60 fps battles (Fates port extra)",
++            "16:9 top screen (Fates port extra)",
++            "Faster battles 150% (Fates port extra)",
++            "60 fps story scenes (Fates port extra, test)",
++        ]);
++        assert!(for_title(fates, "update 1.1").is_empty());
++        let cheats = cheats(fates, "rev0", &["60 fps battles (Fates port extra)".to_owned()]);
++        assert!(cheats[0].enabled && !cheats[1].enabled && !cheats[3].enabled);
++        assert!(cheats[0].notes[1].contains("Fates port"));
++    }
++
+     #[test]
+     fn every_listed_code_is_code() {
+         for line in LIST.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('=') && !line.contains('|')) {
+diff --git a/crates/zakuro-core/src/enhancements.txt b/crates/zakuro-core/src/enhancements.txt
+index 7daa922..ba9e6be 100644
+--- a/crates/zakuro-core/src/enhancements.txt
++++ b/crates/zakuro-core/src/enhancements.txt
+@@ -80,3 +80,62 @@ D2000000 00000000
+ = 00040000001B2900 Yo-kai Watch 2: Psychic Specters (EUR)
+ 60 FPS | rev0 | lucky | Some things may run faster with it.
+ 2086128D 00000001
++
++# the Fates port's own extras (its docs/EXTRAS.md), found in this game's own
++# code and checked by its test robot; its first run turns the first two on.
++= 0004000000179800 Fire Emblem Fates: Special Edition (USA)
++60 fps battles (Fates port extra) | rev0 | the Fates port | Battles draw 60 pictures a second instead of 30, at the same speed. The robot saw units, the hidden random values and saves come out the same.
++004FBB9C E3A00001
++00193900 E3A00001
++00610440 E52DC004
++00610444 E59FC020
++00610448 E59CC000
++0061044C EE00CA90
++00610450 EEF80A60
++00610454 ED9F1A05
++00610458 EE600A81
++0061045C EE600A88
++00610460 EE300A60
++00610464 E49DC004
++00610468 E12FFF1E
++0061046C 006DCA9C
++00610470 3F000000
++001D5E08 EB10E98C
++001D5EAC EB10E963
++00610480 E52DC004
++00610484 E59FC018
++00610488 E59CC000
++0061048C EE01CA10
++00610490 EEB81A41
++00610494 EDDF1A03
++00610498 EE010A21
++0061049C E49DC004
++006104A0 E12FFF1E
++006104A4 006DCA9C
++006104A8 3F000000
++001F1A80 EB107A7E
++16:9 top screen (Fates port extra) | rev0 | the Fates port | Draws the 3D map and battles for a 16:9 screen. Goes with the top screen shape 16:9 in Settings for this game. Menus and text stay as drawn and stretch a little.
++00610400 ED9F2A04
++00610404 EEF40A42
++00610408 EEF1FA10
++0061040C 0D9F2A02
++00610410 0E600A82
++00610414 EAEC7998
++00610418 3FD55555
++0061041C 3F888889
++004DAF40 EB04D52E
++004DB6D4 EB04D349
++Faster battles 150% (Fates port extra) | rev0 | the Fates port | Battle animations at 150%. Fast-forward is twice that; slow motion and pause stay. Battle results do not change.
++001D5D74 ED9F0A06
++001D5D78 E3500002
++001D5D7C 0D9F0A65
++001D5D80 E3500004
++001D5D84 0D9F0A03
++001D5D88 E3500003
++001D5D8C 0EB00A68
++001D5D90 EA00000A
++001D5D94 3FC00000
++001D5D98 40400000
++60 fps story scenes (Fates port extra, test) | rev0 | the Fates port | Test only, leave it off: story scenes at 60 pictures a second change the hidden random values after a scene.
++001AD9A4 E3A00001
++00420F28 E3A00001
+diff --git a/crates/zakuro/src/settings.rs b/crates/zakuro/src/settings.rs
+index 11ed9b0..c0a6d8c 100644
+--- a/crates/zakuro/src/settings.rs
++++ b/crates/zakuro/src/settings.rs
+@@ -709,6 +709,13 @@ impl GameSettings {
+     }
+ }
+ 
++/// Fire Emblem Fates, Special Edition (USA), the Fates port's game.
++pub const FATES_SE_USA: u64 = 0x0004_0000_0017_9800;
++
++/// the enhancements a first run turns on for it, named as in
++/// zakuro-core's enhancements.txt.
++pub const FATES_FIRST_RUN_ENHANCEMENTS: [&str; 2] = ["60 fps battles (Fates port extra)", "16:9 top screen (Fates port extra)"];
++
+ /// what a game goes by in the settings file, its title id.
+ pub fn game_key(program_id: u64) -> String {
+     format!("{program_id:016X}")
+@@ -750,7 +757,9 @@ impl Settings {
+         zakuro_gpu::Stereo { mode: self.stereo.mode(), swap: self.swap_eyes }
+     }
+ 
+-    /// the saved settings, or the defaults when there are none.
++    /// the saved settings, or the first run's when there is no settings
++    /// file yet. a file that is there is never replaced by them, whatever it
++    /// holds.
+     pub fn load() -> Settings {
+         let Some(path) = path() else { return Settings::default() };
+         match std::fs::read_to_string(&path) {
+@@ -761,10 +770,28 @@ impl Settings {
+                 log::warn!("could not read {}, {error}, using the defaults, it is kept as {}", path.display(), aside.display());
+                 Settings::default()
+             }),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                log::info!("no settings at {} yet, a first run", path.display());
++                Settings::first_run()
++            }
+             Err(_) => Settings::default(),
+         }
+     }
+ 
++    /// the settings a first run starts with: the defaults, and for Fire
++    /// Emblem Fates (Special Edition, USA) the Fates port's picks (its
++    /// docs/DECISIONS.md F-041): the 3D at 3x, the default already, the top
++    /// screen 16:9 together with the enhancement that draws the 3D for it,
++    /// and battles at 60 pictures a second. its other two extras, faster
++    /// battles and 60 fps story scenes, stay off.
++    pub fn first_run() -> Settings {
++        let mut settings = Settings::default();
++        let fates = game_key(FATES_SE_USA);
++        settings.per_game.insert(fates.clone(), GameSettings { top_shape: Some(TopShape::Wide16x9), ..GameSettings::default() });
++        settings.enhancements.insert(fates, FATES_FIRST_RUN_ENHANCEMENTS.iter().map(|name| (*name).to_owned()).collect());
++        settings
++    }
++
+     pub fn save(&self) {
+         let Some(path) = path() else { return };
+         let written = toml::to_string_pretty(self)
+@@ -903,6 +930,24 @@ mod tests {
+         assert_eq!(own.resolution, Some(4));
+     }
+ 
++    /// a first run starts Fates with the 3D at 3x (slider up to 8x), the
++    /// top screen 16:9 with its enhancement, and 60 fps battles; every
++    /// other game and the general settings are the defaults.
++    #[test]
++    fn a_first_run_has_the_fates_port_picks() {
++        let settings = Settings::first_run();
++        let fates = settings.for_game(Some(FATES_SE_USA));
++        assert_eq!((fates.resolution, fates.top_shape), (3, TopShape::Wide16x9));
++        assert_eq!(settings.enhancements[&game_key(FATES_SE_USA)], FATES_FIRST_RUN_ENHANCEMENTS);
++        assert_eq!(settings.top_shape, TopShape::Console);
++        assert_eq!(settings.for_game(Some(0x0004_0000_000A_0500)), Settings::default().for_game(Some(0x0004_0000_000A_0500)));
++        let text = toml::to_string_pretty(&settings).unwrap();
++        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
++        // a settings file that is there, even an empty one, gets none of it
++        let file: Settings = toml::from_str("").unwrap();
++        assert!(file.per_game.is_empty() && file.enhancements.is_empty());
++    }
++
+     #[test]
+     fn layouts_go_round() {
+         let mut layout = Screens::Stacked;

@@ -1,0 +1,674 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Tue, 24 Nov 2026 15:18:25 -0500
+Subject: [PATCH] core: Fire Emblem Fates randomizer: chest and village items
+ (the chest hook at ev::ItemGain)
+
+Round 71 (docs/ROUND71_PLAN.md A1, docs/rando/CHESTS.md section 3, owner OK
+"Yes, start round 71"): new module fates_rando_chests. What a chest, a village
+or a talk gift gives is a literal IID in each chapter's event script, handed to
+the script call ev::ItemGain = anonymous_namespace::ItemGain at 0x003B0768
+(registration literal pool 0x0042B62C; r2 = the IID string at its entry; first
+word push {r3-r7, lr} = 0xE92D40F8, read from the owner's dump).
+
+While a randomized run whose folder holds a chest list (chests.txt, written by
+rando.py make with --chests on; make_run_inner keeps it with the run like
+plan.json) is active, the frame hook writes a reserved svc (0xEFFEC001; number
+0xFEC001, above every kernel call) over that first word with
+write32_privileged and has the recompiled code checked again
+(recompiled::Library::check, as cheats.rs does for a cheat that changes code),
+so the interpreter runs that one function. kernel::svc::dispatch hands the svc
+to fates_rando_chests::on_svc: at 0x003B0768 only (ARM, the cpu past the svc)
+it reads the IID r2 points at, finds (chapter, IID) in the list, where the
+chapter is the placement file the game holds (map::Dispos name) and, when
+readable, GameUserData's current chapter (CID_xxxx after its prefix) agrees,
+checks that the new IID's own label text is at GameData's data start + the
+listed offset, and points r2 at it; then it stores r3-r7 and lr below sp as
+the replaced push did and the function goes on at +4 unchanged (window, sound,
+convoy rule as for any gift). Any other svc 0xFEC001 is unknown as before.
+No guest memory is allocated and no script byte is written.
+
+Off = the original game: no list (the row off, the default; a run made
+before round 71), no run, or a list with no changed item, and the word is
+never written; the only thing the hook does then is read that one word once a
+frame through the plain page read. When the list's run ends (a
+non-randomized save, another run) the original word goes back at the next
+frame; a save state holding the svc is put right the same way; the recompiled
+code is checked again only when that word differs from what it was last
+checked against (never, with the row off). A word that is neither the
+original's nor ours (another game version, a cheat) is left alone; recompiled
+code from an older 3dsrecomp that cannot tell a changed function keeps the
+hook off.
+
+Chest list: "fates-rando-chests 1", "seed <seed>", "c <chapter> <original IID
+hex> <new IID hex> <new IID offset hex>" lines, "end <count>"; labels as the
+bytes the game holds (cp932), the offset from GameData's data start (the base
+of patch.txt's "g" label offsets); a missing end line or any unknown line
+refuses the whole file (a notice; chests give their original items).
+
+Tests: the_list_is_read_whole_or_refused, no_file_means_off,
+the_word_follows_the_list_and_leaves_a_stranger_alone,
+the_replaced_push_stores_r3_to_r7_and_lr,
+a_listed_gift_of_the_chapter_being_played_is_swapped,
+another_chapter_or_a_disagreeing_game_leaves_the_gift,
+a_label_that_is_not_where_the_list_says_gives_the_original, chapter_keys
+(cargo tests run in the gate / B3, not by the track). The Python twin
+(tools/randomizer/chests.py parse_engine_list) reads the same test list.
+---
+ crates/zakuro-core/src/fates_rando_chests.rs  | 542 ++++++++++++++++++++++++++
+ crates/zakuro-core/src/fates_rando_session.rs |   9 +-
+ crates/zakuro-core/src/kernel/svc.rs          |   3 +
+ crates/zakuro-core/src/lib.rs                 |   1 +
+ 4 files changed, 554 insertions(+), 1 deletion(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando_chests.rs b/crates/zakuro-core/src/fates_rando_chests.rs
+new file mode 100644
+index 0000000..ecd6a79
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_rando_chests.rs
+@@ -0,0 +1,542 @@
++//! Fire Emblem Fates randomizer: chests, villages and talk gifts (round 71, docs/rando/CHESTS.md).
++//!
++//! What a chest, a village or a talk gift gives is not table data in this game: each
++//! chapter's event script hands the item over by calling `ev::ItemGain` with the item's IID
++//! as a literal string. The script name is bound to `anonymous_namespace::ItemGain(cmvm::
++//! CmContext*, int, const char*)` at 0x003B0768 (the registration code's literal pool at
++//! 0x0042B62C holds 0x003B0768 next to the string `ev::ItemGain`). At its entry r2 points at
++//! the IID string; the function keeps it (r4), checks `Item::IsExist(iid)`, builds the item
++//! with `unit::Item::New(item, iid)` and gives it (`map::SequenceHelper::ItemGain`: the unit
++//! or the convoy, the "got" window and its sound).
++//!
++//! The hook: while a randomized run with a non-empty chest list is active, the first word
++//! of that function (`push {r3-r7, lr}`, 0xE92D40F8) is replaced by a reserved `svc`
++//! (0xEFFEC001; its number 0xFEC001 is no kernel call). Zakuro's recompiled code is checked
++//! again (`recompiled::Library::check`, as `cheats.rs` does for a cheat that changes code), so
++//! the interpreter runs that one function. At the svc (`kernel::svc::dispatch` ->
++//! `on_svc`) the hook reads the IID r2 points at, looks up (the chapter being played, that
++//! IID) in the run's chest list, and when it is there and the new item's own label text is
++//! where the list says in the resident GameData, points r2 at that label text. Then it does
++//! the replaced `push` itself and the function goes on at +4, unchanged: the window, the
++//! sound and the convoy rule behave as for any gift. No guest memory is allocated and no
++//! script byte is ever written (the owner's rule: no script writer).
++//!
++//! Off = the original game: no chest list (the row "Chest and village items" off, the
++//! default, or a run made before round 71), no run (Randomizer off), or a run without
++//! changed items, and the original word is never touched; when a run with a list ends (a
++//! non-randomized save loads, another run is laid) the original word goes back at the next
++//! frame. A save state taken with the svc in memory is put right the same way.
++//!
++//! The chapter is the one the game itself names: the placement file it holds
++//! (`map::Dispos`, name = the chapter id) and, when readable, GameUserData's current chapter
++//! (`CID_xxxx`, as the script call ChapterGetName reads it). Both must name the list's
++//! chapter, so a gift in My Castle or in the next chapter's opening scene is never swapped
++//! for a chest of the chapter played before. The Python side keeps a slot whole when a kept
++//! `ev::ItemGain` gift of the same chapter hands over the same item (chests.hook_shared).
++//!
++//! Chest list file (`chests.txt` in the run folder; tools/randomizer/chests.py
++//! `engine_list`, labels as hex of the bytes the game holds (cp932)):
++//!
++//! ```text
++//! fates-rando-chests 1
++//! seed <seed>
++//! c <chapter> <original IID hex> <new IID hex> <new IID offset hex from GameData's data start>
++//! end <number of c lines>
++//! ```
++
++use std::path::Path;
++
++use zakuro_cpu::Bus;
++
++use crate::fates_rando::{self, Guest};
++use crate::System;
++
++/// `anonymous_namespace::ItemGain`, the handler of the script call `ev::ItemGain`.
++pub const ITEM_GAIN: u32 = 0x003B_0768;
++/// its first instruction: `push {r3-r7, lr}` (`stmdb sp!, {r3, r4, r5, r6, r7, lr}`).
++pub const ORIGINAL_WORD: u32 = 0xE92D_40F8;
++/// the reserved svc number the hook puts there (no 3DS kernel call has a number above 0xFF).
++pub const SVC_NUMBER: u32 = 0x00FE_C001;
++/// `svc #0xFEC001`
++pub const TRAP_WORD: u32 = 0xEF00_0000 | SVC_NUMBER;
++/// the chest list file in the run folder (`rando.py make` writes it into the mod folder; the
++/// core keeps it with the run, `fates_rando_session::make_run_inner`).
++pub const FILE: &str = "chests.txt";
++pub const FORMAT: u32 = 1;
++const MAGIC: &str = "fates-rando-chests";
++/// the longest label the hook reads (tools/randomizer/chests.py MAX_LABEL).
++pub const MAX_LABEL: usize = 63;
++
++/// one changed gift: in `chapter`, the IID `orig` becomes `new`, whose own label text lies at
++/// GameData's data start + `new_at`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Entry {
++    pub chapter: String,
++    pub orig: Vec<u8>,
++    pub new: Vec<u8>,
++    pub new_at: u32,
++}
++
++/// a run's chest list.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Table {
++    pub seed: String,
++    pub entries: Vec<Entry>,
++}
++
++fn unhex(s: &str) -> Option<Vec<u8>> {
++    if s.len() % 2 != 0 || s.is_empty() {
++        return None;
++    }
++    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect()
++}
++
++fn chapter_ok(ch: &str) -> bool {
++    ch.len() == 4 && ch.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
++}
++
++/// the 4-character chapter id of a name the game holds ("A007", "CID_A007" after its
++/// prefix, a placement file "A007"), upper case; None when shorter.
++pub fn chapter_key(name: &str) -> Option<String> {
++    let k: String = name.chars().take(4).collect::<String>().to_ascii_uppercase();
++    chapter_ok(&k).then_some(k)
++}
++
++fn label_ok(b: &[u8]) -> bool {
++    !b.is_empty() && b.len() <= MAX_LABEL && !b.contains(&0)
++}
++
++impl Table {
++    /// reads a chest list (the format above). Any line it does not know, a missing end line
++    /// (a file not written whole) or a count that does not match refuses the whole file.
++    pub fn parse(text: &str) -> Result<Table, String> {
++        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
++        if lines.next() != Some(&format!("{MAGIC} {FORMAT}")[..]) {
++            return Err(format!("not a chest list (format {FORMAT})"));
++        }
++        let mut t = Table::default();
++        let mut end = None;
++        for line in lines {
++            if end.is_some() {
++                return Err("a line after end".into());
++            }
++            let parts: Vec<&str> = line.split_whitespace().collect();
++            match parts.as_slice() {
++                ["seed", s] if t.seed.is_empty() && t.entries.is_empty() => t.seed = s.to_string(),
++                ["c", ch, orig, new, at] => {
++                    let (Some(orig), Some(new), Ok(new_at)) = (unhex(orig), unhex(new), u32::from_str_radix(at, 16))
++                    else {
++                        return Err(format!("bad line {line:?}"));
++                    };
++                    if !chapter_ok(ch) || !label_ok(&orig) || !label_ok(&new) {
++                        return Err(format!("bad line {line:?}"));
++                    }
++                    if t.entries.iter().any(|e| e.chapter == *ch && e.orig == orig) {
++                        return Err(format!("{ch}: an item listed twice"));
++                    }
++                    t.entries.push(Entry { chapter: ch.to_string(), orig, new, new_at });
++                }
++                ["end", n] => {
++                    let n: usize = n.parse().map_err(|_| format!("bad line {line:?}"))?;
++                    if n != t.entries.len() {
++                        return Err(format!("end says {n}, the list has {}", t.entries.len()));
++                    }
++                    end = Some(n);
++                }
++                _ => return Err(format!("bad line {line:?}")),
++            }
++        }
++        if end.is_none() {
++            return Err("no end line (the file is not complete)".into());
++        }
++        Ok(t)
++    }
++
++    /// the entry for `orig` in `chapter`.
++    pub fn find(&self, chapter: &str, orig: &[u8]) -> Option<&Entry> {
++        self.entries.iter().find(|e| e.chapter == chapter && e.orig == orig)
++    }
++
++    fn has_item(&self, orig: &[u8]) -> bool {
++        self.entries.iter().any(|e| e.orig == orig)
++    }
++}
++
++/// the run folder's chest list: None = no file (the row was off: the hook stays off).
++pub fn read_table(run_dir: &Path) -> Option<Result<Table, String>> {
++    let path = run_dir.join(FILE);
++    match std::fs::read_to_string(&path) {
++        Ok(text) => Some(Table::parse(&text).map_err(|e| format!("{}: {e}", path.display()))),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
++        Err(e) => Some(Err(format!("{}: {e}", path.display()))),
++    }
++}
++
++/// the hook's state, kept with the randomizer session (`Session::chests`).
++#[derive(Debug, Default)]
++pub struct Chests {
++    /// the run whose list was read last (None = no run)
++    run: Option<String>,
++    /// its list, when it has changed items
++    table: Option<Table>,
++    /// the word at ITEM_GAIN the recompiled code was last checked against (None = never
++    /// checked by the hook: the original word, as the library was made from)
++    lib_word: Option<u32>,
++    /// said once: the word at ITEM_GAIN is neither ours nor the original's, or the
++    /// recompiled code cannot tell a changed function
++    noted: bool,
++    /// gifts swapped since the program started (the log says each one)
++    pub swaps: u64,
++}
++
++impl Chests {
++    /// whether a list with changed items is active.
++    pub fn active(&self) -> bool {
++        self.table.is_some()
++    }
++}
++
++/// what the frame writes at ITEM_GAIN: the svc while a list is wanted and the original word
++/// is there, the original word back while none is wanted and the svc is there, else nothing
++/// (another version of the game, a cheat or a mod changed that word: it is left alone).
++pub fn word_to_write(want: bool, now: u32) -> Option<u32> {
++    match (want, now) {
++        (true, ORIGINAL_WORD) => Some(TRAP_WORD),
++        (false, TRAP_WORD) => Some(ORIGINAL_WORD),
++        _ => None,
++    }
++}
++
++/// what `stmdb sp!, {list}` (`word`) does with `regs`: the new sp and the (address, value)
++/// words it stores, lowest register at the lowest address. None for any other instruction.
++pub fn push_words(word: u32, regs: &[u32; 16]) -> Option<(u32, Vec<(u32, u32)>)> {
++    // cond AL, STMDB (P=1 U=0 S=0 W=1 L=0), base sp
++    if word & 0xFFFF_0000 != 0xE92D_0000 || word & 0xFFFF == 0 {
++        return None;
++    }
++    let list = word & 0xFFFF;
++    let n = list.count_ones();
++    let start = regs[13].wrapping_sub(4 * n);
++    let mut at = start;
++    let mut out = Vec::with_capacity(n as usize);
++    for r in 0..16 {
++        if list & (1 << r) != 0 {
++            out.push((at, regs[r]));
++            at = at.wrapping_add(4);
++        }
++    }
++    Some((start, out))
++}
++
++/// the swap at the handler's entry: Ok(Some(new r2)) when the IID at `r2` is a changed gift
++/// of the chapter being played; Ok(None) to leave it (not listed, another chapter, nothing
++/// readable); Err when the list names a label that is not where it says (nothing changes).
++pub fn swap(table: &Table, g: &mut dyn Guest, r2: u32) -> Result<Option<(u32, String)>, String> {
++    let Some(orig) = g.cstr(r2, MAX_LABEL as u32 + 1) else { return Ok(None) };
++    if !table.has_item(&orig) {
++        return Ok(None);
++    }
++    let Some((dispos, _)) = fates_rando::dispos_now(g) else { return Ok(None) };
++    let Some(chapter) = chapter_key(&dispos) else { return Ok(None) };
++    let Some(e) = table.find(&chapter, &orig) else { return Ok(None) };
++    // GameUserData's current chapter ("?" when it cannot be read) must agree
++    let gud = crate::fates_nuzlocke::chapter(g);
++    if gud != "?" && chapter_key(&gud).as_deref() != Some(chapter.as_str()) {
++        return Ok(None);
++    }
++    let gd = fates_rando::gamedata_start(g).ok_or_else(|| "GameData is not loaded".to_string())?;
++    let at = gd.wrapping_add(e.new_at);
++    match g.cstr(at, MAX_LABEL as u32 + 1) {
++        Some(b) if b == e.new => Ok(Some((at, chapter))),
++        _ => Err(format!("{chapter}: the new item's label is not at GameData +{:X} (another mod or game version?); \
++                          the original item is given", e.new_at)),
++    }
++}
++
++fn shown(b: &[u8]) -> String {
++    b.iter().map(|c| format!("{c:02x}")).collect()
++}
++
++/// `kernel::svc::dispatch` for SVC_NUMBER: true when it was the hook's svc at ITEM_GAIN (the
++/// gift swapped when listed, the replaced push done, the function goes on at +4); false for
++/// any other place (the svc is then an unknown one, as before).
++pub fn on_svc(system: &mut System) -> bool {
++    // the cpu is already past the svc
++    let at = system.cpu.regs[15].wrapping_sub(4);
++    if system.cpu.cpsr.thumb || at != ITEM_GAIN {
++        return false;
++    }
++    let Some((sp, words)) = push_words(ORIGINAL_WORD, &system.cpu.regs) else { return false };
++    if let Some(table) = system.rando.chests.table.as_ref() {
++        let r2 = system.cpu.regs[2];
++        match swap(table, &mut system.memory, r2) {
++            Ok(Some((new_r2, chapter))) => {
++                let orig = system.memory.cstr(r2, MAX_LABEL as u32 + 1).unwrap_or_default();
++                let new = system.memory.cstr(new_r2, MAX_LABEL as u32 + 1).unwrap_or_default();
++                log::info!("fates_rando: chest hook: {chapter} gift {} -> {}", shown(&orig), shown(&new));
++                system.cpu.regs[2] = new_r2;
++                system.rando.chests.swaps += 1;
++            }
++            Ok(None) => {}
++            Err(e) => {
++                log::warn!("fates_rando: chest hook: {e}");
++                system.rando.notices.push(format!("chest and village items: {e}"));
++            }
++        }
++    }
++    for (addr, value) in words {
++        system.memory.write32(addr, value);
++    }
++    system.cpu.regs[13] = sp;
++    true
++}
++
++/// once a frame (`fates_rando_session::after_frame`, Fire Emblem Fates only): the chest list
++/// follows the active run, and the word at ITEM_GAIN follows the list.
++pub fn frame(system: &mut System, data: &Path) {
++    let active = system.rando.active();
++    if system.rando.chests.run != active {
++        let mut table = None;
++        if let Some(id) = active.as_deref() {
++            match read_table(&crate::fates_rando_session::run_dir(data, id)) {
++                None => {}
++                Some(Ok(t)) if t.entries.is_empty() => {}
++                Some(Ok(t)) => {
++                    log::info!("fates_rando: {id}: chest and village items on ({} changed gifts)", t.entries.len());
++                    table = Some(t);
++                }
++                Some(Err(e)) => {
++                    log::warn!("fates_rando: {e}");
++                    system.rando.notices.push(format!("chest and village items kept original: {e}"));
++                }
++            }
++        }
++        let c = &mut system.rando.chests;
++        c.run = active;
++        c.table = table;
++    }
++    let mut want = system.rando.chests.table.is_some();
++    if want && system.recompiled.as_ref().is_some_and(|lib| !lib.checks_itself()) {
++        // the recompiled code (an older 3dsrecomp) cannot tell a changed function: it would
++        // run the original code anyway, so the word is not changed at all
++        if !system.rando.chests.noted {
++            system.rando.chests.noted = true;
++            log::warn!("fates_rando: chest and village items need the game recompiled again (its code cannot tell a \
++                        changed function); chests give their original items");
++        }
++        want = false;
++    }
++    // read through the plain page read (no cpu-side bookkeeping): with the row off this is the
++    // only thing the hook does, so the game runs exactly as without it
++    let Some(now) = Guest::r32(&mut system.memory, ITEM_GAIN) else { return };
++    match word_to_write(want, now) {
++        Some(word) => {
++            system.memory.write32_privileged(ITEM_GAIN, word);
++            log::info!("fates_rando: chest hook {}", if word == TRAP_WORD { "on" } else { "off (the original word back)" });
++        }
++        None if want && now != TRAP_WORD && !system.rando.chests.noted => {
++            system.rando.chests.noted = true;
++            log::warn!("fates_rando: ItemGain's first word is 0x{now:08X}, not the original's; the chest hook stays off");
++        }
++        None => {}
++    }
++    let Some(now) = Guest::r32(&mut system.memory, ITEM_GAIN) else { return };
++    if now != system.rando.chests.lib_word.unwrap_or(ORIGINAL_WORD) {
++        if let Some(lib) = system.recompiled.as_mut() {
++            if lib.checks_itself() {
++                let stale = lib.check(&mut system.memory);
++                log::info!("fates_rando: chest hook: the recompiled code checked again, {stale} functions run in the interpreter");
++            }
++        }
++        system.rando.chests.lib_word = Some(now);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++        }
++    }
++
++    const GD_FILE: u32 = 0x3000_0000;
++    const GD: u32 = GD_FILE + 32;
++    const SCRIPT: u32 = 0x3400_0000;
++
++    // made-up labels (ASCII; the real ones are cp932 bytes, the hook only compares bytes)
++    const LIST: &str = "fates-rando-chests 1\nseed c71\n\
++c A007 4949445f41 4949445f42 100\n\
++c A007 4949445f43 4949445f44 110\n\
++c X001 4949445f41 4949445f44 110\n\
++end 3\n";
++
++    /// GameData loaded ("IID_B" at +0x100, "IID_D" at +0x110), placement file `dispos`,
++    /// GameUserData's chapter `cid`, and the script's string "IID_A" / "IID_C" / "IID_E".
++    fn game(dispos: &str, cid: Option<&str>) -> Fake {
++        let mut m = Fake::default();
++        let mut gd = vec![0u8; 0x200];
++        gd[32 + 0x100..32 + 0x106].copy_from_slice(b"IID_B\0");
++        gd[32 + 0x110..32 + 0x116].copy_from_slice(b"IID_D\0");
++        m.put(GD_FILE, &gd);
++        let mut arch = vec![0u8; 8];
++        arch[4..8].copy_from_slice(&0x2000_0100u32.to_le_bytes());
++        m.put(0x2000_0000, &arch);
++        let mut x = vec![0u8; 120];
++        x[112..116].copy_from_slice(&GD_FILE.to_le_bytes());
++        m.put(0x2000_0100, &x);
++        m.put(fates_rando::GAMEDATA_ARCHIVE, &0x2000_0000u32.to_le_bytes());
++        // the placement object: name at +0, ArchiveFile at +16 (a dummy archive)
++        let mut darch = vec![0u8; 8];
++        darch[4..8].copy_from_slice(&0x2100_0100u32.to_le_bytes());
++        m.put(0x2100_0000, &darch);
++        let mut dx = vec![0u8; 120];
++        dx[112..116].copy_from_slice(&0x3800_0000u32.to_le_bytes());
++        m.put(0x2100_0100, &dx);
++        m.put(0x3800_0000, &[0u8; 64]);
++        let mut obj = vec![0u8; 24];
++        obj[..dispos.len()].copy_from_slice(dispos.as_bytes());
++        obj[16..20].copy_from_slice(&0x2100_0000u32.to_le_bytes());
++        m.put(0x2200_0000, &obj);
++        m.put(fates_rando::DISPOS_OBJECT, &0x2200_0000u32.to_le_bytes());
++        // GameUserData -> +0xC the chapter row -> +0 its "CID_xxxx" string
++        if let Some(cid) = cid {
++            let mut gud = vec![0u8; 0x40];
++            gud[0xC..0x10].copy_from_slice(&0x2400_0000u32.to_le_bytes());
++            m.put(0x2300_0000, &gud);
++            m.put(0x2400_0000, &0x2500_0000u32.to_le_bytes());
++            let mut s = cid.as_bytes().to_vec();
++            s.push(0);
++            m.put(0x2500_0000, &s);
++            m.put(crate::fates_nuzlocke::GAME_USER_DATA, &0x2300_0000u32.to_le_bytes());
++        }
++        m.put(SCRIPT, b"IID_A\0IID_C\0IID_E\0");
++        m
++    }
++
++    #[test]
++    fn the_list_is_read_whole_or_refused() {
++        let t = Table::parse(LIST).unwrap();
++        assert_eq!(t.seed, "c71");
++        assert_eq!(t.entries.len(), 3);
++        assert_eq!(t.entries[0], Entry { chapter: "A007".into(), orig: b"IID_A".to_vec(), new: b"IID_B".to_vec(), new_at: 0x100 });
++        assert_eq!(t.find("X001", b"IID_A").map(|e| e.new_at), Some(0x110));
++        assert!(t.find("A008", b"IID_A").is_none());
++        // no end line, a wrong count, a bad chapter, an odd hex, a twice-listed item, another format
++        assert!(Table::parse(&LIST.replace("end 3\n", "")).is_err());
++        assert!(Table::parse(&LIST.replace("end 3", "end 2")).is_err());
++        assert!(Table::parse(&LIST.replace("c X001", "c x001")).is_err());
++        assert!(Table::parse(&LIST.replace("4949445f43 ", "4949445f4 ")).is_err());
++        assert!(Table::parse(&LIST.replace("c X001", "c A007")).is_err());
++        assert!(Table::parse(&LIST.replace("chests 1", "chests 2")).is_err());
++        assert!(Table::parse(&format!("{LIST}c A009 41 42 1\n")).is_err());
++        // an empty list is a list (the hook then stays off)
++        assert_eq!(Table::parse("fates-rando-chests 1\nseed s\nend 0\n").unwrap().entries.len(), 0);
++    }
++
++    #[test]
++    fn no_file_means_off() {
++        let dir = std::env::temp_dir().join(format!("fef-chests-test-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        assert!(read_table(&dir).is_none());
++        std::fs::write(dir.join(FILE), LIST).unwrap();
++        assert_eq!(read_table(&dir).unwrap().unwrap().entries.len(), 3);
++        std::fs::write(dir.join(FILE), "fates-rando-chests 1\nseed s\n").unwrap();
++        assert!(read_table(&dir).unwrap().is_err());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn the_word_follows_the_list_and_leaves_a_stranger_alone() {
++        assert_eq!(word_to_write(true, ORIGINAL_WORD), Some(TRAP_WORD));
++        assert_eq!(word_to_write(false, TRAP_WORD), Some(ORIGINAL_WORD));
++        assert_eq!(word_to_write(true, TRAP_WORD), None);
++        assert_eq!(word_to_write(false, ORIGINAL_WORD), None, "off: the original word is never written");
++        assert_eq!(word_to_write(true, 0xE1A0_0000), None);
++        assert_eq!(word_to_write(false, 0xE1A0_0000), None);
++        assert_eq!(TRAP_WORD, 0xEFFE_C001);
++        assert!(SVC_NUMBER > 0xFF, "no kernel call has this number");
++    }
++
++    #[test]
++    fn the_replaced_push_stores_r3_to_r7_and_lr() {
++        let mut regs = [0u32; 16];
++        for (i, r) in regs.iter_mut().enumerate() {
++            *r = 0x100 + i as u32;
++        }
++        regs[13] = 0x0FFF_FF00;
++        let (sp, words) = push_words(ORIGINAL_WORD, &regs).unwrap();
++        assert_eq!(sp, 0x0FFF_FF00 - 24);
++        assert_eq!(words, vec![(sp, 0x103), (sp + 4, 0x104), (sp + 8, 0x105), (sp + 12, 0x106), (sp + 16, 0x107),
++                               (sp + 20, 0x10E)]);
++        assert!(push_words(0xE1A0_5000, &regs).is_none(), "only an stmdb sp! is done by the hook");
++    }
++
++    #[test]
++    fn a_listed_gift_of_the_chapter_being_played_is_swapped() {
++        let t = Table::parse(LIST).unwrap();
++        let mut m = game("A007", Some("CID_A007"));
++        assert_eq!(swap(&t, &mut m, SCRIPT), Ok(Some((GD + 0x100, "A007".to_string()))));
++        assert_eq!(swap(&t, &mut m, SCRIPT + 6), Ok(Some((GD + 0x110, "A007".to_string()))));
++        assert_eq!(swap(&t, &mut m, SCRIPT + 12), Ok(None), "an item not in the list");
++        // the same item in a paralogue has its own entry
++        let mut x = game("X001", Some("CID_X001"));
++        assert_eq!(swap(&t, &mut x, SCRIPT), Ok(Some((GD + 0x110, "X001".to_string()))));
++    }
++
++    #[test]
++    fn another_chapter_or_a_disagreeing_game_leaves_the_gift() {
++        let t = Table::parse(LIST).unwrap();
++        assert_eq!(swap(&t, &mut game("A008", Some("CID_A008")), SCRIPT), Ok(None));
++        assert_eq!(swap(&t, &mut game("Z000", Some("CID_A007")), SCRIPT), Ok(None), "My Castle's map");
++        assert_eq!(swap(&t, &mut game("A007", Some("CID_A008")), SCRIPT), Ok(None), "the next chapter's opening");
++        // GameUserData not readable: the placement file alone decides
++        assert_eq!(swap(&t, &mut game("A007", None), SCRIPT), Ok(Some((GD + 0x100, "A007".to_string()))));
++        // nothing readable at r2
++        assert_eq!(swap(&t, &mut game("A007", Some("CID_A007")), 0x5000_0000), Ok(None));
++    }
++
++    #[test]
++    fn a_label_that_is_not_where_the_list_says_gives_the_original() {
++        let t = Table::parse(&LIST.replace("4949445f42 100", "4949445f42 110")).unwrap();
++        let mut m = game("A007", Some("CID_A007"));
++        assert!(swap(&t, &mut m, SCRIPT).is_err());
++    }
++
++    #[test]
++    fn chapter_keys() {
++        assert_eq!(chapter_key("A007").as_deref(), Some("A007"));
++        assert_eq!(chapter_key("x001").as_deref(), Some("X001"));
++        assert_eq!(chapter_key("R013_extra").as_deref(), Some("R013"));
++        assert_eq!(chapter_key("?"), None);
++        assert_eq!(chapter_key("A0"), None);
++    }
++}
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index fcfe1e9..481c277 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -96,6 +96,9 @@ pub struct Session {
+     pub notices: Vec<String>,
+     /// engine round E2: the active Nuzlocke game (its run was made with Nuzlocke on), or None
+     pub nuz: Option<crate::fates_nuzlocke::Nuz>,
++    /// round 71: the chest hook (chests, villages and talk gifts; `fates_rando_chests`): the
++    /// active run's chest list and the word at ev::ItemGain
++    pub chests: crate::fates_rando_chests::Chests,
+ }
+ 
+ /// round 61: the run a PLAY RANDOMIZED profile with Nuzlocke on keeps in its own data folder
+@@ -462,6 +465,9 @@ pub fn after_frame(system: &mut System) {
+         return;
+     }
+     after_frame_inner(system);
++    // round 71: the chest hook follows the active run's chest list (nothing without one)
++    let data = data_dir(system);
++    crate::fates_rando_chests::frame(system, &data);
+     // engine round E2: the active Nuzlocke game's frame (nothing without one); round 61: while
+     // the unit pool holds a player army (`fates_nuzlocke::in_game`), not GameConfigData +0xB
+     if let Some(n) = system.rando.nuz.as_mut() {
+@@ -1225,7 +1231,8 @@ fn make_run_inner(data: &Path, id: &str, seed: &str, answer: &str, game: Option<
+     let mut keep = vec![(options.clone(), "options.json".to_string())];
+     let mut found = HashMap::new();
+     find_files(&out, &mut found, 3);
+-    for name in ["spoiler.txt", "plan.json"] {
++    // round 71: the chest list (chests.txt, only with Chest and village items on) the chest hook reads
++    for name in ["spoiler.txt", "plan.json", crate::fates_rando_chests::FILE] {
+         if let Some(p) = found.get(name) {
+             keep.push((p.clone(), name.to_string()));
+         }
+diff --git a/crates/zakuro-core/src/kernel/svc.rs b/crates/zakuro-core/src/kernel/svc.rs
+index 80fe1d0..ab085b5 100644
+--- a/crates/zakuro-core/src/kernel/svc.rs
++++ b/crates/zakuro-core/src/kernel/svc.rs
+@@ -103,6 +103,9 @@ pub fn dispatch(system: &mut System, number: u32) {
+         0x54..=0x56 => {
+             system.cpu.regs[0] = 0;
+         }
++        // Fire Emblem Fates' randomizer: the chest hook's svc at ev::ItemGain (round 71;
++        // only while a run with a chest list is active, else that word is the original's)
++        crate::fates_rando_chests::SVC_NUMBER if crate::fates_rando_chests::on_svc(system) => {}
+         _ => {
+             log::warn!(
+                 "unimplemented svc 0x{number:02X} at 0x{:08X} (r0={:08X} r1={:08X} r2={:08X} r3={:08X})",
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 52e171c..3b6b0bb 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -7,6 +7,7 @@ pub mod enhancements;
+ pub mod fates_growth_view;
+ pub mod fates_nuzlocke;
+ pub mod fates_rando;
++pub mod fates_rando_chests;
+ pub mod fates_rando_file;
+ pub mod fates_rando_session;
+ pub mod game_ui;
+-- 
+2.55.0.windows.5
+

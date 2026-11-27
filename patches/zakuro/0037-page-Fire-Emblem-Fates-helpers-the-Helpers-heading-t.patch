@@ -1,0 +1,989 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 18:50:32 -0500
+Subject: [PATCH 37/38] page: Fire Emblem Fates helpers: the Helpers heading,
+ the True hit row and the enemy-turn help line
+
+Round 80 (docs/ROUND80_PLAN.md A1, build/r80/home/HOME_DESIGN.md; the owner's
+pick F-057, run on the standing OK F-059 (3)). The row words are Grok's
+(docs/collab/ROUND80_HELPERS_GROK.md).
+
+Storage: a top-level `fates_helpers` field in Zakuro's Settings, written as a
+`[fates_helpers]` table in settings.toml (enemy_phase = "normal" | "2x" | "4x",
+true_hit = false | true). skip_serializing_if = is_default: at the defaults
+nothing is written, so an untouched settings file stays byte for byte what it
+was; or_default: a value this build does not know (say "8x") gives the defaults
+for the table and keeps every other setting. Not per game (GameSettings): the
+"Follow the general settings" button leaves it, has_own() stays false, and
+split_for_save keeps it in the shared file, so Fire Emblem Fates and Seal of
+Flames share one choice. Never a randomizer row: no seed, answer, run id or
+share code changes.
+
+Core: new zakuro-core fates_helpers.rs (plain data: Helpers { enemy_phase,
+true_hit }, EnemyPhase Normal / X2 / X4 with factor() 1 / 2 / 4, name(), key()).
+System keeps the rows the frontend hands over (set_helpers, at game start in
+start_game and on every apply_settings); System::helpers() returns them for
+Fire Emblem Fates' title id 0004000000179800 (Seal of Flames shares it) and the
+defaults for every other title. The getters the enemy-phase pacing and the
+True hit painter read: System::helpers().enemy_phase().factor() and
+System::helpers().true_hit(). Nothing here reads or writes guest memory; with
+the defaults nothing acts at all.
+
+Paused window: under the Randomizer button, with the same Fates-title gate but
+not hidden by rando_blocked, menus::helper_rows draws the heading "Helpers",
+"Enemy phase [Normal][2x][4x]", "True hit [Off][On]" (one hover sentence each)
+and the help line "The game's own Options line 6 (Off, Move, or All) and the
+Start key still skip the enemy turn. These rows do not change that." A change
+pushes Action::Settings (save + apply_settings), as the Settings window does.
+The Paused window gets .vscroll(true) and a max height of the screen less 16
+px, so it scrolls in a short window (800 x 480) instead of running past its
+bottom; that is a visible change for every game's Paused window. Its egui id
+is set to "Paused" explicitly (the same name it had).
+
+Page robot (FEF_PAGEBOT, headless only): {"esc": "paused"} draws the Helpers
+rows into the robot's windowless context and holds the game while open (as the
+Esc menu does); their targets are helpers:section,
+helpers:opt:enemy_phase=<normal|2x|4x>, helpers:opt:true_hit=<off|on>; a click
+that changes a row runs apply_settings (the run's own APPDATA);
+{"expect_settings": {...}} reads the [fates_helpers] table back from
+settings::path() (now pub). frame() stays for the tests; the program calls
+frame_with.
+
+Tests (cargo test --lib): settings U1 untouched_settings_write_no_helpers_table,
+U2 helpers_round_trip, U3 a_bad_helper_value_keeps_the_rest, U4
+an_older_file_has_the_default_helpers, U5
+follow_the_general_settings_leaves_the_helpers; game_pick U6
+seal_and_fates_share_the_helpers; menus U7 helper_rows_show_only_for_fates, U8
+clicking_true_hit_saves, U9 the_paused_window_fits_a_short_screen (800 x 480 and
+800 x 360, Fates and another game), the_helper_words_say_what_the_plan_asks;
+pagebot the_robot_sets_the_helpers_and_reads_them_back; core fates_helpers
+the_defaults_are_todays_game, the_factors_and_words. zakuro 130 passed,
+zakuro-core 232, zakuro-fs 23.
+
+Round 80 repair (B2, 2026-11-25), the plan's cut 3: robot proof E2 found
+that 2x / 4x pacing (the former patch 0038, not in the series any more)
+could not reach the plan's time goal (4x took 0.82 of Normal's time, 2x
+0.88) while every fight and turn banner stays at normal speed. So the
+Paused window has no Enemy phase row: menus::helper_rows draws the heading,
+"True hit [Off][On]" and the help line "Faster enemy turns: use the game's
+own Options line 6 (Off, Move, or All), or press the Start key during the
+enemy turn. Units, HP and hits stay the same, but later enemy moves can
+differ, as when you take more or less time on your turn." (robot proof E1,
+R4: units, HP and the fight dice were equal after Move / All / Start, the
+general random generator was not). The page robot's targets are
+helpers:section and helpers:opt:true_hit=<off|on>. The enemy_phase field
+stays in the [fates_helpers] table (read and written as before, written
+"normal" beside true_hit when True hit is On) and nothing reads it.
+---
+ crates/zakuro-core/src/fates_helpers.rs | 116 +++++++++++++++++
+ crates/zakuro-core/src/lib.rs           |  24 ++++
+ crates/zakuro/src/game_pick.rs          |  21 +++
+ crates/zakuro/src/lib.rs                |  18 ++-
+ crates/zakuro/src/menus.rs              | 160 +++++++++++++++++++++++
+ crates/zakuro/src/pagebot.rs            | 166 ++++++++++++++++++++++--
+ crates/zakuro/src/settings.rs           |  87 ++++++++++++-
+ 7 files changed, 577 insertions(+), 15 deletions(-)
+ create mode 100644 crates/zakuro-core/src/fates_helpers.rs
+
+diff --git a/crates/zakuro-core/src/fates_helpers.rs b/crates/zakuro-core/src/fates_helpers.rs
+new file mode 100644
+index 0000000..c27a74f
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_helpers.rs
+@@ -0,0 +1,116 @@
++//! Fire Emblem Fates: the Helpers (round 80, owner pick F-057): two comfort rows under the Esc
++//! window's Randomizer button, kept in Zakuro's settings.toml as a `[fates_helpers]` table.
++//!
++//! The getters the other parts call (their names are fixed here):
++//! - `System::helpers()` -> [`Helpers`]: the rows in force for the running game; the defaults
++//!   (Normal, Off) for any title that is not Fire Emblem Fates (Seal of Flames shares its title id).
++//! - [`Helpers::enemy_phase()`] -> [`EnemyPhase`] (Normal / X2 / X4) and
++//!   [`EnemyPhase::factor()`] -> 1, 2 or 4 (the enemy-phase pacing reads it, round 80 A2).
++//! - [`Helpers::true_hit()`] -> bool (the forecast's real-chance painter reads it, round 80 A3).
++//! - `System::set_helpers(Helpers)`: the frontend hands the rows over at game start and on every
++//!   settings change (`apply_settings`).
++//!
++//! The defaults are today's game: with Normal and Off nothing reads guest memory for these rows
++//! and nothing changes. Neither row is ever a randomizer input, so no seed or share code moves.
++//! True hit only paints the host's copy of the screen; the enemy-phase pacing only runs more
++//! emulated frames per real second. Neither writes guest memory. The game's own enemy-phase
++//! option (its Options line 6, Off / Move / All) and the Start key are left as they are.
++//!
++//! Round 80 cut 3 (docs/ROUND80_PLAN.md; robot proof E2 found the 2x / 4x pacing could not reach
++//! its time goal while every fight and turn banner stays at normal speed): the Esc window has no
++//! Enemy phase row and nothing in this build reads [`Helpers::enemy_phase()`]. The field stays in
++//! the `[fates_helpers]` table (read and written as before) so a later round can bring the row
++//! back without a new file format.
++
++use serde::{Deserialize, Serialize};
++
++/// how fast the enemy turn plays (the Esc window's "Enemy phase" row).
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
++pub enum EnemyPhase {
++    /// today's game, the default.
++    #[default]
++    #[serde(rename = "normal")]
++    Normal,
++    #[serde(rename = "2x")]
++    X2,
++    #[serde(rename = "4x")]
++    X4,
++}
++
++impl EnemyPhase {
++    pub const ALL: [EnemyPhase; 3] = [EnemyPhase::Normal, EnemyPhase::X2, EnemyPhase::X4];
++
++    /// emulated frames per screen frame while the enemy phase may run fast: 1, 2 or 4.
++    pub fn factor(self) -> u32 {
++        match self {
++            EnemyPhase::Normal => 1,
++            EnemyPhase::X2 => 2,
++            EnemyPhase::X4 => 4,
++        }
++    }
++
++    /// the word the row shows.
++    pub fn name(self) -> &'static str {
++        match self {
++            EnemyPhase::Normal => "Normal",
++            EnemyPhase::X2 => "2x",
++            EnemyPhase::X4 => "4x",
++        }
++    }
++
++    /// the value written in settings.toml (and in the page robot's target names).
++    pub fn key(self) -> &'static str {
++        match self {
++            EnemyPhase::Normal => "normal",
++            EnemyPhase::X2 => "2x",
++            EnemyPhase::X4 => "4x",
++        }
++    }
++}
++
++/// the Helpers rows. `Default` (Normal, Off) is today's game and is never written to the file.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Helpers {
++    pub enemy_phase: EnemyPhase,
++    pub true_hit: bool,
++}
++
++impl Helpers {
++    /// the "Enemy phase" row.
++    pub fn enemy_phase(&self) -> EnemyPhase {
++        self.enemy_phase
++    }
++
++    /// the "True hit" row: the forecast also shows the real chance to hit.
++    pub fn true_hit(&self) -> bool {
++        self.true_hit
++    }
++
++    /// both rows at today's game.
++    pub fn is_default(&self) -> bool {
++        *self == Helpers::default()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_defaults_are_todays_game() {
++        let helpers = Helpers::default();
++        assert_eq!(helpers.enemy_phase(), EnemyPhase::Normal);
++        assert_eq!(helpers.enemy_phase().factor(), 1);
++        assert!(!helpers.true_hit());
++        assert!(helpers.is_default());
++    }
++
++    #[test]
++    fn the_factors_and_words() {
++        let got: Vec<_> = EnemyPhase::ALL.iter().map(|p| (p.factor(), p.name(), p.key())).collect();
++        assert_eq!(got, [(1, "Normal", "normal"), (2, "2x", "2x"), (4, "4x", "4x")]);
++        assert!(!Helpers { enemy_phase: EnemyPhase::X4, true_hit: false }.is_default());
++        assert!(!Helpers { enemy_phase: EnemyPhase::Normal, true_hit: true }.is_default());
++    }
++}
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 2d14d63..07c788d 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -5,6 +5,7 @@ pub mod camera;
+ pub mod cheats;
+ pub mod enhancements;
+ pub mod fates_growth_view;
++pub mod fates_helpers;
+ pub mod fates_nuzlocke;
+ pub mod fates_rando;
+ pub mod fates_rando_chests;
+@@ -263,6 +264,9 @@ pub struct System {
+     /// Fire Emblem Fates' growth view on the unit panel (round 62, fates_growth_view): reads
+     /// only; Select and its button are kept from the game only while the panel is shown.
+     pub growth: fates_growth_view::GrowthView,
++    /// Fire Emblem Fates' Helpers (round 80, fates_helpers): the Esc window's Enemy phase and
++    /// True hit rows, handed over by the frontend; read through `helpers()`.
++    helpers: fates_helpers::Helpers,
+ }
+ 
+ /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
+@@ -344,6 +348,7 @@ impl System {
+             recompiled_instructions: 0,
+             rando: fates_rando_session::Session::default(),
+             growth: fates_growth_view::GrowthView::default(),
++            helpers: fates_helpers::Helpers::default(),
+         }
+     }
+ 
+@@ -982,6 +987,25 @@ impl System {
+         self.is_fates_title() && self.growth.toggle(&mut self.memory)
+     }
+ 
++    /// round 80: the Helpers rows (fates_helpers) the frontend's settings hold; kept as given,
++    /// they act only for Fire Emblem Fates' title id.
++    pub fn set_helpers(&mut self, helpers: fates_helpers::Helpers) {
++        if self.helpers != helpers {
++            log::info!(target: "zakuro::fates_helpers", "helpers: enemy phase {}, true hit {}", helpers.enemy_phase.key(), if helpers.true_hit { "on" } else { "off" });
++        }
++        self.helpers = helpers;
++    }
++
++    /// round 80: the Helpers rows in force: the frontend's for Fire Emblem Fates (and Seal of
++    /// Flames, on its title id), the defaults (today's game) for every other title.
++    pub fn helpers(&self) -> fates_helpers::Helpers {
++        if self.is_fates_title() {
++            self.helpers
++        } else {
++            fates_helpers::Helpers::default()
++        }
++    }
++
+     // -- GPU plumbing -------------------------------------------------------
+ 
+     pub fn gpu_read_register(&mut self, offset: u32) -> u32 {
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+index 0275d05..bf05511 100644
+--- a/crates/zakuro/src/game_pick.rs
++++ b/crates/zakuro/src/game_pick.rs
+@@ -640,6 +640,27 @@ mod tests {
+         assert_eq!(toml::to_string_pretty(&fates_again).unwrap(), toml::to_string_pretty(&shared).unwrap());
+     }
+ 
++    /// round 80, U6: the Helpers are one choice for Fire Emblem Fates and Seal of Flames: a
++    /// change made while Seal plays lands in the owner's shared settings.toml, never in Seal's
++    /// game bits.
++    #[test]
++    fn seal_and_fates_share_the_helpers() {
++        use zakuro_core::fates_helpers::{EnemyPhase, Helpers};
++        let mut settings = Settings::first_run();
++        let owner = take_bits(&settings);
++        let seal = owner.clone();
++        put_bits(&mut settings, seal);
++        settings.fates_helpers = Helpers { enemy_phase: EnemyPhase::X4, true_hit: true };
++        let (shared, seal_now) = split_for_save(&settings, &owner);
++        assert_eq!(shared.fates_helpers, settings.fates_helpers);
++        let bits = toml::to_string_pretty(&SealFile { format: 1, bits: seal_now.clone() }).unwrap();
++        assert!(!bits.contains("fates_helpers") && !bits.contains("enemy_phase"), "{bits}");
++        // back on Fire Emblem Fates the owner's bits return, the helpers stay
++        let mut fates_again = shared.clone();
++        put_bits(&mut fates_again, owner.clone());
++        assert_eq!(fates_again.fates_helpers, Helpers { enemy_phase: EnemyPhase::X4, true_hit: true });
++    }
++
+     #[test]
+     fn seal_of_flames_game_settings_round_trip_and_start_from_the_first_run_picks() {
+         let dir = scratch("bits");
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 75c9380..c83e3d0 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -920,6 +920,8 @@ impl App {
+             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+             .unwrap_or_default();
+         let mut game = Running::new(system, path.to_owned(), name);
++        // round 80: Fire Emblem Fates' Helpers (the settings' [fates_helpers]; the defaults are today's game)
++        game.system.set_helpers(self.settings.fates_helpers);
+         game.replay = replay;
+         if let Some(record) = record {
+             match zakuro_core::replay::Recorder::create(&record, clock) {
+@@ -1371,13 +1373,19 @@ impl App {
+         let mut frames = 0u64;
+         loop {
+             let Some(mut bot) = self.pagebot.take() else { return true };
+-            let actions = bot.frame(&mut self.menus.rando, data.as_deref(), ran);
++            let (actions, helpers_changed) = bot.frame_with(&mut self.menus.rando, data.as_deref(), ran, Some(&mut self.settings.fates_helpers));
+             let finished = bot.finished();
++            let helpers_open = bot.helpers_open();
+             self.pagebot = Some(bot);
+             self.rando(actions);
++            // round 80: a Helpers row changed: saved and handed to the game as the Paused window does
++            if helpers_changed {
++                self.apply_settings();
++            }
+             // round 71: the Esc Randomizer window opened by the script holds the game too (as
+-            // the Esc menu does with a window) until the script closes it or ends
+-            if !self.menus.rando.new_game && (!self.menus.rando.this_run_open || finished) {
++            // the Esc menu does with a window) until the script closes it or ends; round 80: so
++            // do the Helpers rows
++            if !self.menus.rando.new_game && (!(self.menus.rando.this_run_open || helpers_open) || finished) {
+                 break;
+             }
+             frames += 1;
+@@ -1734,6 +1742,8 @@ impl App {
+             if game.system.config.slider_3d != slider {
+                 game.system.set_slider_3d(slider);
+             }
++            // round 80: Fire Emblem Fates' Helpers act from the next frame on
++            game.system.set_helpers(self.settings.fates_helpers);
+         }
+         self.apply_camera();
+         self.keyboard.set_keys(self.settings.keys.clone());
+@@ -2560,7 +2570,7 @@ impl App {
+         let overlay = gui.frame(window, |ui| {
+             match &game {
+                 Some((name, fps, recompiled)) => {
+-                    actions.extend(menus.game(ui, name, program_id, show_fps.then_some(*fps), *recompiled, fast, jobs, waiting.len(), saved.as_deref()));
++                    actions.extend(menus.game(ui, name, program_id, show_fps.then_some(*fps), *recompiled, fast, jobs, waiting.len(), saved.as_deref(), &mut settings.fates_helpers));
+                     if let Some(text) = &corner {
+                         menus::corner(ui.ctx(), text);
+                     }
+diff --git a/crates/zakuro/src/menus.rs b/crates/zakuro/src/menus.rs
+index b430dae..e9db354 100644
+--- a/crates/zakuro/src/menus.rs
++++ b/crates/zakuro/src/menus.rs
+@@ -6,6 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
+ 
+ use egui::{Align, Color32, Layout, RichText, Vec2};
+ use winit::keyboard::KeyCode;
++use zakuro_core::fates_helpers::Helpers;
+ use zakuro_core::services::keyboard::Request;
+ 
+ use crate::library::{Game, Library, ICON_SIZE};
+@@ -115,6 +116,8 @@ pub struct Menus {
+     pub switch_game: Option<(crate::game_pick::Game, Option<String>)>,
+     /// the game playing is the fan mod Seal of Flames: its credit under its name.
+     pub seal_playing: bool,
++    /// round 80: where the Helpers rows' controls were drawn this frame (none when not drawn).
++    pub helper_targets: Vec<(String, egui::Rect)>,
+ }
+ 
+ /// the room the player is in, as the multiplayer window shows it.
+@@ -417,6 +420,7 @@ impl Menus {
+         jobs: &[Job],
+         waiting: usize,
+         saved: Option<&str>,
++        helpers: &mut Helpers,
+     ) -> Vec<Action> {
+         let mut actions = Vec::new();
+         let ctx = ui.ctx().clone();
+@@ -453,12 +457,19 @@ impl Menus {
+                 });
+             });
+         }
++        self.helper_targets.clear();
+         if !self.menu_open {
+             return actions;
+         }
++        // round 80: it scrolls inside a short screen instead of running past its bottom (the
++        // Helpers rows made it taller; every game's Paused window gets this)
++        let room = ctx.content_rect().height() - 16.0;
+         egui::Window::new("Paused")
++            .id(egui::Id::new("Paused"))
+             .collapsible(false)
+             .resizable(false)
++            .vscroll(true)
++            .max_height(room)
+             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+             .show(&ctx, |ui| {
+                 ui.label(RichText::new(if self.seal_playing { crate::game_pick::SEAL_NAME } else { name }).strong());
+@@ -517,6 +528,10 @@ impl Menus {
+                 if program_id == Some(crate::rando_page::FATES) && !self.rando_blocked && wide(ui, "Randomizer") {
+                     self.rando.this_run_open = true;
+                 }
++                // round 80: Fire Emblem Fates' Helpers (not the randomizer: never hidden with it)
++                if program_id == Some(crate::rando_page::FATES) && helper_rows(ui, helpers, &mut self.helper_targets) {
++                    actions.push(Action::Settings);
++                }
+                 if wide(ui, "Multiplayer") {
+                     self.multiplayer_open = true;
+                 }
+@@ -1195,6 +1210,41 @@ fn code(ui: &mut egui::Ui, recompiled: &mut bool) {
+ }
+ 
+ /// a line a GameOverlay keeps over the game, in the bottom right corner.
++/// round 80: the Helpers rows' words (Grok's, docs/collab/ROUND80_HELPERS_GROK.md).
++pub const HELPERS_HEADING: &str = "Helpers";
++pub const TRUE_HIT_HELP: &str = "Also shows the real chance to hit, such as 70 (real 79). It never changes a roll.";
++/// round 80 cut 3 (docs/ROUND80_PLAN.md): no 2x / 4x row; the line points at the game's own
++/// enemy-turn skip, with what robot proof E1 (R4) found about it.
++pub const HELPERS_LINE: &str = "Faster enemy turns: use the game's own Options line 6 (Off, Move, or All), or press the Start key during the enemy turn. Units, HP and hits stay the same, but later enemy moves can differ, as when you take more or less time on your turn.";
++
++/// round 80: Fire Emblem Fates' Helpers in the Paused window, under the Randomizer button: the
++/// heading, the True hit row and the help line (the Enemy phase row was cut, round 80 cut 3:
++/// the line points at the game's own skip). Each control reports where it is drawn
++/// (`helpers:section`, `helpers:opt:true_hit=<off|on>`), for the page robot. True when a row changed (the caller
++/// saves the settings and hands them to the game).
++pub fn helper_rows(ui: &mut egui::Ui, helpers: &mut Helpers, targets: &mut Vec<(String, egui::Rect)>) -> bool {
++    let before = *helpers;
++    ui.add_space(4.0);
++    let heading = ui.label(RichText::new(HELPERS_HEADING).strong().color(Color32::from_rgb(150, 200, 255)));
++    targets.push(("helpers:section".to_owned(), heading.rect));
++    egui::Grid::new("fates helpers").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
++        ui.label("True hit").on_hover_text(TRUE_HIT_HELP);
++        ui.horizontal(|ui| {
++            let off = ui.selectable_value(&mut helpers.true_hit, false, "Off").on_hover_text(TRUE_HIT_HELP);
++            targets.push(("helpers:opt:true_hit=off".to_owned(), off.rect));
++            let on = ui.selectable_value(&mut helpers.true_hit, true, "On").on_hover_text(TRUE_HIT_HELP);
++            targets.push(("helpers:opt:true_hit=on".to_owned(), on.rect));
++        });
++        ui.end_row();
++    });
++    ui.scope(|ui| {
++        ui.set_max_width(210.0);
++        ui.label(RichText::new(HELPERS_LINE).weak().small());
++    });
++    ui.add_space(4.0);
++    *helpers != before
++}
++
+ pub fn corner(ctx: &egui::Context, text: &str) {
+     egui::Area::new(egui::Id::new("overlay corner"))
+         .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-8.0, -8.0))
+@@ -1391,6 +1441,116 @@ mod tests {
+         assert_eq!(ids(idle(games(), std::slice::from_ref(&job), &[])), [1, 2, 3]);
+     }
+ 
++    // round 80: the Helpers rows (U7-U9; HOME_DESIGN 3)
++
++    /// one frame of the Paused window over a game, with a click at `click` when given.
++    fn paused_frame(ctx: &egui::Context, menus: &mut Menus, program_id: u64, helpers: &mut Helpers, screen: Vec2, click: Option<egui::Pos2>) -> Vec<Action> {
++        let mut events = Vec::new();
++        if let Some(at) = click {
++            let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
++            events.extend([egui::Event::PointerMoved(at), press(true), press(false)]);
++        }
++        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), events, ..Default::default() };
++        let mut actions = Vec::new();
++        ctx.run_ui(input, |ui| {
++            actions = menus.game(ui, "A game", Some(program_id), None, false, false, &[], 0, None, helpers);
++        })
++        .drop_without_applying_deltas();
++        actions
++    }
++
++    /// U7: the heading and its rows show for Fire Emblem Fates' title id (Seal of Flames shares
++    /// it), and for no other game.
++    #[test]
++    fn helper_rows_show_only_for_fates() {
++        let screen = Vec2::new(800.0, 480.0);
++        for (program_id, shown) in [(crate::rando_page::FATES, true), (0x0004_0000_000A_0500, false)] {
++            let ctx = egui::Context::default();
++            let mut menus = Menus { menu_open: true, ..Menus::default() };
++            let mut helpers = Helpers::default();
++            for _ in 0..3 {
++                let actions = paused_frame(&ctx, &mut menus, program_id, &mut helpers, screen, None);
++                assert!(actions.is_empty(), "drawing alone changes nothing");
++            }
++            let names: Vec<&str> = menus.helper_targets.iter().map(|(name, _)| name.as_str()).collect();
++            if shown {
++                assert_eq!(names, [
++                    "helpers:section", "helpers:opt:true_hit=off", "helpers:opt:true_hit=on"
++                ]);
++            } else {
++                assert!(names.is_empty(), "{names:?}");
++            }
++            assert_eq!(helpers, Helpers::default());
++        }
++        // the randomizer's block leaves the helpers (they are not the randomizer)
++        let ctx = egui::Context::default();
++        let mut menus = Menus { menu_open: true, rando_blocked: true, ..Menus::default() };
++        let mut helpers = Helpers::default();
++        paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
++        assert_eq!(menus.helper_targets.len(), 3);
++        // the menu closed: nothing drawn
++        menus.menu_open = false;
++        paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
++        assert!(menus.helper_targets.is_empty());
++    }
++
++    /// U8: a click on True hit On changes the row and asks for the settings to be saved and put
++    /// to use (Action::Settings), as the Settings window does; a click on the value already
++    /// chosen asks for nothing. (Round 80 cut 3: there is no 2x / 4x row to click.)
++    #[test]
++    fn clicking_true_hit_saves() {
++        let screen = Vec2::new(800.0, 480.0);
++        let ctx = egui::Context::default();
++        let mut menus = Menus { menu_open: true, ..Menus::default() };
++        let mut helpers = Helpers::default();
++        for _ in 0..3 {
++            paused_frame(&ctx, &mut menus, crate::rando_page::FATES, &mut helpers, screen, None);
++        }
++        let at = |menus: &Menus, name: &str| menus.helper_targets.iter().find(|(n, _)| n == name).map(|(_, r)| r.center()).unwrap();
++        let click = |menus: &mut Menus, helpers: &mut Helpers, name: &str| {
++            let pos = at(menus, name);
++            let actions = paused_frame(&ctx, menus, crate::rando_page::FATES, helpers, screen, Some(pos));
++            // and a quiet frame after it
++            paused_frame(&ctx, menus, crate::rando_page::FATES, helpers, screen, None);
++            actions.iter().filter(|a| matches!(a, Action::Settings)).count()
++        };
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=on"), 1);
++        assert_eq!(helpers, Helpers { true_hit: true, ..Helpers::default() });
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=on"), 0, "the same value again saves nothing");
++        assert_eq!(click(&mut menus, &mut helpers, "helpers:opt:true_hit=off"), 1);
++        assert!(helpers.is_default());
++    }
++
++    /// U9: with the Helpers heading the Paused window stays inside a short screen (800 x 480,
++    /// window scale 1, and 800 x 360), scrolling in it rather than running past its bottom, and
++    /// keeps its full width and a useful height. Every game's Paused window scrolls now.
++    #[test]
++    fn the_paused_window_fits_a_short_screen() {
++        for (height, program_id) in [(480.0, crate::rando_page::FATES), (360.0, crate::rando_page::FATES), (360.0, 0x0004_0000_000A_0500)] {
++            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, height));
++            let ctx = egui::Context::default();
++            let mut menus = Menus { menu_open: true, ..Menus::default() };
++            let mut helpers = Helpers::default();
++            for _ in 0..4 {
++                paused_frame(&ctx, &mut menus, program_id, &mut helpers, screen.size(), None);
++            }
++            let window = ctx.memory(|memory| memory.area_rect(egui::Id::new("Paused"))).unwrap();
++            assert!(screen.contains_rect(window), "{window:?} in {screen:?}");
++            assert!(window.width() >= 200.0 && window.height() >= height * 0.6, "{window:?}");
++            for (name, rect) in &menus.helper_targets {
++                assert!(rect.min.x >= window.min.x && rect.max.x <= window.max.x, "{name} {rect:?} in {window:?}");
++            }
++        }
++    }
++
++    #[test]
++    fn the_helper_words_say_what_the_plan_asks() {
++        assert!(HELPERS_LINE.contains("Options line 6") && HELPERS_LINE.contains("Off, Move, or All") && HELPERS_LINE.contains("Start key"));
++        // E1 (R4): the game's own skip can change later enemy turns; the line says so plainly
++        assert!(HELPERS_LINE.contains("later enemy moves can differ"));
++        assert!(TRUE_HIT_HELP.contains("70 (real 79)") && TRUE_HIT_HELP.contains("never changes a roll"));
++    }
++
+     #[test]
+     fn keys_have_short_names() {
+         assert_eq!(key_name(KeyCode::KeyX), "X");
+diff --git a/crates/zakuro/src/pagebot.rs b/crates/zakuro/src/pagebot.rs
+index fef254f..b6978b6 100644
+--- a/crates/zakuro/src/pagebot.rs
++++ b/crates/zakuro/src/pagebot.rs
+@@ -24,6 +24,15 @@
+ //! screen (the Esc window's Keep with This run full). Click events carry the code the Share
+ //! code field shows (`share`), expect events the help line's note too.
+ //!
++//! Round 80 (docs/ROUND80_PLAN.md A1): `{"esc": "paused"}` opens the Esc menu's Helpers rows
++//! (`menus::helper_rows`, the part of the Paused window under the Randomizer button), drawn into
++//! the same context; while they are open the game waits, as under the Esc menu. Their controls
++//! are clicked by their targets `helpers:opt:true_hit=<off|on>` (round 80 cut 3: no Enemy phase
++//! row, so no `helpers:opt:enemy_phase=...` target); a click that changes a row saves the settings as the Paused
++//! window does (the program's `apply_settings`, into the run's own APPDATA). `{"esc": "close"}`
++//! closes them, and `{"expect_settings": {"true_hit": true}}` checks the
++//! `[fates_helpers]` table of the settings.toml the program writes (`settings::path()`).
++//!
+ //! Nothing here runs without FEF_PAGEBOT: the program does exactly what it did before.
+ 
+ use std::io::Write;
+@@ -32,6 +41,8 @@ use std::time::Instant;
+ 
+ use serde_json::{json, Value};
+ 
++use zakuro_core::fates_helpers::Helpers;
++
+ use crate::rando_page::{PageAction, RandoPage};
+ 
+ /// page frames (at 60 a second) the page may stay open before the run gives up: 10 minutes.
+@@ -69,6 +80,12 @@ pub struct PageBot {
+     pub answered: Option<Result<Option<String>, String>>,
+     /// round 74: the text the page's last Copy put out (egui's copy command)
+     copied: Option<String>,
++    /// round 80: the Esc menu's Helpers rows are open (`{"esc": "paused"}`), where their controls
++    /// were drawn last frame, the rows as drawn, and the settings file `expect_settings` reads
++    helpers_open: bool,
++    helper_targets: Vec<(String, egui::Rect)>,
++    helpers_seen: Option<Helpers>,
++    settings_file: Option<PathBuf>,
+ }
+ 
+ impl PageBot {
+@@ -101,6 +118,10 @@ impl PageBot {
+             laid_at: None,
+             answered: None,
+             copied: None,
++            helpers_open: false,
++            helper_targets: Vec::new(),
++            helpers_seen: None,
++            settings_file: crate::settings::path(),
+         };
+         let n = bot.steps.len();
+         bot.event("hook", json!({"steps": n, "avatar_after": bot.avatar_after}));
+@@ -122,10 +143,23 @@ impl PageBot {
+         self.next >= self.steps.len()
+     }
+ 
++    /// round 80: the Esc menu's Helpers rows are open: the game waits.
++    pub fn helpers_open(&self) -> bool {
++        self.helpers_open
++    }
++
+     /// one page frame: the next script step, then the real page drawn with its events. Called
+     /// every frame, the page open or not (closed, the page only makes its early guess).
++    #[cfg(test)]
+     pub fn frame(&mut self, page: &mut RandoPage, data: Option<&Path>, game_frame: u64) -> Vec<PageAction> {
+-        if page.new_game || page.this_run_open {
++        self.frame_with(page, data, game_frame, None).0
++    }
++
++    /// `frame`, with the settings' Helpers rows (round 80) drawn while `{"esc": "paused"}` holds
++    /// them open; true with the actions when a click changed a row (the caller saves).
++    pub fn frame_with(&mut self, page: &mut RandoPage, data: Option<&Path>, game_frame: u64, mut helpers: Option<&mut Helpers>) -> (Vec<PageAction>, bool) {
++        self.helpers_seen = helpers.as_deref().copied();
++        if page.new_game || page.this_run_open || self.helpers_open {
+             self.open_frames = self.open_frames.saturating_add(1);
+             self.page_frames += 1;
+         } else {
+@@ -153,7 +187,7 @@ impl PageBot {
+         for id in std::mem::take(&mut page.thrown) {
+             self.event("discarded", json!({"id": id}));
+         }
+-        if page.new_game || page.this_run_open || self.esc_step_next() {
++        if page.new_game || page.this_run_open || self.helpers_open || self.esc_step_next() {
+             self.step(page, data);
+         }
+         self.time += 1.0 / 60.0;
+@@ -171,13 +205,28 @@ impl PageBot {
+             ..Default::default()
+         };
+         let mut actions = Vec::new();
++        let mut changed = false;
++        let helpers_open = self.helpers_open;
++        let mut helper_targets = Vec::new();
+         let output = self.ctx.run_ui(input, |ui| {
+             actions = page.draw_new_game(ui.ctx(), data);
+             if page.this_run_open {
+                 // round 71: the Esc Randomizer window, as the program draws it
+                 actions.extend(page.draw_this_run(ui.ctx(), data));
+             }
++            if let (true, Some(helpers)) = (helpers_open, helpers.as_deref_mut()) {
++                // round 80: the Paused window's Helpers part, as the program draws it
++                egui::Window::new("Paused").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ui.ctx(), |ui| {
++                    changed = crate::menus::helper_rows(ui, helpers, &mut helper_targets);
++                });
++            }
+         });
++        self.helper_targets = helper_targets;
++        if changed {
++            self.helpers_seen = helpers.as_deref().copied();
++            let now = self.helpers_seen.map(|h| serde_json::to_value(h).unwrap_or(Value::Null));
++            self.event("helpers_changed", json!({"helpers": now}));
++        }
+         // round 74: what the page's Copy put on the (here missing) clipboard
+         for command in &output.platform_output.commands {
+             if let egui::OutputCommand::CopyText(text) = command {
+@@ -186,7 +235,13 @@ impl PageBot {
+             }
+         }
+         output.drop_without_applying_deltas();
+-        actions
++        (actions, changed)
++    }
++
++    /// where a control was drawn last frame: the Helpers rows' (round 80), else the page's.
++    fn target_rect(&self, page: &RandoPage, target: &str) -> Option<egui::Rect> {
++        let list = if target.starts_with("helpers:") { &self.helper_targets } else { &page.targets };
++        list.iter().rev().find(|(k, _)| k == target).map(|(_, r)| *r)
+     }
+ 
+     /// round 71: the next step opens or closes the Esc Randomizer window (it runs with the
+@@ -219,15 +274,23 @@ impl PageBot {
+         }
+         let Some(step) = self.steps.get(self.next).cloned() else { return };
+         if let Some(what) = step["esc"].as_str() {
+-            // round 71: the Esc menu's Randomizer window (the New Game page is not open then)
++            // round 71: the Esc menu's Randomizer window (the New Game page is not open then);
++            // round 80: "paused" opens the Paused window's Helpers rows instead
+             let open = what != "close";
+             if open && page.new_game {
+                 return; // the program offers the Esc window only over the game
+             }
+-            page.this_run_open = open;
++            if what == "paused" {
++                self.helpers_open = true;
++            } else if open {
++                page.this_run_open = true;
++            } else {
++                page.this_run_open = false;
++                self.helpers_open = false;
++            }
+             self.open_frames = 0;
+             let window = if open { "open" } else { "closed" };
+-            self.event("esc", json!({"window": window}));
++            self.event("esc", json!({"window": window, "what": what}));
+             self.next += 1;
+             return;
+         }
+@@ -273,7 +336,7 @@ impl PageBot {
+         if let Some(target) = step["expect_target"].as_str() {
+             // round 74 (A9): the control is drawn wholly on the screen (reachable by a click)
+             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+-            let rect = page.targets.iter().rev().find(|(k, _)| k == target).map(|(_, r)| *r);
++            let rect = self.target_rect(page, target);
+             let ok = rect.is_some_and(|r| screen.contains_rect(r));
+             let mut extra = json!({
+                 "target": target, "ok": ok, "rect": rect.map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]),
+@@ -287,14 +350,14 @@ impl PageBot {
+             self.next += 1;
+             return;
+         }
+-        if let (Some(mark), None) = (step["mark"].as_str(), step.get("click")) {
++        if let (Some(mark), None, None) = (step["mark"].as_str(), step.get("click"), step.get("expect_settings")) {
+             self.event("mark", json!({"name": mark}));
+             self.next += 1;
+             return;
+         }
+         if let Some(target) = step["click"].as_str() {
+             // not drawn yet (a choice list opens the frame after its box is clicked): wait for it
+-            let Some(rect) = page.targets.iter().rev().find(|(k, _)| k == target).map(|(_, r)| *r) else {
++            let Some(rect) = self.target_rect(page, target) else {
+                 self.seen = None;
+                 return;
+             };
+@@ -312,6 +375,10 @@ impl PageBot {
+             // round 74: the code the Share code field shows (the Next New Game part's for next: targets)
+             let share = page.share_shown(target.starts_with("next:"));
+             let mut extra = json!({"target": target, "x": pos.x, "y": pos.y, "values": values, "share": share});
++            if target.starts_with("helpers:") {
++                // round 80: the rows as they were before this click
++                extra["helpers"] = self.helpers_seen.map(|h| serde_json::to_value(h).unwrap_or(Value::Null)).unwrap_or(Value::Null);
++            }
+             if let Some(mark) = step["mark"].as_str() {
+                 extra["mark"] = Value::String(mark.to_owned());
+             }
+@@ -343,6 +410,22 @@ impl PageBot {
+             self.next += 1;
+             return;
+         }
++        if let Some(want) = step["expect_settings"].as_object() {
++            // round 80: the [fates_helpers] table the program wrote to its settings.toml
++            let text = self.settings_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
++            let table = text.as_deref().is_some_and(|t| t.contains("[fates_helpers]"));
++            let saved = text.as_deref().and_then(|t| toml::from_str::<crate::settings::Settings>(t).ok()).map(|s| s.fates_helpers);
++            let got = saved.map(|h| serde_json::to_value(h).unwrap_or(Value::Null)).unwrap_or(Value::Null);
++            let ok = saved.is_some() && want.iter().all(|(k, v)| got.get(k) == Some(v));
++            let file = self.settings_file.as_ref().map(|f| f.display().to_string());
++            let mut extra = json!({"expect": step["expect_settings"], "ok": ok, "saved": got, "table": table, "file": file});
++            if let Some(mark) = step["mark"].as_str() {
++                extra["mark"] = Value::String(mark.to_owned());
++            }
++            self.event("expect_settings", extra);
++            self.next += 1;
++            return;
++        }
+         // a step this hook does not know: logged and skipped
+         self.event("unknown_step", json!({"step": step}));
+         self.next += 1;
+@@ -378,6 +461,10 @@ mod tests {
+             laid_at: None,
+             answered: None,
+             copied: None,
++            helpers_open: false,
++            helper_targets: Vec::new(),
++            helpers_seen: None,
++            settings_file: None,
+         }
+     }
+ 
+@@ -424,6 +511,67 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// round 80 (H7 in a unit test): the script opens the Paused window's Helpers rows, clicks
++    /// True hit On (cut 3: no 4x row), and reads them back from the settings file the program saved (here the
++    /// test saves as the program's `apply_settings` would); the rows hold the game while open.
++    #[test]
++    fn the_robot_sets_the_helpers_and_reads_them_back() {
++        use zakuro_core::fates_helpers::Helpers;
++        let dir = std::env::temp_dir().join(format!("zakuro-r80-pagebot-helpers-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let log = dir.join("pagebot.jsonl");
++        let file = dir.join("settings.toml");
++        let mut bot = bot(json!([
++            {"esc": "paused"},
++            {"expect_settings": {"true_hit": false}, "mark": "before"},
++            {"click": "helpers:opt:true_hit=on"},
++            {"expect_settings": {"true_hit": true}},
++            {"expect_target": "helpers:opt:true_hit=on"},
++            {"esc": "close"}
++        ]), &log);
++        bot.settings_file = Some(file.clone());
++        let mut page = RandoPage::with_rows(parse_schema(SCHEMA).unwrap());
++        let mut settings = crate::settings::Settings::default();
++        let mut held = 0;
++        for frame in 0..400 {
++            if bot.helpers_open() {
++                held += 1;
++            }
++            let (_, changed) = bot.frame_with(&mut page, Some(&dir), frame, Some(&mut settings.fates_helpers));
++            if changed {
++                std::fs::write(&file, toml::to_string_pretty(&settings).unwrap()).unwrap();
++            }
++            if bot.finished() {
++                break;
++            }
++        }
++        assert!(bot.finished());
++        assert!(!bot.helpers_open() && !page.this_run_open && !page.new_game);
++        assert!(held > 5, "the rows held the game while open");
++        assert_eq!(settings.fates_helpers, Helpers { true_hit: true, ..Helpers::default() });
++        let text = std::fs::read_to_string(&file).unwrap();
++        assert!(text.contains("[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = true\n"), "{text}");
++        drop(bot);
++        let events = events_of(&log);
++        let named = |name: &str| events.iter().filter(|e| e["event"] == name).cloned().collect::<Vec<_>>();
++        assert!(named("unknown_step").is_empty(), "{events:?}");
++        let expects = named("expect_settings");
++        assert_eq!(expects.len(), 2);
++        assert_eq!(expects[0]["ok"], json!(false), "no settings file yet: nothing to read back");
++        assert_eq!(expects[0]["mark"], json!("before"));
++        assert_eq!(expects[1]["ok"], json!(true), "{expects:?}");
++        assert_eq!(expects[1]["saved"], json!({"enemy_phase": "normal", "true_hit": true}));
++        assert_eq!(expects[1]["table"], json!(true));
++        assert_eq!(named("helpers_changed").len(), 1);
++        let clicks = named("click");
++        assert_eq!(clicks.len(), 1);
++        assert_eq!(clicks[0]["helpers"], json!({"enemy_phase": "normal", "true_hit": false}));
++        assert_eq!(named("expect_target")[0]["ok"], json!(true));
++        assert_eq!(named("esc").len(), 2);
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     /// round 74: the pagebot SCHEMA with two made-up presets.
+     const SCHEMA_74: &str = r#"{"format": 1, "rows": [
+         {"key": "randomizer", "label": "Randomizer", "kind": "onoff", "default": false, "all": true, "section": "Basics", "help": "On uses the settings below."},
+diff --git a/crates/zakuro/src/settings.rs b/crates/zakuro/src/settings.rs
+index ac99cad..1b20447 100644
+--- a/crates/zakuro/src/settings.rs
++++ b/crates/zakuro/src/settings.rs
+@@ -627,6 +627,12 @@ pub struct Settings {
+     pub room_address: String,
+     pub room_name: String,
+     pub room_port: u16,
++    /// the Fates port's Helpers (round 80, zakuro-core's fates_helpers): the Esc window's Enemy
++    /// phase and True hit rows, one choice for every save of Fire Emblem Fates and Seal of
++    /// Flames. at the defaults (today's game) nothing is written, so an untouched file stays as
++    /// it was; a value this build does not know gives the defaults and keeps the rest.
++    #[serde(deserialize_with = "or_default", skip_serializing_if = "is_default")]
++    pub fates_helpers: zakuro_core::fates_helpers::Helpers,
+ }
+ 
+ impl Default for Settings {
+@@ -670,6 +676,7 @@ impl Default for Settings {
+             room_address: String::new(),
+             room_name: String::new(),
+             room_port: zakuro_core::room::DEFAULT_PORT,
++            fates_helpers: zakuro_core::fates_helpers::Helpers::default(),
+         }
+     }
+ }
+@@ -810,8 +817,8 @@ fn write(path: &Path, text: &str) -> std::io::Result<()> {
+     std::fs::write(path, text)
+ }
+ 
+-/// the system's place for a program's settings.
+-fn path() -> Option<PathBuf> {
++/// the system's place for a program's settings (the page robot reads it back, round 80).
++pub fn path() -> Option<PathBuf> {
+     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
+     let dir = if cfg!(windows) {
+         var("APPDATA")
+@@ -955,6 +962,82 @@ mod tests {
+         assert!(file.per_game.is_empty() && file.enhancements.is_empty());
+     }
+ 
++    // round 80: the Helpers (U1-U6; HOME_DESIGN 3)
++
++    use zakuro_core::fates_helpers::{EnemyPhase, Helpers};
++
++    /// U1: an untouched settings file gets no `[fates_helpers]` table: today's files stay as they are.
++    #[test]
++    fn untouched_settings_write_no_helpers_table() {
++        for settings in [Settings::default(), Settings::first_run()] {
++            let text = toml::to_string_pretty(&settings).unwrap();
++            assert!(!text.contains("fates_helpers"), "{text}");
++            assert!(!text.contains("enemy_phase") && !text.contains("true_hit"));
++        }
++        // an explicit table at the defaults loads, and is not written back
++        let explicit: Settings = toml::from_str("show_fps = true\n[fates_helpers]\nenemy_phase = \"normal\"\ntrue_hit = false\n").unwrap();
++        assert!(explicit.fates_helpers.is_default());
++        assert_eq!(toml::to_string_pretty(&explicit).unwrap(), toml::to_string_pretty(&Settings { show_fps: true, ..Settings::default() }).unwrap());
++    }
++
++    /// U2: every value of both rows comes back as it was saved, and only a changed row is written.
++    #[test]
++    fn helpers_round_trip() {
++        for enemy_phase in EnemyPhase::ALL {
++            for true_hit in [false, true] {
++                let settings = Settings { fates_helpers: Helpers { enemy_phase, true_hit }, ..Settings::default() };
++                let text = toml::to_string_pretty(&settings).unwrap();
++                assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings, "{text}");
++                assert_eq!(text.contains("[fates_helpers]"), !settings.fates_helpers.is_default());
++            }
++        }
++        let text = toml::to_string_pretty(&Settings { fates_helpers: Helpers { enemy_phase: EnemyPhase::X4, true_hit: true }, ..Settings::default() }).unwrap();
++        assert!(text.contains("[fates_helpers]\nenemy_phase = \"4x\"\ntrue_hit = true\n"), "{text}");
++    }
++
++    /// U3: a value this build does not know gives the defaults and keeps every other setting.
++    #[test]
++    fn a_bad_helper_value_keeps_the_rest() {
++        let text = "show_fps = true\nscale = 3\n[fates_helpers]\nenemy_phase = \"8x\"\ntrue_hit = true\n[keys]\na = \"KeyK\"\n";
++        let settings: Settings = toml::from_str(text).unwrap();
++        assert!(settings.show_fps);
++        assert_eq!(settings.scale, 3);
++        assert_eq!(settings.keys.a, KeyCode::KeyK);
++        assert_eq!(settings.fates_helpers, Helpers::default(), "the whole table falls back, nothing else does");
++        let wrong_kind: Settings = toml::from_str("show_fps = true\nfates_helpers = 4\n").unwrap();
++        assert!(wrong_kind.show_fps && wrong_kind.fates_helpers.is_default());
++        let half: Settings = toml::from_str("[fates_helpers]\ntrue_hit = true\n").unwrap();
++        assert_eq!(half.fates_helpers, Helpers { enemy_phase: EnemyPhase::Normal, true_hit: true });
++    }
++
++    /// U4: a settings file of the round-77 program (no table) loads as Normal / Off.
++    #[test]
++    fn an_older_file_has_the_default_helpers() {
++        let mut older = toml::to_string_pretty(&Settings::first_run()).unwrap();
++        older.push_str("unknown_newer_thing = 1
++");
++        let settings: Settings = toml::from_str(&older).unwrap();
++        assert_eq!(settings.fates_helpers, Helpers::default());
++        assert_eq!(settings.fates_helpers.enemy_phase().factor(), 1);
++        assert!(!settings.fates_helpers.true_hit());
++    }
++
++    /// U5: the helpers are not a game's own settings: "Follow the general settings in
++    /// everything" (per_game removed) leaves them, and setting them gives Fates nothing of its own.
++    #[test]
++    fn follow_the_general_settings_leaves_the_helpers() {
++        let mut settings = Settings::default();
++        settings.fates_helpers = Helpers { enemy_phase: EnemyPhase::X2, true_hit: true };
++        assert!(!settings.has_own(FATES_SE_USA), "a helper is not a game setting of its own");
++        settings.per_game.insert(game_key(FATES_SE_USA), GameSettings { resolution: Some(4), ..GameSettings::default() });
++        // the button's effect (menus.rs game_settings): the game's own settings go
++        settings.per_game.remove(&game_key(FATES_SE_USA));
++        assert!(!settings.has_own(FATES_SE_USA));
++        assert_eq!(settings.fates_helpers, Helpers { enemy_phase: EnemyPhase::X2, true_hit: true });
++        assert_eq!(settings.for_game(Some(FATES_SE_USA)).fates_helpers, settings.fates_helpers);
++        assert_eq!(settings.for_game(None).fates_helpers, settings.fates_helpers);
++    }
++
+     #[test]
+     fn layouts_go_round() {
+         let mut layout = Screens::Stacked;
+-- 
+2.55.0.windows.5
+

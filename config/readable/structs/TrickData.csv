@@ -1,0 +1,10 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr:TrickData,next,high,"map::trick::Enumerator::Enumerate 0x00399C5C walks the list through this word until 0; trick::Data::Data stores its first argument here",
+0x008,0x1,s8,x,high,"trick::Data::IsAccess(int,int) 0x00526C7C and Enumerate 0x00399B3C ldrsb: left column of the gimmick's area",
+0x009,0x1,s8,y,high,"trick::Data::IsAccess 0x00526C88 and Enumerate 0x00399B54 ldrsb: top row of the gimmick's area",
+0x00A,0x1,s8,width,high,"trick::Data::IsAccess 0x00526C80 adds it to x (the area is x .. x + width - 1); Enumerate search 1 and SetDeploy 0x00526EE4 use it the same way",
+0x00B,0x1,s8,height,high,"trick::Data::IsAccess 0x00526C84 adds it to y (rows y .. y + height - 1); SetDeploy 0x00526ED0",
+0x00C,0x1,u8,type,high,"map::trick::Type: Enumerate 0x00399AEC compares it with the searched type; IsAccess 0x00526BA8 switches on it (11 = dragon vein: TransformTerrain::BuildAttribute searches 11; 12 = a region a vein changes: SetDeploy 0x00526E98 searches 12; 25..27 = cannons: IsCannon 0x00526D80)",
+0x015,0x1,u8,cannon_side,high,"trick::Data::GetAccessForCannon 0x005269E8 switches on 1 / 2 / 4 / 8 (the side of the cannon a unit stands on to use it)",
+0x016,0x1,u8,state,high,"bit 0 (1) usable, bit 1 (2) used (done), bit 2 (4) ruined: trick::Data::Enable 0x0039AB50 / Done 0x0039AAB8 / Ruin 0x0039AB04 set one and clear the others; Enumerate 0x00399B04 tests it against the searched mask; TrickTst 0x003B0AAC returns state & mask",
+0x018,0x4,str,positions,high,"map::trick::PositionEnumerator::PositionEnumerator(const char*) 0x0039A02C reads the string trick::Data::SetDeploy 0x00526E28 and Mutation pass from here: x,y pairs of the regions a vein changes, or None / All / EnableAll / DoneAll / RuinAll",

@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x10,u32[4],state,high,"Random::GetValue(void) 0x0044AE14 shifts the four words (s0 = s1, s1 = s2, s2 = s3, s3 = new) and returns the new one without its top bit; Random::Initialize 0x0044ABC4 seeds them",

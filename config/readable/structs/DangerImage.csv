@@ -1,0 +1,6 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x80,u8[128],marked_a,high,"map::Image::Danger::Add 0x0038F70C ORs the 128-byte tile set map::Deploy +0x810 points to into these bytes, only for a unit with state bit 16 (0x10000); Update 0x0038F854 clears them; one bit per tile x | y << 5",
+0x080,0x80,u8[128],all_a,high,"Danger::Add 0x0038F79C ORs Deploy +0x810's set into these bytes for every unit it is called for; Update clears them",
+0x100,0x80,u8[128],marked_b,high,"Danger::Add 0x0038F75C ORs the set Deploy +0x814 points to into these bytes for a unit with state bit 16; map::Panel::Danger::SetVertex 0x00391034 draws a tile whose bit is set here first",
+0x180,0x80,u8[128],all_b,high,"Danger::Add 0x0038F7DC ORs Deploy +0x814's set in for every unit; SetVertex 0x0039129C draws a tile whose bit is set here when the marked_b bit is not",
+0x200,0x4,u32,flags,high,"bit 0: the whole danger zone is on (UnitShowWholeDanger 0x003AD1F0 sets it, DangerTick toggles it; Update 0x0038F8FC then adds every enemy unit, not only marked ones); bit 1: redraw (Add and Update set it, map::Panel::Danger::Tick 0x00390F28 runs SetVertex and clears it)",

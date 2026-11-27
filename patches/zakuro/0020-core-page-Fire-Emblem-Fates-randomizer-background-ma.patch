@@ -1,0 +1,828 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 22:29:09 -0500
+Subject: [PATCH 20/21] core+page: Fire Emblem Fates randomizer: background
+ make, progress line, owner's rule
+
+Python found once per program run and its real interpreter called directly;
+PYTHONPYCACHEPREFIX in build/rando-pycache instead of PYTHONDONTWRITEBYTECODE; the
+make gets the table cache (build/rando-cache) and --progress. make_run_cancellable
+(cancel flag polled every 50 ms; 'progress N' lines stored), run_id_for, discard_run.
+Page: a background make of exactly the text Start game would send (proposed random
+seed when none is typed): a first guess of the restored last values when the rows are
+known, then one 300 ms after the page's values settle; cancelled and deleted on any
+change (never a run it did not make); Start game sends the answer the frame the make
+of exactly its text is done ('Making your game... N%'), nothing laid before.
+Headless: an answer known before the mode pick (rando-answer, FEF_RANDO_ANSWER; test
+hook FEF_RANDO_GUESS until FEF_RANDO_GUESS_UNTIL stands for the page's earlier values)
+is made in the background, a changed one throws the old guess away, and the pick waits
+for the make of exactly its answer, then only lays it; the log gives the ms from the
+pick to laid. FEF_HEADLESS_PACE keeps a headless run to the clock for timing tests
+(docs/rando/SPEED.md 4 and 5).
+---
+ crates/zakuro-core/src/fates_rando_session.rs | 248 ++++++++++++++--
+ crates/zakuro/src/lib.rs                      |  12 +
+ crates/zakuro/src/rando_page.rs               | 269 +++++++++++++++++-
+ 3 files changed, 509 insertions(+), 20 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index bd95d3b..47eeccc 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -26,7 +26,8 @@ use std::collections::{HashMap, HashSet};
+ use std::io::{BufRead, BufReader, Read};
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+-use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
++use std::sync::{Arc, OnceLock};
+ use std::time::{Duration, Instant};
+ 
+ use crate::fates_rando::{self, Guest, NewGameWatch, Patch, Run, TITLE};
+@@ -64,6 +65,18 @@ pub struct Session {
+     watch: NewGameWatch,
+     pending: bool,
+     queued: Option<String>,
++    /// round 59 (docs/rando/SPEED.md): headless, the answer is known before the mode pick;
++    /// its run is made in the background (exactly that answer; nothing is laid until the
++    /// pick): (the answer text, the make's thread)
++    prebuild: Option<Prebuilt>,
++    /// background makes whose answer changed before the pick: thrown away at the pick
++    discarded: Vec<Prebuilt>,
++    /// FEF_RANDO_ANSWER's text, read once
++    env_answer: Option<Option<String>>,
++    /// the test hook FEF_RANDO_GUESS (a file) / FEF_RANDO_GUESS_UNTIL (a frame): the answer
++    /// known before that frame, standing for the page's values before the player changed a
++    /// row (the owner's rule test, docs/rando/SPEED.md 5), read once
++    env_guess: Option<Option<(String, u64)>>,
+     run: Option<Run>,
+     placements: Vec<Placement>,
+     /// files of the save archives written since they were opened
+@@ -172,12 +185,37 @@ impl Session {
+             self.pending = true;
+             return Pick::Page;
+         }
+-        Pick::Answer(self.queued.take().or_else(|| {
++        let env = self.env_answer();
++        Pick::Answer(self.queued.take().or(env))
++    }
++
++    /// FEF_RANDO_ANSWER's text (read once per program run).
++    fn env_answer(&mut self) -> Option<String> {
++        self.env_answer.get_or_insert_with(|| {
+             let path = std::env::var_os("FEF_RANDO_ANSWER")?;
+             std::fs::read_to_string(&path)
+                 .map_err(|e| log::warn!("fates_rando: FEF_RANDO_ANSWER {path:?} could not be read: {e}"))
+                 .ok()
+-        }))
++        }).clone()
++    }
++
++    /// the answer the next mode pick takes when not interactive (None = off), as known at
++    /// frame `frame` (FEF_RANDO_GUESS before FEF_RANDO_GUESS_UNTIL).
++    fn known_answer(&mut self, frame: u64) -> Option<String> {
++        if self.interactive {
++            return None;
++        }
++        let guess = self.env_guess.get_or_insert_with(|| {
++            let path = std::env::var_os("FEF_RANDO_GUESS")?;
++            let until = std::env::var("FEF_RANDO_GUESS_UNTIL").ok()?.trim().parse().ok()?;
++            Some((std::fs::read_to_string(path).ok()?, until))
++        }).clone();
++        if let Some((text, until)) = guess {
++            if frame < until {
++                return Some(text);
++            }
++        }
++        self.queued.clone().or_else(|| self.env_answer())
+     }
+ 
+     /// the active run's id (None = the original game).
+@@ -303,7 +341,7 @@ impl Session {
+             Ok(patch) => {
+                 let mut r = Run::new(patch, id);
+                 if let Some(base) = fates_rando::gamedata_start(g) {
+-                    r.assume_applied(base);
++                    r.assume_applied_in(g, base);
+                 }
+                 self.run = Some(r);
+             }
+@@ -325,20 +363,99 @@ pub fn after_frame(system: &mut System) {
+     if !is_fates(system) {
+         return;
+     }
++    prebuild(system);
+     match system.rando.frame(&mut system.memory) {
+         Pick::None | Pick::Page => {}
+         Pick::Answer(a) => {
++            let picked = Instant::now();
+             log::info!("fates_rando: New Game mode picked at frame {}; answered {}", system.frames,
+                        if a.is_some() { "from the test hook" } else { "off" });
+-            match answer(system, a.as_deref().unwrap_or("{\"randomizer\": false}")) {
+-                Ok(Some(id)) => log::info!("fates_rando: randomized game {id} laid"),
+-                Ok(None) => {}
+-                Err(e) => notice(system, format!("the randomizer was not laid: {e}")),
++            if let Some(Prebuilt { text, handle, .. }) = system.rando.prebuild.take() {
++                if a.as_deref() == Some(text.as_str()) {
++                    let t = Instant::now();
++                    let done = handle.join().unwrap_or_else(|_| Err("the background make stopped".into()));
++                    log::info!("fates_rando: the background make of this answer {} (waited {} ms at the pick)",
++                               if done.is_ok() { "is done" } else { "failed; made now" }, t.elapsed().as_millis());
++                } else {
++                    log::info!("fates_rando: the background make was for another answer: not used");
++                }
++            }
++            let laid = match answer(system, a.as_deref().unwrap_or("{\"randomizer\": false}")) {
++                Ok(Some(id)) => {
++                    log::info!("fates_rando: randomized game {id} laid ({} ms from the mode pick)",
++                               picked.elapsed().as_millis());
++                    Some(id)
++                }
++                Ok(None) => None,
++                Err(e) => {
++                    notice(system, format!("the randomizer was not laid: {e}"));
++                    None
++                }
++            };
++            // the guesses thrown away: cancelled, their folders removed once they ended
++            // (never a run this program did not make, never the one laid)
++            let data = data_dir(system);
++            for p in std::mem::take(&mut system.rando.discarded) {
++                p.cancel.store(true, Ordering::Relaxed);
++                let _ = p.handle.join();
++                if p.fresh && laid.as_deref() != Some(p.id.as_str()) {
++                    discard_run(&data, &p.id);
++                    log::info!("fates_rando: background make {} thrown away (the answer changed before the pick)", p.id);
++                }
+             }
+         }
+     }
+ }
+ 
++/// round 59 (docs/rando/SPEED.md 4, headless half): a randomized answer known before the
++/// mode pick (boot-server's `rando-answer`, FEF_RANDO_ANSWER) with its seed is made in a
++/// background thread, exactly as `answer` would make it (same text, same run id). Only
++/// files are written (`build/rando-make/<id>/`, the run folder, the cache); nothing is laid
++/// before the pick, which then waits for this make and only lays it. A changed answer starts
++/// a new make; the old one is left to end (a run folder is only complete with patch.txt).
++fn prebuild(system: &mut System) {
++    let Some(text) = system.rando.known_answer(system.frames) else { return };
++    if system.rando.prebuild.as_ref().is_some_and(|p| p.text == text) {
++        return;
++    }
++    if let Some(old) = system.rando.prebuild.take() {
++        old.cancel.store(true, Ordering::Relaxed);
++        log::info!("fates_rando: the answer changed: background make {} is a guess thrown away", old.id);
++        system.rando.discarded.push(old);
++    }
++    if json_field(&text, "randomizer").as_deref() != Some("true") {
++        return;
++    }
++    let game = system.config.fates_rando_game.clone();
++    let Ok((seed, id)) = run_id_for(&text, game.as_deref()) else { return };
++    let data = data_dir(system);
++    let made = run_dir(&data, &id);
++    let cancel = Arc::new(AtomicBool::new(false));
++    if made.join("patch.txt").is_file() {
++        let handle = std::thread::spawn(move || Ok(made));
++        system.rando.prebuild = Some(Prebuilt { text, id, cancel, fresh: false, handle });
++        return;
++    }
++    let full = answer_for(&text, game.as_deref());
++    log::info!("fates_rando: making {id} in the background (nothing is laid before the mode pick)");
++    let (c, i) = (cancel.clone(), id.clone());
++    let handle = std::thread::spawn(move || {
++        make_run_cancellable(&data, &i, &seed, &full, game.as_deref(), &c, &Arc::new(AtomicU8::new(0)))
++    });
++    system.rando.prebuild = Some(Prebuilt { text, id, cancel, fresh: true, handle });
++}
++
++/// one headless background make: its answer text, run id, cancel flag, whether this
++/// program made it (only then may it be thrown away), and its thread.
++#[derive(Debug)]
++pub struct Prebuilt {
++    text: String,
++    id: String,
++    cancel: Arc<AtomicBool>,
++    fresh: bool,
++    handle: std::thread::JoinHandle<Result<PathBuf, String>>,
++}
++
+ /// true once, after the frame in which the mode was picked (interactive only): the page
+ /// opens and the game waits for `answer`.
+ pub fn take_pending(system: &mut System) -> bool {
+@@ -389,6 +506,19 @@ pub fn answer_for(answer: &str, game: Option<&str>) -> String {
+     }
+ }
+ 
++/// round 59 (docs/rando/SPEED.md 4.1.3): the (seed, run id) the page's answer `answer` gets
++/// in `Session::answer`, for a background make of exactly that answer. The answer must
++/// carry its seed (the page always fills it in).
++pub fn run_id_for(answer: &str, game: Option<&str>) -> Result<(String, String), String> {
++    let answer = answer_for(answer, game);
++    let seed = json_field(&answer, "seed").unwrap_or_default();
++    if !seed_ok(&seed) {
++        return Err(format!("the seed {seed:?} is not 1-32 letters, digits, - or _"));
++    }
++    let id = run_id(&seed, &answer);
++    Ok((seed, id))
++}
++
+ /// where Seal of Flames' files are for the tool: Zakuro's mod folder of the title in the
+ /// game's data folder (upper-case id unless only the lower-case one exists, as mods.rs).
+ pub fn mod_romfs(data: &Path) -> PathBuf {
+@@ -740,13 +870,27 @@ pub fn python_command(py: &Python, args: &[&std::ffi::OsStr]) -> (Command, u32)
+ 
+ /// runs a hidden command to its end (killed past `timeout`); every output line goes to
+ /// the log (zakuro.log). Returns (exit code, the output's lines).
+-pub fn run_hidden(mut cmd: Command, timeout: Duration) -> Result<(i32, Vec<String>), String> {
++pub fn run_hidden(cmd: Command, timeout: Duration) -> Result<(i32, Vec<String>), String> {
++    run_hidden_watched(cmd, timeout, &AtomicBool::new(false), &Arc::new(AtomicU8::new(0)))
++}
++
++/// run_hidden that stops (kills the child, Err "cancelled") as soon as `cancel` is set,
++/// checked every 50 ms, and stores N of every output line `progress N ...` in `progress`.
++pub fn run_hidden_watched(mut cmd: Command, timeout: Duration, cancel: &AtomicBool, progress: &Arc<AtomicU8>)
++    -> Result<(i32, Vec<String>), String>
++{
+     let mut child = cmd.spawn().map_err(|e| format!("could not start {:?}: {e}", cmd.get_program()))?;
+     let pump = |r: Option<Box<dyn Read + Send>>| {
++        let progress = progress.clone();
+         std::thread::spawn(move || {
+             let mut lines = Vec::new();
+             if let Some(r) = r {
+                 for line in BufReader::new(r).lines().map_while(Result::ok) {
++                    if let Some(n) = line.strip_prefix("progress ").and_then(|t| t.split(' ').next())
++                        .and_then(|n| n.parse::<u8>().ok())
++                    {
++                        progress.store(n.min(100), Ordering::Relaxed);
++                    }
+                     log::info!("rando.py: {line}");
+                     lines.push(line);
+                 }
+@@ -760,6 +904,11 @@ pub fn run_hidden(mut cmd: Command, timeout: Duration) -> Result<(i32, Vec<Strin
+     let status = loop {
+         match child.try_wait() {
+             Ok(Some(status)) => break status,
++            Ok(None) if cancel.load(Ordering::Relaxed) => {
++                let _ = child.kill();
++                let _ = child.wait();
++                return Err("cancelled".into());
++            }
+             Ok(None) if started.elapsed() > timeout => {
+                 let _ = child.kill();
+                 let _ = child.wait();
+@@ -777,6 +926,22 @@ pub fn run_hidden(mut cmd: Command, timeout: Duration) -> Result<(i32, Vec<Strin
+ /// FEF_PYTHON, then `py -3`, then `python`: the first that answers `--version` with
+ /// Python 3 within 5 s.
+ pub fn find_python() -> Result<Python, String> {
++    // round 59 (docs/rando/SPEED.md 4.1.1): asked once per program run, then the real
++    // interpreter is called directly (no launcher, no probe per make)
++    static FOUND: OnceLock<Result<Python, String>> = OnceLock::new();
++    FOUND.get_or_init(|| {
++        let py = probe_python()?;
++        let (cmd, _) = python_command(&py, &["-c".as_ref(), "import sys; print('EXE=' + sys.executable)".as_ref()]);
++        if let Ok((0, lines)) = run_hidden(cmd, PROBE_TIMEOUT) {
++            if let Some(exe) = lines.iter().find_map(|l| l.strip_prefix("EXE=")).filter(|e| Path::new(e).is_file()) {
++                return Ok(Python { program: exe.into(), args: vec![] });
++            }
++        }
++        Ok(py)
++    }).clone()
++}
++
++fn probe_python() -> Result<Python, String> {
+     let mut tries = Vec::new();
+     if let Some(p) = std::env::var_os("FEF_PYTHON") {
+         tries.push(Python { program: p.into(), args: vec![] });
+@@ -814,15 +979,15 @@ pub fn find_tool() -> Result<PathBuf, String> {
+ /// what Python runs: `rando.py make` with the page's answer turned into its flags by
+ /// `ingame.make_args` (one list, one place), the patch written with `--patch-out`.
+ const MAKE_SCRIPT: &str = "import sys, json\n\
+-tool, answer, out, patch, seed, options = sys.argv[1:7]\n\
++tool, answer, out, patch, seed, options, cache = sys.argv[1:8]\n\
+ sys.path.insert(0, tool)\n\
+ import rando\n\
+ import ingame\n\
+ a = json.load(open(answer, encoding='utf-8'))\n\
+ a['seed'] = a.get('seed') or seed\n\
+ with open(options, 'w', encoding='utf-8') as fh:\n    json.dump(a, fh, sort_keys=True)\n\
+-if len(sys.argv) > 8 and sys.argv[7] != 'fates':\n    import sources\n    sources.activate(sys.argv[7], sys.argv[8] or None)\n\
+-sys.exit(rando.main(['make'] + ingame.make_args(a) + ['--out', out, '--patch-out', patch]))\n";
++if len(sys.argv) > 9 and sys.argv[8] != 'fates':\n    import sources\n    sources.activate(sys.argv[8], sys.argv[9] or None)\n\
++sys.exit(rando.main(['make'] + ingame.make_args(a) + ['--out', out, '--patch-out', patch, '--cache', cache, '--progress']))\n";
+ 
+ /// makes run `id` with Python and keeps its files in `<data>/rando/<title>/runs/<id>/`.
+ /// Python works in the repo's `build/rando-make/<id>/` (the randomizer refuses to write
+@@ -835,25 +1000,62 @@ pub fn make_run(data: &Path, id: &str, seed: &str, answer: &str) -> Result<PathB
+ /// = a mod sharing the title id (`seal`): the tool first switches its tables to that game
+ /// (`tools/randomizer/sources.py` `activate`, the mod's files from `mod_romfs(data)`).
+ pub fn make_run_for(data: &Path, id: &str, seed: &str, answer: &str, game: Option<&str>) -> Result<PathBuf, String> {
++    make_run_cancellable(data, id, seed, answer, game, &AtomicBool::new(false), &Arc::new(AtomicU8::new(0)))
++}
++
++/// round 59 (docs/rando/SPEED.md 4.1.4): make_run_for for the page's background make. Set
++/// `cancel` and the make stops: the child is killed, its work folder and an unfinished run
++/// folder removed, Err("cancelled"). `progress` gets N of the tool's `progress N` lines.
++pub fn make_run_cancellable(data: &Path, id: &str, seed: &str, answer: &str, game: Option<&str>,
++                            cancel: &AtomicBool, progress: &Arc<AtomicU8>) -> Result<PathBuf, String> {
++    let r = make_run_inner(data, id, seed, answer, game, cancel, progress);
++    if r.is_err() && cancel.load(Ordering::Relaxed) {
++        discard_run(data, id);
++        return Err("cancelled".into());
++    }
++    r
++}
++
++/// a guessed run thrown away: its work folder, and its run folder unless it was laid
++/// (`keep_laid`: a run folder with patch.txt that a save may name is only removed by the page
++/// for its own guesses).
++pub fn discard_run(data: &Path, id: &str) {
++    if let Ok(tool) = find_tool() {
++        if let Some(root) = tool.parent().and_then(Path::parent) {
++            let _ = std::fs::remove_dir_all(root.join("build").join("rando-make").join(id));
++        }
++    }
++    let _ = std::fs::remove_dir_all(run_dir(data, id));
++}
++
++fn make_run_inner(data: &Path, id: &str, seed: &str, answer: &str, game: Option<&str>,
++                  cancel: &AtomicBool, progress: &Arc<AtomicU8>) -> Result<PathBuf, String> {
+     let tool = find_tool()?;
+     let py = find_python()?;
+     let root = tool.parent().and_then(Path::parent).ok_or("tools/randomizer has no repo above it")?;
+     let work = root.join("build").join("rando-make").join(id);
+     let _ = std::fs::remove_dir_all(&work);
+     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
++    // the table cache (tools/randomizer/cache.py) and the compiled modules: in the repo's
++    // build/ folder, never in the data folder (%APPDATA% for the owner)
++    let cache = root.join("build").join("rando-cache");
++    let pycache = root.join("build").join("rando-pycache");
+     let answer_path = work.join("answer.json");
+     std::fs::write(&answer_path, answer).map_err(|e| e.to_string())?;
+     let (out, patch, options) = (work.join("mod"), work.join("patch.txt"), work.join("options.json"));
+     let mut args: Vec<&std::ffi::OsStr> = vec!["-c".as_ref(), MAKE_SCRIPT.as_ref(), tool.as_os_str(), answer_path.as_os_str(),
+-                                                out.as_os_str(), patch.as_os_str(), seed.as_ref(), options.as_os_str()];
++                                                out.as_os_str(), patch.as_os_str(), seed.as_ref(), options.as_os_str(),
++                                                cache.as_os_str()];
+     let romfs = mod_romfs(data);
+     if let Some(g) = game {
+         args.push(g.as_ref());
+         args.push(romfs.as_os_str());
+     }
+-    let (cmd, _) = python_command(&py, &args);
++    let (mut cmd, _) = python_command(&py, &args);
++    cmd.env_remove("PYTHONDONTWRITEBYTECODE").env("PYTHONPYCACHEPREFIX", &pycache);
+     log::info!("fates_rando: making {id} with {:?}", py.program);
+-    let (code, lines) = run_hidden(cmd, MAKE_TIMEOUT).map_err(|e| format!("the randomizer: {e}"))?;
++    let (code, lines) = run_hidden_watched(cmd, MAKE_TIMEOUT, cancel, progress)
++        .map_err(|e| if e == "cancelled" { e } else { format!("the randomizer: {e}") })?;
+     if code != 0 || !patch.is_file() {
+         let tail: Vec<&str> = lines.iter().rev().take(4).rev().map(String::as_str).collect();
+         return Err(format!("the randomizer stopped (exit {code}): {}", tail.join(" | ")));
+@@ -940,10 +1142,22 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&data);
+     }
+ 
++    #[test]
++    fn a_background_make_gets_the_run_id_answer_uses() {
++        let a = r#"{"randomizer": true, "seed": "s59", "classes": true}"#;
++        let (seed, id) = run_id_for(a, None).unwrap();
++        assert_eq!((seed.as_str(), id.clone()), ("s59", run_id("s59", a)));
++        let (_, sid) = run_id_for(a, Some("seal")).unwrap();
++        assert_eq!(sid, run_id("s59", &answer_for(a, Some("seal"))));
++        assert_ne!(sid, id);
++        assert!(run_id_for(r#"{"randomizer": true, "seed": ""}"#, None).is_err());
++    }
++
+     #[test]
+     fn the_make_script_switches_tables_only_for_another_game() {
+-        assert!(MAKE_SCRIPT.contains("sys.argv[7] != 'fates'"));
+-        assert!(MAKE_SCRIPT.contains("sources.activate(sys.argv[7], sys.argv[8] or None)"));
++        assert!(MAKE_SCRIPT.contains("sys.argv[8] != 'fates'"));
++        assert!(MAKE_SCRIPT.contains("sources.activate(sys.argv[8], sys.argv[9] or None)"));
++        assert!(MAKE_SCRIPT.contains("'--cache', cache, '--progress'"));
+         assert!(MAKE_SCRIPT.find("sources.activate").unwrap() < MAKE_SCRIPT.find("rando.main").unwrap());
+     }
+ 
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index c7cd27b..2f0fdc8 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -944,6 +944,7 @@ impl App {
+         // Fire Emblem Fates' Randomizer page asks the port's tool for its rows now, in a
+         // thread, so they are there by the mode pick; a new game starts with none open
+         self.menus.rando.reset();
++        self.menus.rando.game = game.system.config.fates_rando_game.clone();
+         if rando_link::is_fates(&game.system) && self.options.headless.is_none() {
+             self.menus.rando.ask();
+         }
+@@ -1253,6 +1254,7 @@ impl App {
+         let report = std::env::var_os("FEF_HEADLESS_REPORT").map(PathBuf::from);
+         let ranges = headless_ranges();
+         let hash_at = frame_list("FEF_HEADLESS_HASH_AT");
++        let pace: Option<f64> = std::env::var("FEF_HEADLESS_PACE").ok().and_then(|v| v.trim().parse().ok());
+         let mut records = Vec::new();
+         if report.is_some() {
+             records.push(self.headless_record("boot", 0, 0, &ranges));
+@@ -1284,6 +1286,15 @@ impl App {
+             }
+             outcome = game.system.run_frame();
+             ran += 1;
++            // FEF_HEADLESS_PACE=<frames per second>: a headless run kept to the clock (a
++            // timing test as a player sees it), never faster than that
++            if let Some(fps) = pace.filter(|f| *f > 0.0) {
++                let due = start + Duration::from_secs_f64(ran as f64 / fps);
++                let now = Instant::now();
++                if due > now {
++                    std::thread::sleep(due - now);
++                }
++            }
+             if report.is_some() && hash_at.contains(&(frame + 1)) {
+                 records.push(self.headless_record("at", frame + 1, frame + 1 - since, &ranges));
+             }
+@@ -2145,6 +2156,7 @@ impl App {
+         let outcome = game.system.run_frame();
+         // the core saw the New Game mode pick and waits for the Randomizer page
+         if rando_link::take_pending(&mut game.system) {
++            self.menus.rando.game = game.system.config.fates_rando_game.clone();
+             self.menus.rando.open_new_game();
+         }
+         // the overlay reads the game the program was built on, not another
+diff --git a/crates/zakuro/src/rando_page.rs b/crates/zakuro/src/rando_page.rs
+index 447af17..eb0ed9f 100644
+--- a/crates/zakuro/src/rando_page.rs
++++ b/crates/zakuro/src/rando_page.rs
+@@ -18,7 +18,9 @@
+ use std::io::Read;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+ use std::sync::mpsc::{channel, Receiver, TryRecvError};
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ use egui::{Color32, RichText, Vec2};
+@@ -313,11 +315,29 @@ impl RandoForm {
+         if self.seed().is_empty() {
+             self.values.insert("seed".into(), Value::String(random_seed()));
+         }
++        self.answers_with_seed(None)
++    }
++
++    /// round 59 (docs/rando/SPEED.md 4.2.2): the answers Start game will give, with
++    /// `proposed` as the seed when none is typed; Start game with the same values gives
++    /// byte-identical text (`answers_with_seed(Some(proposed))` = `answers()` after the
++    /// proposed seed is put in the form).
++    pub fn answers_preview(&self, proposed: &str) -> Value {
++        if !self.on() {
++            return json!({"randomizer": false});
++        }
++        self.answers_with_seed((self.seed().is_empty()).then_some(proposed))
++    }
++
++    fn answers_with_seed(&self, seed: Option<&str>) -> Value {
+         let mut out = Map::new();
+         for row in &self.rows {
+             let value = if row.fixed { row.default.clone() } else { self.get(&row.key).clone() };
+             out.insert(row.key.clone(), value);
+         }
++        if let Some(seed) = seed {
++            out.insert("seed".into(), Value::String(seed.to_owned()));
++        }
+         Value::Object(out)
+     }
+ 
+@@ -392,6 +412,63 @@ pub struct ThisRun {
+     pub notices: Vec<String>,
+ }
+ 
++/// round 59 (docs/rando/SPEED.md 4.2): one background make of exactly one answer text: a
++/// guess, thrown away (cancelled, its folders removed) the moment the page's values change.
++pub struct Prebuild {
++    pub text: String,
++    pub id: String,
++    cancel: Arc<AtomicBool>,
++    progress: Arc<AtomicU8>,
++    done: Receiver<Result<PathBuf, String>>,
++    pub result: Option<Result<PathBuf, String>>,
++    /// made by this page (a run that was already complete, which a save may name, is never
++    /// thrown away)
++    pub fresh: bool,
++}
++
++impl Prebuild {
++    /// starts the make of `text` (None when the answer has no valid seed or game data).
++    pub fn start(text: String, data: &Path, game: Option<&str>) -> Option<Prebuild> {
++        let (seed, id) = zakuro_core::fates_rando_session::run_id_for(&text, game).ok()?;
++        let full = zakuro_core::fates_rando_session::answer_for(&text, game);
++        let (cancel, progress) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(0)));
++        let (send, done) = channel();
++        let (c, pr, d, i, g) = (cancel.clone(), progress.clone(), data.to_path_buf(), id.clone(), game.map(str::to_owned));
++        let fresh = !zakuro_core::fates_rando_session::run_dir(data, &id).join("patch.txt").is_file();
++        log::info!(target: "zakuro::rando", "background make of {id} started (a guess: nothing is laid before Start game)");
++        std::thread::spawn(move || {
++            let made = zakuro_core::fates_rando_session::run_dir(&d, &i);
++            let r = if made.join("patch.txt").is_file() {
++                Ok(made)
++            } else {
++                zakuro_core::fates_rando_session::make_run_cancellable(&d, &i, &seed, &full, g.as_deref(), &c, &pr)
++            };
++            let _ = send.send(r);
++        });
++        Some(Prebuild { text, id, cancel, progress, done, result: None, fresh })
++    }
++
++    /// the make's result once it ended.
++    pub fn poll(&mut self) -> Option<&Result<PathBuf, String>> {
++        if self.result.is_none() {
++            match self.done.try_recv() {
++                Ok(r) => self.result = Some(r),
++                Err(TryRecvError::Disconnected) => self.result = Some(Err("the background make stopped".into())),
++                Err(TryRecvError::Empty) => {}
++            }
++        }
++        self.result.as_ref()
++    }
++
++    pub fn percent(&self) -> u8 {
++        self.progress.load(Ordering::Relaxed)
++    }
++
++    pub fn cancel(&self) {
++        self.cancel.store(true, Ordering::Relaxed);
++    }
++}
++
+ pub struct RandoPage {
+     rows: Rows,
+     form: Option<RandoForm>,
+@@ -408,6 +485,20 @@ pub struct RandoPage {
+     pub this_run: ThisRun,
+     /// the run (and how many notices) This run was last read for, while it is open.
+     pub shown_for: Option<(Option<String>, usize)>,
++    /// the game the page makes for (None = Fire Emblem Fates; "seal" = Seal of Flames).
++    pub game: Option<String>,
++    /// the random seed used when none is typed: made when the page opens, kept.
++    pub proposed_seed: String,
++    /// the background make of the page's current values (a guess).
++    pub prebuild: Option<Prebuild>,
++    /// guesses thrown away: their run ids, removed once they ended.
++    discarded: Vec<Prebuild>,
++    /// the values changed: (their answer text, since when), started after 300 ms.
++    settling: Option<(String, Instant)>,
++    /// Start game pressed: this answer is sent the frame its make is done.
++    waiting: Option<String>,
++    /// the first guess of this game start was made (or not needed).
++    early_guess: bool,
+ }
+ 
+ impl Default for RandoPage {
+@@ -422,6 +513,13 @@ impl Default for RandoPage {
+             pending_answer: None,
+             this_run: ThisRun::default(),
+             shown_for: None,
++            game: None,
++            proposed_seed: random_seed(),
++            prebuild: None,
++            discarded: Vec::new(),
++            settling: None,
++            waiting: None,
++            early_guess: false,
+         }
+     }
+ }
+@@ -440,6 +538,7 @@ impl RandoPage {
+         self.pending_answer = None;
+         self.this_run = ThisRun::default();
+         self.shown_for = None;
++        self.early_guess = false;
+     }
+ 
+     /// asks the randomizer for its rows, in a thread, once (a Fates game started).
+@@ -482,6 +581,118 @@ impl RandoPage {
+         self.status = None;
+         self.failed = false;
+         self.pending_answer = None;
++        self.waiting = None;
++        if self.prebuild.is_none() {
++            self.proposed_seed = random_seed();
++        }
++    }
++
++    /// round 59: keeps the background make on the page's values (owner's rule, F-047): a
++    /// make whose text is no longer the page's is cancelled and thrown away; a new one
++    /// starts after the values stayed the same for 300 ms. Randomizer off: nothing runs.
++    fn keep_prebuild(&mut self, data: Option<&Path>) {
++        for p in &mut self.discarded {
++            p.poll();
++        }
++        if let Some(data) = data {
++            self.discarded.retain_mut(|p| {
++                if p.result.is_some() {
++                    if p.fresh {
++                        zakuro_core::fates_rando_session::discard_run(data, &p.id);
++                    }
++                    false
++                } else {
++                    true
++                }
++            });
++        }
++        if let Some(p) = &mut self.prebuild {
++            p.poll();
++        }
++        let Some(form) = &self.form else { return };
++        let Some(data) = data else { return };
++        let want = form.on().then(|| form.answers_preview(&self.proposed_seed).to_string());
++        if self.prebuild.as_ref().map(|p| &p.text) == want.as_ref() {
++            self.settling = None;
++            return;
++        }
++        if let Some(old) = self.prebuild.take() {
++            old.cancel();
++            log::info!(target: "zakuro::rando", "background make of {} thrown away (the values changed)", old.id);
++            self.discarded.push(old);
++        }
++        let Some(want) = want else {
++            self.settling = None;
++            return;
++        };
++        match &self.settling {
++            Some((text, since)) if *text == want => {
++                if since.elapsed() >= Duration::from_millis(300) {
++                    self.settling = None;
++                    self.prebuild = Prebuild::start(want, data, self.game.as_deref());
++                }
++            }
++            _ => self.settling = Some((want, Instant::now())),
++        }
++    }
++
++    /// Start game pressed with Randomizer on: the answer goes to the core the frame the make
++    /// of exactly this text is done (at once when the guess was right and finished).
++    fn start_waiting(&mut self, text: String, data: Option<&Path>) {
++        if self.prebuild.as_ref().is_none_or(|p| p.text != text) {
++            if let Some(old) = self.prebuild.take() {
++                old.cancel();
++                self.discarded.push(old);
++            }
++            self.prebuild = data.and_then(|d| Prebuild::start(text.clone(), d, self.game.as_deref()));
++        }
++        self.waiting = Some(text);
++        self.poll_waiting();
++    }
++
++    fn poll_waiting(&mut self) {
++        let Some(text) = self.waiting.clone() else { return };
++        let Some(p) = self.prebuild.as_mut().filter(|p| p.text == text) else {
++            // no make could start (no data folder): the core makes it, as before
++            self.waiting = None;
++            self.pending_answer = Some(text);
++            return;
++        };
++        match p.poll() {
++            None => self.status = Some(format!("Making your game... {}%", p.percent())),
++            Some(_) => {
++                // done or failed: the core lays it (a failure is made again there and its
++                // reason shown)
++                self.waiting = None;
++                self.pending_answer = Some(text);
++            }
++        }
++    }
++
++    /// after Start game was answered: every guess of this page except the laid run removed.
++    fn clean_guesses(&mut self, data: Option<&Path>, laid: Option<&str>) {
++        let mut all: Vec<Prebuild> = std::mem::take(&mut self.discarded);
++        all.extend(self.prebuild.take());
++        for p in all {
++            p.cancel();
++            if p.fresh && Some(p.id.as_str()) != laid {
++                if let Some(data) = data {
++                    let id = p.id.clone();
++                    let data = data.to_path_buf();
++                    // after the make ended (cancel stops it within 50 ms)
++                    std::thread::spawn(move || {
++                        let mut p = p;
++                        for _ in 0..200 {
++                            if p.poll().is_some() {
++                                break;
++                            }
++                            std::thread::sleep(Duration::from_millis(50));
++                        }
++                        zakuro_core::fates_rando_session::discard_run(&data, &id);
++                    });
++                }
++            }
++        }
+     }
+ 
+     /// the answer to give the core this frame, after "making" was shown for one.
+@@ -494,6 +705,8 @@ impl RandoPage {
+     pub fn answered(&mut self, result: Result<ThisRun, String>, data: Option<&Path>) {
+         match result {
+             Ok(run) => {
++                let laid = run.seed.as_ref().and(self.prebuild.as_ref()).map(|p| p.id.clone());
++                self.clean_guesses(data, laid.as_deref());
+                 if let (Some(data), Some(form)) = (data, &self.form) {
+                     // kept only for a randomized game: an original one writes nothing
+                     if run.seed.is_some() {
+@@ -537,10 +750,28 @@ impl RandoPage {
+     /// the New Game page, while open.
+     pub fn draw_new_game(&mut self, ctx: &egui::Context, data: Option<&Path>) -> Vec<PageAction> {
+         let mut actions = Vec::new();
++        let mut start_text: Option<String> = None;
+         self.poll(data);
+         if !self.new_game {
++            // round 59: the last values (restored from last.json) guessed once per game start,
++            // in the background, before the page even opens: thrown away like any guess if
++            // the page's values differ when it opens
++            if !self.early_guess && self.form.is_some() {
++                self.early_guess = true;
++                if let (Some(form), Some(data)) = (&self.form, data) {
++                    if form.on() && self.prebuild.is_none() {
++                        let text = form.answers_preview(&self.proposed_seed).to_string();
++                        self.prebuild = Prebuild::start(text, data, self.game.as_deref());
++                    }
++                }
++            }
+             return actions;
+         }
++        if self.waiting.is_some() {
++            self.poll_waiting();
++        } else if self.status.is_none() {
++            self.keep_prebuild(data);
++        }
+         let height = (ctx.content_rect().height() - 140.0).max(120.0);
+         egui::Window::new("Randomizer")
+             .id(egui::Id::new("rando new game"))
+@@ -551,6 +782,13 @@ impl RandoPage {
+                 ui.label(RichText::new("New game: randomize it?").strong());
+                 if let Some(status) = &self.status {
+                     ui.label(RichText::new(status).color(if self.failed { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN }));
++                    if self.waiting.is_some() {
++                        if ui.button("Back to the settings").clicked() {
++                            // the wait ends; nothing is laid, the make goes on as the guess
++                            self.waiting = None;
++                            self.status = None;
++                        }
++                    }
+                     if self.failed {
+                         ui.horizontal(|ui| {
+                             if ui.button("Back to the settings").clicked() {
+@@ -582,12 +820,15 @@ impl RandoPage {
+                             let problem = form.problem();
+                             let start = ui.add_enabled(problem.is_none() && !self.failed, egui::Button::new(RichText::new("Start game").strong()));
+                             if start.clicked() {
++                                if form.on() && form.seed().is_empty() {
++                                    // the random seed the background make used
++                                    form.values.insert("seed".into(), Value::String(self.proposed_seed.clone()));
++                                }
+                                 let answers = form.answers();
+                                 if form.on() {
+-                                    self.status = Some(format!("Making the game from seed {}... (a few seconds)", form.seed()));
++                                    self.status = Some("Making your game... 0%".to_owned());
+                                     self.failed = false;
+-                                    // drawn once, then given to the core next frame
+-                                    self.pending_answer = Some(answers.to_string());
++                                    start_text = Some(answers.to_string());
+                                 } else {
+                                     actions.push(PageAction::Answer(answers.to_string()));
+                                 }
+@@ -612,6 +853,9 @@ impl RandoPage {
+                     }
+                 }
+             });
++        if let Some(text) = start_text {
++            self.start_waiting(text, data);
++        }
+         actions
+     }
+ 
+@@ -832,6 +1076,25 @@ mod tests {
+         assert_eq!(form.get("children"), &json!(false));
+     }
+ 
++    #[test]
++    fn the_background_make_text_is_start_games_text() {
++        // round 59, owner's rule: the guess is made for the exact text Start game sends
++        let mut form = form();
++        form.set("randomizer", json!(true));
++        let preview = form.answers_preview("prop1234").to_string();
++        form.values.insert("seed".into(), json!("prop1234"));
++        assert_eq!(form.answers().to_string(), preview);
++        // a typed seed wins over the proposed one
++        form.set("seed", json!("typed"));
++        assert_eq!(form.answers_preview("prop1234")["seed"], json!("typed"));
++        // a changed row changes the text (the guess is thrown away)
++        let before = form.answers_preview("x").to_string();
++        form.set("classes", json!(false));
++        assert_ne!(form.answers_preview("x").to_string(), before);
++        form.set("randomizer", json!(false));
++        assert_eq!(form.answers_preview("x"), json!({"randomizer": false}));
++    }
++
+     #[test]
+     fn an_empty_seed_is_made_at_start_and_shown() {
+         let mut form = form();

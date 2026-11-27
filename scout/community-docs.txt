@@ -1,0 +1,9 @@
+Fates scout - community-docs (2026-11-10)
+- Fates RomFS has debug/name.StackTrace (1,615,932 B, 26,122 NUL-separated demangled C++ signatures)
+  + debug/addr.StackTrace (208,984 B = 26,123 x (u32 addr, u32 name offset)); TimeStamp 2015/11/17 Rev 27274.
+  Awakening RomFS has no such file (debugs/ holds only debugFont.ctpk.lz).
+- 281 of 1,014 Awakening RTTI class names (config/naming/classes.csv) appear verbatim as Fates class names.
+- RomFS: 21,880 files; top dirs GameData Scripts m face unit bu ba bx field castle live2d sound movie ...
+- Paragon Data/FE13/Types (24 yml) vs Data/FE14/Types (42 yml): same IS .bin container, different layouts
+  (Person 0x238=568 B in FE13, 152 B in FE14).
+- Licences: Paragon/mila/Exalt/Ignis/FEFEditor GPL-3.0; FEAT + FE3D GPL-2.0.

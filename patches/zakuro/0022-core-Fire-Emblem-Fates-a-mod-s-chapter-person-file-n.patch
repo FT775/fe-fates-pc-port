@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Sat, 21 Nov 2026 03:00:00 -0500
+Subject: [PATCH 0022] core: Fire Emblem Fates: a mod's chapter person file numbers its people in file order
+
+A battle save writes each unit's person as its number (Person+0x24,
+Person::SerializePointer 0x0044A54C) and Person::DeserializePointer
+(0x0044A62C) takes the record at (number - the first record's number)
+back: by position. Every person file of the game numbers its records in
+file order; Seal of Flames v6's R021, R023 and Y004 carry the same
+numbers in another order, so after a battle-save reload those units
+became the person at their number's position (same class, level and
+place; another person and HP), with the randomizer off too. The mod
+layer's person fix (0018) now also serves such a file numbered in file
+order from its first record's number, only when the numbers are exactly
+that range in another order. fates_person_name becomes fates_person_fix
+(name and numbers). Round 60, track sealfix: docs/tests/SEAL_SAVE.md 8.
+---
+  crates/zakuro-core/src/mods.rs | 166 +++++++++++++++++++++++++++++++++++------
+  1 file changed, 145 insertions(+), 21 deletions(-)
+
+diff --git a/crates/zakuro-core/src/mods.rs b/crates/zakuro-core/src/mods.rs
+index 7bbbcbf..1cf6da2 100644
+--- a/crates/zakuro-core/src/mods.rs
++++ b/crates/zakuro-core/src/mods.rs
+@@ -130,10 +130,10 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
+         log::info!("mods: the game's exheader is {}", dir.join(EXHEADER).display());
+         title.exheader = exheader;
+     }
+-    // Fire Emblem Fates: a mod's chapter person files served under their own archive name
+-    // (docs/tests/SEAL_SAVE.md); every other title: no fix
++    // Fire Emblem Fates: a mod's chapter person files served under their own archive name and
++    // with their people numbered in file order (docs/tests/SEAL_SAVE.md); every other title: no fix
+     let fix: Option<layered::Fix> =
+-        (title.program_id() == crate::fates_rando::TITLE).then_some(&fates_person_name as layered::Fix);
++        (title.program_id() == crate::fates_rando::TITLE).then_some(&fates_person_fix as layered::Fix);
+     match title.lay_mods_fixed(&dir, fix) {
+         Ok(Some(changes)) => log::info!(
+             "mods from {}: {} files replaced, {} added, {} patched, {} removed",
+@@ -175,7 +175,18 @@ pub fn lay(title: &mut Title, data_dir: Option<&Path>) {
+ /// screen, or back to the title (docs/tests/SEAL_SAVE.md). Served under its own name: only a
+ /// mod's file under GameData/Person, only a name of the same length that nothing else points
+ /// at; every other byte is kept.
+-pub fn fates_person_name(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
++///
++/// Round 60: the same files must also number their people in file order. A battle save
++/// writes each unit's person as its number (Person+0x24, Person::SerializePointer 0044A54C)
++/// and Person::DeserializePointer (0044A62C) takes the record at (number - the first
++/// record's number) back: by position, not by number. Every file of the game numbers its
++/// records first, first+1, ... in file order; three files of Seal of Flames v6 (R021, R023,
++/// Y004) carry the same numbers in another order (a record put in among the others), so
++/// after a reload those units became the person at their number's position (same class,
++/// level and place, another person and HP; docs/tests/SEAL_SAVE.md section 8). Served
++/// numbered in file order from the first record's number: only when the numbers are exactly
++/// that range in another order (so no number is new, and the first record keeps its own).
++pub fn fates_person_fix(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+     use crate::fates_rando_file::{inplace_margin, lz11_compress, lz_decompress, IsBin};
+     let stem = path.strip_prefix("GameData/Person/")?.rsplit('/').next()?.strip_suffix(".bin.lz")?;
+     let lz = lz_decompress(bytes).ok()?;
+@@ -186,25 +197,19 @@ pub fn fates_person_name(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+     if !bin.relocs.contains(&0) {
+         return None;
+     }
+-    let ptr = bin.word(0)?;
+-    let name = bin.string_at(ptr)?.to_vec();
+-    if name == stem.as_bytes() {
+-        return None;
+-    }
+-    if name.len() != stem.len() || bin.relocs.iter().filter(|&&r| bin.word(r) == Some(ptr)).count() != 1 {
+-        log::warn!("mods: {path}: its person archive is named {}; not changed (a battle save of this chapter will not reload its own people)", String::from_utf8_lossy(&name));
++    let renamed = person_name(path, stem, &mut bin);
++    let renumbered = person_numbers(path, &mut bin);
++    if !renamed && !renumbered {
+         return None;
+     }
+-    let at = (ptr - bin.se()) as usize;
+-    bin.strtab[at..at + stem.len()].copy_from_slice(stem.as_bytes());
+     let data = bin.build();
+     let mut out = lz11_compress(&data, lz.format, if lz.format == 0x13 { data.len() as u32 } else { 0 });
+-    // round 59 check: the renamed file keeps the stored size of the mod's own file (padded with
++    // round 59 check: the fixed file keeps the stored size of the mod's own file (padded with
+     // zeros, as fates_rando_file::patch_stored does). Our compression is usually shorter than the
+     // mod's; a shorter served file left the randomizer's patch of the same chapter no room
+     // ("does not fit in the original's N bytes": chapter people kept original in 16 Seal chapters).
+     if out.len() > bytes.len() {
+-        log::warn!("mods: {path}: renamed archive compresses to {} bytes, more than the mod's {}; not changed", out.len(), bytes.len());
++        log::warn!("mods: {path}: fixed archive compresses to {} bytes, more than the mod's {}; not changed", out.len(), bytes.len());
+         return None;
+     }
+     if lz.format == 0x13 {
+@@ -220,6 +225,54 @@ pub fn fates_person_name(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+     Some(out)
+ }
+ 
++/// the archive name set to the file's stem (true = changed).
++fn person_name(path: &str, stem: &str, bin: &mut crate::fates_rando_file::IsBin) -> bool {
++    let Some(ptr) = bin.word(0) else { return false };
++    let Some(name) = bin.string_at(ptr).map(|n| n.to_vec()) else { return false };
++    if name == stem.as_bytes() {
++        return false;
++    }
++    if name.len() != stem.len() || bin.relocs.iter().filter(|&&r| bin.word(r) == Some(ptr)).count() != 1 {
++        log::warn!("mods: {path}: its person archive is named {}; not changed (a battle save of this chapter will not reload its own people)", String::from_utf8_lossy(&name));
++        return false;
++    }
++    let at = (ptr - bin.se()) as usize;
++    bin.strtab[at..at + stem.len()].copy_from_slice(stem.as_bytes());
++    true
++}
++
++/// a Person block's records: the count (u16 at +4), 0x98 bytes each from +0x10, the number
++/// (u16) at record +0x24. Numbered in file order from the first record's number when the
++/// numbers are that range in another order (true = changed).
++fn person_numbers(path: &str, bin: &mut crate::fates_rando_file::IsBin) -> bool {
++    const REC: usize = 0x98;
++    let n = match bin.data.get(4..6) {
++        Some(c) => u16::from_le_bytes([c[0], c[1]]) as usize,
++        None => return false,
++    };
++    if n == 0 || bin.data.len() < 0x10 + n * REC {
++        return false;
++    }
++    let at = |i: usize| 0x10 + i * REC + 0x24;
++    let nums: Vec<u32> = (0..n).map(|i| u16::from_le_bytes([bin.data[at(i)], bin.data[at(i) + 1]]) as u32).collect();
++    let first = nums[0];
++    if nums.iter().enumerate().all(|(i, &v)| v == first + i as u32) {
++        return false;
++    }
++    let mut sorted = nums.clone();
++    sorted.sort_unstable();
++    if first + n as u32 > 0x1_0000 || sorted.iter().enumerate().any(|(i, &v)| v != first + i as u32) {
++        log::warn!("mods: {path}: its people are numbered {nums:x?}, not a reordering of {first:#x}..; not changed (a battle save of this chapter will not reload its own people)");
++        return false;
++    }
++    for i in 0..n {
++        let v = (first + i as u32) as u16;
++        bin.data[at(i)..at(i) + 2].copy_from_slice(&v.to_le_bytes());
++    }
++    log::info!("mods: {path}: its people served numbered in file order from {first:#x} (they were {nums:x?}; a battle save reloads each unit's own person)");
++    true
++}
++
+ #[cfg(test)]
+ mod person_name_tests {
+     use super::*;
+@@ -241,7 +294,7 @@ mod person_name_tests {
+ 
+     #[test]
+     fn a_copied_name_is_served_as_the_files_own() {
+-        let out = fates_person_name("GameData/Person/C/R002.bin.lz", &block("X020")).expect("renamed");
++        let out = fates_person_fix("GameData/Person/C/R002.bin.lz", &block("X020")).expect("renamed");
+         let want = lz_decompress(&block("R002")).unwrap().data;
+         assert_eq!(lz_decompress(&out).unwrap().data, want);
+         let orig = lz_decompress(&block("X020")).unwrap().data;
+@@ -255,16 +308,87 @@ mod person_name_tests {
+         // served at the mod's size, so a randomizer patch of the same chapter has the same room
+         let mut stored = block("X020");
+         stored.extend_from_slice(&[0; 6]);
+-        let out = fates_person_name("GameData/Person/C/R002.bin.lz", &stored).expect("renamed");
++        let out = fates_person_fix("GameData/Person/C/R002.bin.lz", &stored).expect("renamed");
+         assert_eq!(out.len(), stored.len());
+         assert_eq!(lz_decompress(&out).unwrap().data, lz_decompress(&block("R002")).unwrap().data);
+     }
+ 
+     #[test]
+     fn everything_else_is_left_alone() {
+-        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", &block("R002")), None);
+-        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", &block("X0201")), None);
+-        assert_eq!(fates_person_name("GameData/Dispos/C/R002.bin.lz", &block("X020")), None);
+-        assert_eq!(fates_person_name("GameData/Person/C/R002.bin.lz", b"not lz at all"), None);
++        assert_eq!(fates_person_fix("GameData/Person/C/R002.bin.lz", &block("R002")), None);
++        assert_eq!(fates_person_fix("GameData/Person/C/R002.bin.lz", &block("X0201")), None);
++        assert_eq!(fates_person_fix("GameData/Dispos/C/R002.bin.lz", &block("X020")), None);
++        assert_eq!(fates_person_fix("GameData/Person/C/R002.bin.lz", b"not lz at all"), None);
++    }
++
++    /// a Person block with `nums.len()` records of 0x98 bytes, numbered `nums`; word 0 points
++    /// at the archive name, each record's +8 at a PID string.
++    fn people(name: &str, nums: &[u16]) -> Vec<u8> {
++        let mut strtab = name.as_bytes().to_vec();
++        strtab.push(0);
++        let mut data = vec![0u8; 0x10 + nums.len() * 0x98];
++        data[4..6].copy_from_slice(&(nums.len() as u16).to_le_bytes());
++        let mut relocs = vec![0u32];
++        let mut pids = Vec::new();
++        for (i, _) in nums.iter().enumerate() {
++            pids.push(strtab.len() as u32);
++            strtab.extend_from_slice(format!("PID_{i}\0").as_bytes());
++            relocs.push((0x10 + i * 0x98 + 8) as u32);
++        }
++        let mut bin = IsBin { pad: [0; 16], data, relocs, labels: vec![], strtab };
++        let se = bin.se();
++        bin.data[0..4].copy_from_slice(&se.to_le_bytes());
++        for (i, &v) in nums.iter().enumerate() {
++            let r = 0x10 + i * 0x98;
++            bin.data[r + 8..r + 12].copy_from_slice(&(se + pids[i]).to_le_bytes());
++            bin.data[r + 0x24..r + 0x26].copy_from_slice(&v.to_le_bytes());
++            bin.data[r + 0x30] = 0x40 + i as u8; // something else in the record, kept
++        }
++        let raw = bin.build();
++        // stored like a mod's file: compressed less tightly than ours (16 bytes of room)
++        let mut z = lz11_compress(&raw, 0x13, raw.len() as u32);
++        z.extend_from_slice(&[0; 16]);
++        z
++    }
++
++    fn numbers(z: &[u8]) -> Vec<u16> {
++        let bin = IsBin::parse(&lz_decompress(z).unwrap().data).unwrap();
++        let n = u16::from_le_bytes([bin.data[4], bin.data[5]]) as usize;
++        (0..n).map(|i| u16::from_le_bytes([bin.data[0x10 + i * 0x98 + 0x24], bin.data[0x10 + i * 0x98 + 0x25]])).collect()
++    }
++
++    #[test]
++    fn people_out_of_file_order_are_numbered_in_file_order() {
++        // R021's shape: a record numbered first+9 put in at position 7
++        let nums = [0x7a00, 0x7a01, 0x7a02, 0x7a03, 0x7a04, 0x7a05, 0x7a06, 0x7a09, 0x7a07, 0x7a08];
++        let z = people("C021", &nums);
++        let out = fates_person_fix("GameData/Person/C/R021.bin.lz", &z).expect("fixed");
++        assert_eq!(out.len(), z.len(), "the mod's stored size");
++        assert_eq!(numbers(&out), (0x7a00..0x7a0a).collect::<Vec<u16>>());
++        // only the name and the numbers differ
++        let (a, b) = (lz_decompress(&z).unwrap().data, lz_decompress(&out).unwrap().data);
++        assert_eq!(a.len(), b.len());
++        let diff: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
++        let name_at = IsBin::parse(&a).unwrap().se() as usize + 0x20;
++        assert!(diff.iter().all(|&i| (name_at..name_at + 4).contains(&i) || (i >= 0x30 && ((i - 0x30) % 0x98 == 0x24 || (i - 0x30) % 0x98 == 0x25))), "{diff:x?}");
++        // Y004's shape: the first record is not 0x7A00; it keeps its number
++        let y = people("X015", &[0x7a0b, 0x7a0c, 0x7a0d, 0x7a16, 0x7a0e, 0x7a0f, 0x7a10, 0x7a11, 0x7a12, 0x7a13, 0x7a14, 0x7a15]);
++        let out = fates_person_fix("GameData/Person/C/Y004.bin.lz", &y).expect("fixed");
++        assert_eq!(numbers(&out), (0x7a0b..0x7a17).collect::<Vec<u16>>());
++        // already in order and already named: nothing
++        assert_eq!(fates_person_fix("GameData/Person/C/R002.bin.lz", &people("R002", &[0x7a05, 0x7a06, 0x7a07])), None);
++        // in order but misnamed: only the name
++        let out = fates_person_fix("GameData/Person/C/R002.bin.lz", &people("X020", &[0x7a00, 0x7a01])).expect("renamed");
++        assert_eq!(numbers(&out), vec![0x7a00, 0x7a01]);
++    }
++
++    #[test]
++    fn numbers_that_are_not_a_reordering_are_left_alone() {
++        // a gap (a new number) or a repeat: not changed, the name is still fixed
++        let out = fates_person_fix("GameData/Person/C/R021.bin.lz", &people("C021", &[0x7a00, 0x7a02, 0x7a01, 0x7a05])).expect("renamed");
++        assert_eq!(numbers(&out), vec![0x7a00, 0x7a02, 0x7a01, 0x7a05]);
++        assert_eq!(fates_person_fix("GameData/Person/C/R021.bin.lz", &people("R021", &[0x7a00, 0x7a01, 0x7a01])), None);
++        // the first record is not the lowest: the range would start elsewhere, not changed
++        assert_eq!(fates_person_fix("GameData/Person/C/R021.bin.lz", &people("R021", &[0x7a01, 0x7a00, 0x7a02])), None);
+     }
+ }
+-- 
+

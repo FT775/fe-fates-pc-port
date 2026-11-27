@@ -1,0 +1,22 @@
+Fates file-format scout (2026-11-10). Read-only; nothing extracted. Tags: [high]/[med]/[guess].
+CCI: decrypted (NoCrypto), program 0004000000179800, CTR-P-BFZE. RomFS 21,880 files / 645 dirs / 1.80 GB
+(Awakening: 7,368 / 44 / 1.11 GB). Awakening tools/rom parser reads it unchanged [high].
+SAME (Awakening tool works unchanged, measured):
+  LZ13 lz.py: 13,455 LZ13 files, no LZ11/LZ10; 60/60 random sample recompress byte-identical [high]
+  IS .bin isbin.py: 2,736/2,736 .bin/.bin.lz dump->assemble identical [high]
+  message archives msg.py: 1,328/1,328 text round trip (m/@E, m/A|B|C/@E, m/common), now LZ13 not LZ11 [high]
+  CTPK ctpk.py: only 170 files (live2d/model), 3/3 sampled rebuild identical [high]
+CHANGED (small patch):
+  .arc: same Data/Count/Info IS .bin, but Data at 0x60 and members 0x80-aligned; arc.py rejects all 540 tried [high]
+  map dispos: same {name ptr, block ptr, count} faction triples; unit record 0x8C (Awakening 0x74) [med]
+DIFFERENT:
+  GameData.bin.lz: no <Name>Data/<Name>DataNum labels; header of pointers+counts at data start [high]
+    record strides: Person 0x98 (A 0x238), Item 0x68 (A 0x38), Chapter 0x1C (A 0x44), Skill SEID 0x20
+    (A RSID 0x1C), Belong 0x10 (A 0x0C), Tutorial 0x14 (A 0x0C), Job 0x80 (same size, layout unverified),
+    ID lists 4-byte (A 8-byte) [high for strides]. Persons in GameData (255 PID) + GameData/Person/{,A,B,C}.
+  Terrain: per-chapter GameData/Terrain/*.bin.lz with own TID records (0x28) [med]; A: table in GameData + raw grids.
+  Models/textures: BCH (H3D) 10,743 .bch.lz; Awakening CGFX tool useless; tex3ds PICA codecs reusable [high]
+  Faces: face/face/*.arc of LZ13 BCH + face/hair, face/accessory BCH layers + face/FaceData.bin.lz (FSID) [high]
+  New: live2d (Cubism .moc/.mtn/json), .aac voice, .dspadpcm.bcstm, castle/, field/, Scripts/{A,B,C,bev}.
+  .cmb scripts: same magic + header bytes as Awakening [med]; .bfnt: header differs [med].
+Oddities: GameData/TextEditor.bin.lz not LZ/IS-bin header; 30 .bch.lz start with 0x00 (not LZ13) [high, cause unknown]

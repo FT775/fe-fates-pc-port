@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x00,40,s8[40],by_level_gap,high,"Unit::GetExpDance and Unit::GetExpRod add GetSupportDecline(difficulty)[i] (s8), i = target level - own level + 39 clamped to 0..39"

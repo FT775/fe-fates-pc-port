@@ -1,0 +1,6 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr,person,high,"unit::Family::ParentSingle::GetGrow(int) const 0x0053B74C returns 0 when this word is 0, else adds this Person record's growth (+0x40 + stat); unit::Family::GetLimit 0x0053BDF4 adds its limit_mod (+0x48 + stat)",
+0x004,0x1,u8,boon,high,"ParentSingle::GetGrow 0x0053B768: Personality::Get of this byte, boon_growth (+0x14) added; Family::GetLimit adds that record's boon_limit (+0x1C)",
+0x005,0x1,u8,bane,high,"ParentSingle::GetGrow 0x0053B758: Personality::Get of this byte, bane_growth (+0x2C) added; Family::GetLimit adds that record's bane_limit (+0x34)",
+0x008,0x4,ptr,grandparent_a,medium,"ParentSingle::GetGrow 0x0053B7D4: with grandparent_b also set, this Person's growth is averaged in when the person.family_index Person is female (Person::IsFemale); Family::GetLimit adds both grandparents' limit_mod",
+0x00C,0x4,ptr,grandparent_b,medium,"ParentSingle::GetGrow 0x0053B7D8: averaged in instead of grandparent_a when that Person is not female",

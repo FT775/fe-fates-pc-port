@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Thu, 26 Nov 2026 03:18:56 -0500
+Subject: [PATCH] core: Seal of Flames randomizer: hear the New Game step
+
+Round 82b (docs/ROUND82B_PLAN.md S1-S3; the owner's "Yes, that order" to
+Grok's order in docs/collab/SEAL_EDITION_SPLIT_GROK.md). Round 82's new-parts
+check N4 found that Seal of Flames + Normal + Classic with the randomizer on
+gives the plain game, with no warning (the same answer on Casual is
+randomized). The cause is round 81b's D1: it assumed the randomizer's hooks
+are off on Seal, but this port's frontend keeps them on (F-047), so the 81b
+gate (step_game: Fates only) kept Seal out of the New Game step.
+
+- S1 (fates_rando_session.rs): step_game is true for Fates (None, "fates")
+  and Seal of Flames ("seal"); any other name stays out (fail closed). The
+  hooks decide: listens = hooks_on (the Fates title id and
+  Config::fates_rando) && step_game. With the hooks on, Seal at the defaults
+  now lays round 81's StartFromBeginning trap and hears the step, exactly as
+  Fates has since round 81b; with Config::fates_rando false, no trap, no
+  guest memory read and no warning, as in round 81.
+- S2: the two warning lines ("This New Game did not use your seed." and
+  "Classic New Games cannot start the randomizer in this setup; pick Casual
+  or Phoenix.") apply on Seal too, the same words, once each.
+- S3: nothing else changes: the randomizer's output (answer, run id, patch),
+  round 81's rows and bytes, the Fates behaviour from round 81b, loads and
+  the page. Doc comments that said the hooks are off for Seal (hooks_on,
+  Config::fates_rando, fates_options module and svc_outcome) now say what
+  the code does.
+
+Tests: two assertions of round 81b changed on purpose, because they pinned
+81b's wrong assumption: fates_rando_session
+only_fates_itself_hears_the_new_game_step (renamed
+fates_and_seal_hear_the_new_game_step_and_the_hooks_decide):
+step_game(Some("seal")) and listens(TITLE, true, Some("seal")) were false,
+now true; added: hooks off for Seal does not listen, no title does not
+listen, an unknown or differently spelled name does not hear. fates_options
+the_trap_is_wanted_for_the_rows_or_the_randomizer: "Seal with no row set: no
+trap" becomes the trap with the hooks on, and no trap with the hooks off.
+New: a_seal_classic_new_game_is_heard_at_the_trap_and_picks_once,
+a_seal_casual_new_game_heard_and_watched_in_one_frame_is_one_pick,
+seal_with_the_randomizer_hooks_off_lays_no_trap_at_the_defaults,
+a_seal_refusal_or_a_trap_that_cannot_be_laid_is_said_once. Every other
+round 81 / 81b test unchanged and passing (the Fates behaviour). Nine code
+mutations each fail at least one test (build/r82b/code/planted.txt).
+zakuro-core 275 passed in engine/target/zakuro-core-test, zakuro 131 passed
+(2 ignored) in engine/target/zakuro-frontend-test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/zakuro-core/src/fates_options.rs       | 178 ++++++++++++++++--
+ crates/zakuro-core/src/fates_rando_session.rs |  39 ++--
+ crates/zakuro-core/src/lib.rs                 |   6 +-
+ 3 files changed, 193 insertions(+), 30 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_options.rs b/crates/zakuro-core/src/fates_options.rs
+index 3d6a386..377bfd2 100644
+--- a/crates/zakuro-core/src/fates_options.rs
++++ b/crates/zakuro-core/src/fates_options.rs
+@@ -51,15 +51,16 @@
+ //! randomizer's `NewGameWatch` only sees a New Game when word +0x4 changes, and on Normal +
+ //! Classic it does not (docs/RANDOMIZER_INGAME.md section 16). So the trap is also laid while
+ //! the randomizer listens (`fates_rando_session::hears_step`: the Fates title id,
+-//! `Config::fates_rando`, and the game is Fates itself, not Seal of Flames: the port's frontend
+-//! keeps the hooks on for Seal too, F-047, but Seal at the defaults stays as in round 81, no
+-//! trap), even with every row at Game's choice. At the
++//! `Config::fates_rando`, and a game whose randomizer has the step: Fates, and since round 82b
++//! (docs/ROUND82B_PLAN.md S1) Seal of Flames too, whose hooks the port's frontend keeps on,
++//! F-047), even with every row at Game's choice. At the
+ //! svc the same checks run once: when they hold, "the New Game step was heard" goes to the
+ //! randomizer for this frame (`fates_rando_session::heard_step`) whatever the rows; the rows'
+ //! pending store is recorded only while a row is set, exactly as before. A refusal, or a trap
+ //! that cannot be laid (a stranger word, recompiled code that cannot check itself), is said to
+-//! the player once by the randomizer's notice. The randomizer not listening (`Config::fates_rando`
+-//! false, or Seal of Flames) with every row at Game's choice: no trap and no guest memory read, as in round 81.
++//! the player once by the randomizer's notice (on Seal of Flames too, round 82b S2). The
++//! randomizer not listening (`Config::fates_rando` false) with every row at Game's choice: no
++//! trap and no guest memory read, as in round 81.
+ 
+ use zakuro_cpu::Bus;
+ 
+@@ -244,8 +245,9 @@ pub struct SvcOutcome {
+     pub refused: Option<Refusal>,
+ }
+ 
+-/// round 81b D2: the svc's checks, run once for both listeners. Neither listening (Seal of
+-/// Flames at the defaults, or a word a state brought back): no check, no guest memory read.
++/// round 81b D2: the svc's checks, run once for both listeners. Neither listening (the
++/// randomizer's hooks off at the defaults, or a word a state brought back): no check, no guest
++/// memory read.
+ pub fn svc_outcome(g: &mut dyn Guest, rows: bool, hooks: bool, thumb: bool, at: u32, lr: u32, r0: u32) -> SvcOutcome {
+     if !rows && !hooks {
+         return SvcOutcome::default();
+@@ -391,7 +393,7 @@ pub fn after_frame(system: &mut System) {
+         }
+     }
+     let rows = helpers.any_new_game_row();
+-    // round 81b D1: the randomizer wants the trap too (Fates only; Seal of Flames at the defaults: none)
++    // round 81b D1: the randomizer wants the trap too while it listens (round 82b S1: Fates and Seal of Flames)
+     let hooks = crate::fates_rando_session::hears_step(system);
+     let mut want = trap_wanted(rows, hooks);
+     if want && system.recompiled.as_ref().is_some_and(|lib| !lib.checks_itself()) {
+@@ -803,10 +805,15 @@ mod tests {
+         // the hooks follow the randomizer's own switch: Config::fates_rando off = hooks off
+         assert!(!trap_wanted(false, crate::fates_rando_session::hooks_on(Some(crate::fates_rando::TITLE), false)));
+         assert!(trap_wanted(false, crate::fates_rando_session::hooks_on(Some(crate::fates_rando::TITLE), true)));
+-        // Seal of Flames (hooks on, F-047) at the defaults: no trap, as in round 81 (plan D1, P7)
+-        let seal = crate::fates_rando_session::step_game(Some("seal"));
+-        assert!(!trap_wanted(false, seal), "Seal with no row set: no trap");
+-        assert!(trap_wanted(true, seal), "Seal with a row set: the rows' trap, as in round 81");
++        // round 82b S1 changes one assertion of round 81b on purpose: Seal of Flames (hooks on,
++        // F-047) at the defaults now lays the trap (81b pinned "no trap", its plan D1's wrong
++        // assumption); with its hooks off it still lays none
++        let seal = crate::fates_rando_session::listens(Some(crate::fates_rando::TITLE), true, Some("seal"));
++        assert!(trap_wanted(false, seal), "Seal with the hooks on and no row set: the trap (round 82b)");
++        assert!(trap_wanted(true, seal), "Seal with a row set: the trap, as in round 81");
++        let seal_off = crate::fates_rando_session::listens(Some(crate::fates_rando::TITLE), false, Some("seal"));
++        assert!(!trap_wanted(false, seal_off), "Seal with the hooks off and no row set: no trap");
++        assert!(trap_wanted(true, seal_off), "Seal with the hooks off and a row set: the rows' trap (round 81)");
+         assert!(trap_wanted(false, crate::fates_rando_session::step_game(None)), "Fates: the trap");
+     }
+ 
+@@ -902,6 +909,153 @@ mod tests {
+         assert_eq!(w.cannot_lay(true, false), CannotLay::default());
+     }
+ 
++    // ------------------------------------------------- round 82b: Seal of Flames hears the step
++
++    /// Seal of Flames as the port's frontend runs it: the Fates title id, the hooks on (F-047)
++    fn seal_hooks() -> bool {
++        crate::fates_rando_session::listens(Some(crate::fates_rando::TITLE), true, Some("seal"))
++    }
++
++    /// the trap laid at the defaults (no row set) for these hooks, as `after_frame` does
++    fn laid_for(hooks: bool) -> (Writer, Fake) {
++        let mut w = Writer::default();
++        let mut m = title();
++        assert!(!Helpers::default().any_new_game_row());
++        assert!(!w.jumped(1));
++        let s = w.word_step(&mut m, trap_wanted(false, hooks), false);
++        assert_eq!(s, WordStep { now: Some(ORIGINAL_WORD), write: Some(TRAP_WORD), stranger: false },
++                   "the trap is laid at the defaults");
++        m.set_word(START_FROM_BEGINNING, TRAP_WORD);
++        (w, m)
++    }
++
++    /// one svc at the trap, passed on as `on_svc` does (to the randomizer only while it listens)
++    /// and taken at the frame's end (frame number `frame`)
++    fn svc_to(s: &mut crate::fates_rando_session::Session, m: &mut Fake, hooks: bool, frame: u64) -> (bool, bool) {
++        let o = svc_outcome(m, false, hooks, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK);
++        assert_eq!(o.pending, None, "no row set: nothing pending");
++        if hooks {
++            s.hear(frame, o.seen, o.refused.is_some());
++        }
++        s.take_heard(frame)
++    }
++
++    #[test]
++    fn a_seal_classic_new_game_is_heard_at_the_trap_and_picks_once() {
++        use crate::fates_rando_session::{Pick, Session};
++        let hooks = seal_hooks();
++        assert!(hooks, "Seal listens (round 82b S1)");
++        let (_w, mut m) = laid_for(hooks);
++        for interactive in [false, true] {
++            let mut s = Session::default();
++            s.interactive = interactive;
++            assert_eq!(s.frame(&mut m), Pick::None);
++            // Normal + Classic: word +0x4 stays at its reset value; the watch alone misses it
++            let before = block_bytes(&m);
++            let (seen, refused) = svc_to(&mut s, &mut m, hooks, 2);
++            assert_eq!((seen, refused), (true, false), "the step heard on Seal");
++            let p = s.frame_heard(&mut m, seen, refused);
++            if interactive {
++                assert_eq!(p, Pick::Page, "the page opens once");
++            } else {
++                assert!(matches!(p, Pick::Answer(_)), "one pick: {p:?}");
++            }
++            for _ in 0..10 {
++                assert_eq!(s.frame(&mut m), Pick::None, "never a second pick");
++            }
++            assert!(s.notices.is_empty(), "no warning on a good pick");
++            assert_eq!(block_bytes(&m), before, "the pick reads only");
++        }
++        assert!(m.writes.is_empty(), "no guest byte written at the svc");
++    }
++
++    #[test]
++    fn a_seal_casual_new_game_heard_and_watched_in_one_frame_is_one_pick() {
++        use crate::fates_rando_session::{Pick, Session};
++        let hooks = seal_hooks();
++        let (_w, mut m) = laid_for(hooks);
++        let mut s = Session::default();
++        s.interactive = true;
++        assert_eq!(s.frame(&mut m), Pick::None);
++        // Normal + Casual: the svc hears the step and the mode word changes in the same frame
++        let (seen, refused) = svc_to(&mut s, &mut m, hooks, 2);
++        m.set_word(BLOCK + 4, 0x4001_5EDE);
++        assert_eq!(s.frame_heard(&mut m, seen, refused), Pick::Page);
++        let later: Vec<Pick> = (0..10).map(|_| s.frame(&mut m)).collect();
++        assert!(later.iter().all(|p| *p == Pick::None), "one pick, not two: {later:?}");
++        // the word's change one frame after the heard pick: the same New Game
++        let (_w, mut m) = laid_for(hooks);
++        let mut s = Session::default();
++        s.interactive = true;
++        s.frame(&mut m);
++        let (seen, refused) = svc_to(&mut s, &mut m, hooks, 2);
++        assert_eq!(s.frame_heard(&mut m, seen, refused), Pick::Page);
++        m.set_word(BLOCK + 4, 0x4001_5EDE);
++        assert_eq!(s.frame(&mut m), Pick::None, "the same New Game");
++        assert!(s.notices.is_empty());
++    }
++
++    #[test]
++    fn seal_with_the_randomizer_hooks_off_lays_no_trap_at_the_defaults() {
++        use crate::fates_rando_session::{Pick, Session};
++        let hooks = crate::fates_rando_session::listens(Some(crate::fates_rando::TITLE), false, Some("seal"));
++        assert!(!hooks, "Config::fates_rando false: Seal does not listen");
++        let mut w = Writer::default();
++        let mut m = title();
++        m.untouchable = true;
++        for f in 1..200 {
++            let j = w.jumped(f);
++            assert_eq!(w.word_step(&mut m, trap_wanted(false, hooks), j), WordStep::default(), "frame {f}");
++        }
++        // a svc there anyway (a state brought the word back): no check, no read, nothing heard
++        assert_eq!(svc_outcome(&mut m, false, hooks, false, START_FROM_BEGINNING, CALL_RETURN, BLOCK),
++                   SvcOutcome::default());
++        m.untouchable = false;
++        assert_eq!(m.reads, 0);
++        assert!(m.writes.is_empty());
++        assert_eq!(m.word(START_FROM_BEGINNING), ORIGINAL_WORD);
++        // and the randomizer sees no pick and says nothing on Classic, as in round 81
++        let mut s = Session::default();
++        s.frame(&mut m);
++        let (seen, refused) = svc_to(&mut s, &mut m, hooks, 2);
++        assert_eq!(s.frame_heard(&mut m, seen, refused), Pick::None);
++        assert!(s.notices.is_empty());
++        assert_eq!(w.cannot_lay(false, hooks), CannotLay::default(), "no warning either");
++    }
++
++    #[test]
++    fn a_seal_refusal_or_a_trap_that_cannot_be_laid_is_said_once() {
++        use crate::fates_rando_session::{Pick, Session, CLASSIC_CANNOT, NOT_YOUR_SEED};
++        let hooks = seal_hooks();
++        // refused at the trap (a player army: not a New Game): no pick, the warning once
++        let (_w, mut m) = laid_for(hooks);
++        army(&mut m);
++        m.writes.clear();
++        let mut s = Session::default();
++        s.frame(&mut m);
++        let (seen, refused) = svc_to(&mut s, &mut m, hooks, 2);
++        assert_eq!((seen, refused), (false, true));
++        assert_eq!(s.frame_heard(&mut m, seen, refused), Pick::None, "refused: no pick");
++        assert_eq!(s.notices, vec![NOT_YOUR_SEED.to_string()]);
++        for f in 3..8 {
++            let (seen, refused) = svc_to(&mut s, &mut m, hooks, f);
++            assert_eq!(s.frame_heard(&mut m, seen, refused), Pick::None);
++        }
++        assert_eq!(s.notices.len(), 1, "said once");
++        assert!(m.writes.is_empty());
++        // a stranger word on Seal at the defaults: the randomizer's line once, never the rows'
++        let mut w = Writer::default();
++        let mut m = title();
++        m.set_word(START_FROM_BEGINNING, 0xE1A0_0000);
++        let st = w.word_step(&mut m, trap_wanted(false, hooks), false);
++        assert!(st.stranger);
++        assert_eq!(st.write, None, "a stranger word is left alone");
++        assert_eq!(w.cannot_lay(false, hooks), CannotLay { rows: false, rando: true });
++        assert_eq!(w.cannot_lay(false, hooks), CannotLay::default(), "once");
++        assert!(m.writes.is_empty());
++        assert!(CLASSIC_CANNOT.starts_with("Classic New Games cannot start the randomizer"));
++    }
++
+     #[test]
+     fn a_load_never_writes() {
+         // a load fills the army (and the block from the save) without StartFromBeginning: no svc,
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 39722c6..a406c0a 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -147,28 +147,32 @@ pub fn is_fates(system: &System) -> bool {
+ }
+ 
+ /// round 81b D1: the randomizer listens for the New Game step (`fates_options` lays the trap
+-/// for it, `heard_step` records it) only for Fire Emblem Fates itself (`step_game`). The port's
+-/// frontend keeps the hooks on for Seal of Flames too (F-047), but Seal at the defaults stays as
+-/// in round 81: no trap, no step heard, no warning (docs/ROUND81B_PLAN.md D1, P7).
++/// for it, `heard_step` records it) while its hooks are on (`hooks_on`) for a game whose
++/// randomizer has that step (`step_game`). Round 82b (docs/ROUND82B_PLAN.md S1): Seal of Flames
++/// too, so its Normal + Classic New Games are heard as Fates' have been since round 81b; the
++/// hooks decide (the port's frontend keeps them on for Seal, F-047; `Config::fates_rando` off
++/// means no trap, no step heard and no warning, as in round 81).
+ pub fn hears_step(system: &System) -> bool {
+     listens(system.title.as_ref().map(|t| t.program_id()), system.config.fates_rando,
+             system.config.fates_rando_game.as_deref())
+ }
+ 
+-/// `hears_step` from its parts: the hooks on (`hooks_on`) and the game Fates itself (`step_game`).
++/// `hears_step` from its parts: the hooks on (`hooks_on`) and a game with the step (`step_game`).
+ pub fn listens(program_id: Option<u64>, fates_rando: bool, game: Option<&str>) -> bool {
+     hooks_on(program_id, fates_rando) && step_game(game)
+ }
+ 
+ /// round 81b D1: the games whose randomizer hears the New Game step: Fates (`None`, the
+-/// default, or "fates"); not a mod sharing the title id ("seal").
++/// default, or "fates"); round 82b S1: and Seal of Flames ("seal"), which has the randomizer
++/// (F-047) and the same `StartFromBeginning` step (round 81 P6 trapped it there). Any other
++/// name: not heard (fail closed).
+ pub fn step_game(game: Option<&str>) -> bool {
+-    matches!(game, None | Some("fates"))
++    matches!(game, None | Some("fates") | Some("seal"))
+ }
+ 
+ /// the randomizer's hooks run for Fire Emblem Fates only, and only while the frontend
+-/// lets them (`Config::fates_rando`, off for a mod that shares the title id, such as
+-/// Seal of Flames by Laz14): off, every hook returns at once, so no mode-pick watch, no
++/// lets them (`Config::fates_rando`; this port's frontend keeps it on for Seal of Flames
++/// by Laz14 too, F-047): off, every hook returns at once, so no mode-pick watch, no
+ /// test-hook answer, no tool and no `<data>/rando`.
+ pub fn hooks_on(program_id: Option<u64>, fates_rando: bool) -> bool {
+     fates_rando && program_id == Some(TITLE)
+@@ -1459,7 +1463,7 @@ mod tests {
+     #[test]
+     fn the_hooks_run_for_fates_only_and_only_while_the_frontend_lets_them() {
+         assert!(hooks_on(Some(TITLE), true));
+-        // a mod sharing Fates' title id (Seal of Flames by Laz14): every hook off
++        // the frontend's switch off (any game on the title id): every hook off
+         assert!(!hooks_on(Some(TITLE), false));
+         assert!(!hooks_on(Some(0x0004_0000_000A_0500), true));
+         assert!(!hooks_on(None, true));
+@@ -1468,17 +1472,22 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn only_fates_itself_hears_the_new_game_step() {
+-        // round 81b D1: Fates (the default None, or "fates") hears; Seal of Flames does not
++    fn fates_and_seal_hear_the_new_game_step_and_the_hooks_decide() {
++        // round 81b D1: Fates (the default None, or "fates") hears. Round 82b S1 changes two
++        // assertions of round 81b on purpose: Seal of Flames now hears too (`step_game(Some("seal"))`
++        // and `listens(.., Some("seal"))` were pinned false, the wrong assumption of 81b's D1)
+         assert!(step_game(None));
+         assert!(step_game(Some("fates")));
+-        assert!(!step_game(Some("seal")));
+-        assert!(!step_game(Some("anything else")));
++        assert!(step_game(Some("seal")), "round 82b S1: Seal has the randomizer and the same step");
++        assert!(!step_game(Some("anything else")), "an unknown game: not heard (fail closed)");
++        assert!(!step_game(Some("Seal")), "the frontend's exact name only");
+         assert!(listens(Some(TITLE), true, None), "Fates with the hooks on: listens");
+-        assert!(!listens(Some(TITLE), true, Some("seal")), "Seal (hooks on, F-047): does not");
++        assert!(listens(Some(TITLE), true, Some("seal")), "Seal with the hooks on (F-047): listens");
+         assert!(!listens(Some(TITLE), false, None), "hooks off: does not");
++        assert!(!listens(Some(TITLE), false, Some("seal")), "Seal with the hooks off: does not");
+         assert!(!listens(None, true, None));
+-        // a Seal system records nothing at the svc
++        assert!(!listens(None, true, Some("seal")), "no title: does not");
++        // a Seal system with no Fates title loaded (the hooks off) records nothing at the svc
+         let mut system = System::new(crate::Config { fates_rando_game: Some("seal".into()), ..crate::Config::default() });
+         assert!(!hears_step(&system));
+         heard_step(&mut system, true, false);
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 51dc21f..4fcbf40 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -108,9 +108,9 @@ pub struct Config {
+     /// nothing, see idle.
+     pub skip_idle_loops: bool,
+     /// Fire Emblem Fates' in-game randomizer (fates_rando_session) may run for this
+-    /// game. On by default, so every caller is as before; a Fates port's frontend turns
+-    /// it off for a game that shares Fates' title id but is not Fates, a mod such as
+-    /// Seal of Flames by Laz14, and then every randomizer hook returns at once.
++    /// game. On by default, so every caller is as before; a Fates port's frontend may turn
++    /// it off for a game that shares Fates' title id, and then every randomizer hook returns
++    /// at once. (This port keeps it on for Seal of Flames by Laz14 too, F-047; round 82b.)
+     pub fates_rando: bool,
+     /// which game the in-game randomizer makes its runs for: None = Fire Emblem Fates
+     /// itself (as before); Some("seal") = Seal of Flames by Laz14, which shares Fates'

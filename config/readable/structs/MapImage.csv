@@ -1,0 +1,8 @@
+offset,size,type,name,confidence,evidence,elements
+0x002,0x1,u8,play_x_min,high,"TerrainGrid.play_x_min copied by map::Image::Update (config/tables/TerrainGrid.csv); trick::Data::SetDeploy 0x00526FE8 starts a row mark here",
+0x003,0x1,u8,play_y_min,high,"TerrainGrid.play_y_min; SetDeploy 0x00526F9C starts a column mark here",
+0x004,0x1,u8,play_x_end,high,"TerrainGrid.play_x_end; SetDeploy 0x00526FEC marks columns below it",
+0x005,0x1,u8,play_y_end,high,"TerrainGrid.play_y_end; SetDeploy 0x00526FA0 marks rows below it",
+0x408,0x400,u8[1024],draw_terrain,medium,"map::Panel::Danger::SetVertex 0x00391010 reads +0x408 + (x | y << 5) and passes the byte to Terrain::Get: a second 32x32 tile grid (the one the danger zone is drawn over; how it differs from +0x808 is not traced)",
+0x808,0x400,u8[1024],terrain,high,"trick::Data::IsAccess 0x00526D60 and SetDeploy 0x00526F18 read +0x808 + (x | y << 5) and pass the byte to Terrain::Get (a TerrainTile index): the map's current 32x32 tile grid",
+0x1008,0x204,struct:DangerImage,danger,high,"map::Image::Danger::Update is called with MapImage + 0x1008 (DangerPanel::SetValue 0x003BAF28, UnitShowWholeDanger 0x003AD1FC); map::Panel::Danger::Tick 0x00390F24 tests the flag word at +0x1208",

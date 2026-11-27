@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <port@localhost>
+Date: Fri, 20 Nov 2026 21:27:26 -0500
+Subject: [PATCH 16/21] core: Fire Emblem Fates randomizer: chapter person
+ files and map settings laid in the read
+
+Engine round E1 (F-046 / F-047, round 59). Two new file kinds in the patch file,
+both patched only inside the game's own read of its RomFS, like the placements:
+
+- `person`: `GameData/Person/**` (the chapter person files and the route-variant
+  HANDOVER files; `Person::Load` 0x0044A808 builds `GameData/Person/%s.bin.lz` when
+  the game needs one). This lays the character shuffle's route-variant rows ("keep the
+  face"), enemy levels and tougher bosses from the in-game page.
+- `mapconfig`: `map/config/<chapter>.bin`, stored plain (the format string
+  `map/config/%s.bin` in the game's code): the chapter's map theme names (music).
+
+`v` cells may now also lie in the file's string pool (offset at or past the pool
+start, never inside the relocation or label lists, same length): the music track
+writes a new song name over the old one in place, never longer (Grok's pick A,
+docs/collab/E1_MUSIC_GROK.md), so these files keep their exact size and need no label
+pointers. A label pointer in a person or map settings file is refused and the file is
+served unchanged with a notice (there is no in-memory path for them); a plain file
+must keep its exact size. Files of these kinds that cannot be laid say so ("chapter
+people kept original", "map settings kept original").
+
+Without an active randomized run nothing changes: the hooks return at once as before.
+Checked: `cargo test -p zakuro-core --lib` 180 passed (new test
+plain_file_pool_cells_and_refusals); made_patch_fits_the_real_files with a made patch
+(seed e1a: shuffle route, music maps+battles, enemy levels 2, bosses linear) on the
+clean dump: all 110 person files and 99 map settings files fit and show every new cell.
+---
+ crates/zakuro-core/src/fates_rando.rs         |  24 +++-
+ crates/zakuro-core/src/fates_rando_file.rs    | 127 ++++++++++++++++--
+ crates/zakuro-core/src/fates_rando_session.rs |  22 ++-
+ 3 files changed, 158 insertions(+), 15 deletions(-)
+
+diff --git a/crates/zakuro-core/src/fates_rando.rs b/crates/zakuro-core/src/fates_rando.rs
+index 250f524..554241d 100644
+--- a/crates/zakuro-core/src/fates_rando.rs
++++ b/crates/zakuro-core/src/fates_rando.rs
+@@ -26,12 +26,18 @@
+ //! seed <seed>
+ //! options <json, not read here>
+ //! gamedata-sha256 <hex>
+-//! file gamedata|dispos <romfs path>
++//! file gamedata|dispos|person|mapconfig <romfs path>
+ //! v <offset> <original bytes> <new bytes>
+ //! p <offset> <original label|-> <new label|-> <g|s|-> <new label offset|-> <original value|->
+ //! end <number of v and p lines>
+ //! ```
+ //!
++//! `person` (`GameData/Person/**`) and `mapconfig` (`map/config/*.bin`, stored plain) files
++//! (engine round E1) are patched only in the game's own read, like the placements. Their
++//! `v` cells may also lie in the file's string pool (offset at or past the pool start): the
++//! music track writes a new song name over the old one in place, never longer (docs/collab/
++//! E1_MUSIC_GROK.md); a `p` cell in such a file is refused (the file is served unchanged).
++//!
+ //! `p` cells are pointers to label text (a placement's class or item, for example). In
+ //! memory a pointer is "data start + offset", so the new value is GameData's data start
+ //! (`g`) or this file's data start (`s`) plus the label's offset, and the guard compares
+@@ -111,6 +117,20 @@ impl Guest for Memory {
+ pub enum Kind {
+     GameData,
+     Dispos,
++    /// engine round E1: a chapter person file or a route-variant (HANDOVER) file,
++    /// `GameData/Person/**` (`Person::Load` 0x0044A808 names it `GameData/Person/%s.bin.lz`
++    /// when the game needs it); patched in the game's own read only
++    Person,
++    /// engine round E1: a chapter's map settings, `map/config/<chapter>.bin` (stored plain,
++    /// not compressed; the map theme names); patched in the game's own read only
++    MapConfig,
++}
++
++impl Kind {
++    /// files patched inside the game's read of the RomFS (`fates_rando_file`)
++    pub fn in_read(self) -> bool {
++        matches!(self, Kind::Dispos | Kind::Person | Kind::MapConfig)
++    }
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -193,6 +213,8 @@ impl Patch {
+                     let kind = match w[1] {
+                         "gamedata" => Kind::GameData,
+                         "dispos" => Kind::Dispos,
++                        "person" => Kind::Person,
++                        "mapconfig" => Kind::MapConfig,
+                         k => return Err(at(format!("unknown file kind {k}"))),
+                     };
+                     p.files.push(FilePatch { kind, rel: w[2].to_string(), values: vec![], ptrs: vec![] });
+diff --git a/crates/zakuro-core/src/fates_rando_file.rs b/crates/zakuro-core/src/fates_rando_file.rs
+index 6ccbfac..2e2d120 100644
+--- a/crates/zakuro-core/src/fates_rando_file.rs
++++ b/crates/zakuro-core/src/fates_rando_file.rs
+@@ -302,6 +302,31 @@ impl IsBin {
+         out
+     }
+ 
++    /// `len` bytes at `off` (from the data start): in the data, or (engine round E1) in the
++    /// string pool at or past its start; never in the relocation or label lists, never
++    /// across the end of either.
++    pub fn cell(&self, off: u32, len: usize) -> Option<&[u8]> {
++        let (o, se) = (off as usize, self.se() as usize);
++        if o + len <= self.data.len() {
++            Some(&self.data[o..o + len])
++        } else if o >= se {
++            self.strtab.get(o - se..o - se + len)
++        } else {
++            None
++        }
++    }
++
++    pub fn cell_mut(&mut self, off: u32, len: usize) -> Option<&mut [u8]> {
++        let (o, se) = (off as usize, self.se() as usize);
++        if o + len <= self.data.len() {
++            Some(&mut self.data[o..o + len])
++        } else if o >= se {
++            self.strtab.get_mut(o - se..o - se + len)
++        } else {
++            None
++        }
++    }
++
+     pub fn word(&self, off: u32) -> Option<u32> {
+         u32_at(&self.data, off as usize)
+     }
+@@ -320,8 +345,7 @@ impl IsBin {
+ pub fn guard(bin: &IsBin, f: &FilePatch) -> Vec<String> {
+     let mut bad = Vec::new();
+     for v in &f.values {
+-        let at = v.off as usize;
+-        if bin.data.get(at..at + v.old.len()) != Some(&v.old[..]) {
++        if bin.cell(v.off, v.old.len()) != Some(&v.old[..]) || v.new.len() != v.old.len() {
+             bad.push(format!("{}: v {:#x} does not hold its original bytes", f.rel, v.off));
+         }
+     }
+@@ -351,8 +375,9 @@ pub fn guard(bin: &IsBin, f: &FilePatch) -> Vec<String> {
+ /// writes the patch's cells into the file form (after `guard` found nothing).
+ pub fn apply(bin: &mut IsBin, f: &FilePatch) {
+     for v in &f.values {
+-        let at = v.off as usize;
+-        bin.data[at..at + v.new.len()].copy_from_slice(&v.new);
++        if let Some(cell) = bin.cell_mut(v.off, v.new.len()) {
++            cell.copy_from_slice(&v.new);
++        }
+     }
+     let se_old = bin.se();
+     // new labels appended to the pool, one copy each (pool offset)
+@@ -426,6 +451,9 @@ fn find_label(strtab: &[u8], label: &[u8]) -> Option<u32> {
+ /// reasons nothing is patched.
+ pub fn patch_stored(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>> {
+     let one = |e: String| vec![format!("{}: {e}", f.rel)];
++    if f.kind == crate::fates_rando::Kind::MapConfig {
++        return patch_plain(stored, f);
++    }
+     let lz = lz_decompress(stored).map_err(one)?;
+     let mut bin = IsBin::parse(&lz.data).map_err(one)?;
+     // pointers into the area between the data and the pool would move wrongly
+@@ -458,6 +486,27 @@ pub fn patch_stored(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>
+     Ok(out)
+ }
+ 
++/// engine round E1: a file stored plain (`map/config/*.bin`): the IS .bin itself, patched
++/// in place. Only plain cells (the data or the pool); the result must keep the exact size,
++/// because the game reads the size its RomFS directory gives.
++pub fn patch_plain(stored: &[u8], f: &FilePatch) -> Result<Vec<u8>, Vec<String>> {
++    let one = |e: String| vec![format!("{}: {e}", f.rel)];
++    if !f.ptrs.is_empty() {
++        return Err(one("label pointers are not laid in a plain file".into()));
++    }
++    let mut bin = IsBin::parse(stored).map_err(one)?;
++    let bad = guard(&bin, f);
++    if !bad.is_empty() {
++        return Err(bad);
++    }
++    apply(&mut bin, f);
++    let out = bin.build();
++    if out.len() != stored.len() {
++        return Err(one(format!("the patched file has {} bytes, the original {}", out.len(), stored.len())));
++    }
++    Ok(out)
++}
++
+ /// the file as the game holds it after its relocation, from its data start: every
+ /// relocated pointer = base + its file value (what `ArchiveFile` leaves in memory).
+ pub fn relocated(bin: &IsBin, base: u32) -> Vec<u8> {
+@@ -538,6 +587,60 @@ mod tests {
+         assert!(lz_decompress(b"PK").is_err());
+     }
+ 
++    /// engine round E1: a plain map settings file gets a song name written over the old one
++    /// in its own pool (the pointer unchanged), same size; a cell in the relocation list,
++    /// a wrong original or a label pointer is refused and nothing is served.
++    #[test]
++    fn plain_file_pool_cells_and_refusals() {
++        let mut b = IsBin { pad: [0; 16], data: vec![0; 0x10], relocs: vec![0x4], labels: vec![(0, 0)],
++                            strtab: b"SHEET\0STRM_MAP_E1\0".to_vec() };
++        let se = b.se();
++        b.data[0x4..0x8].copy_from_slice(&(se + 6).to_le_bytes());
++        let stored = b.build();
++        let f = FilePatch {
++            kind: Kind::MapConfig,
++            rel: "map/config/A005.bin".into(),
++            values: vec![Value { off: se + 6, old: b"STRM_MAP_E1\0".to_vec(), new: b"STRM_MAP_B2\0".to_vec() }],
++            ptrs: vec![],
++        };
++        let out = patch_stored(&stored, &f).unwrap();
++        assert_eq!(out.len(), stored.len());
++        let nb = IsBin::parse(&out).unwrap();
++        assert_eq!(nb.string_at(nb.word(0x4).unwrap()), Some(&b"STRM_MAP_B2"[..]));
++        assert_eq!(nb.word(0x4), b.word(0x4), "the pointer itself is unchanged");
++        assert_eq!(nb.string_at(se), Some(&b"SHEET"[..]), "the label name is untouched");
++        // a shorter name: NUL padded, same size
++        let mut g = f.clone();
++        g.values[0].new = b"STRM_MAP_A\0\0".to_vec();
++        let nb = IsBin::parse(&patch_stored(&stored, &g).unwrap()).unwrap();
++        assert_eq!(nb.string_at(nb.word(0x4).unwrap()), Some(&b"STRM_MAP_A"[..]));
++        // refusals
++        let mut wrong = f.clone();
++        wrong.values[0].old = b"STRM_MAP_E2\0".to_vec();
++        assert!(patch_stored(&stored, &wrong).is_err(), "original bytes differ");
++        let mut lists = f.clone();
++        lists.values[0].off = 0x10; // the relocation list
++        lists.values[0].old = stored[0x30..0x34].to_vec();
++        lists.values[0].new = vec![0; 4];
++        assert!(patch_stored(&stored, &lists).is_err(), "never inside the relocation list");
++        let mut long = f.clone();
++        long.values[0].new = b"STRM_MAP_C1R\0".to_vec();
++        assert!(patch_stored(&stored, &long).is_err(), "a longer name never fits");
++        let mut ptr = f.clone();
++        ptr.ptrs.push(Ptr { off: 0x4, old: Some(b"STRM_MAP_E1".to_vec()), new: None, target: None, old_value: Some(se + 6) });
++        assert!(patch_stored(&stored, &ptr).is_err(), "no label pointers in a plain file");
++        // a person file (LZ) takes the same pool cell
++        let mut pf = f.clone();
++        pf.kind = Kind::Person;
++        pf.rel = "GameData/Person/A/A007.bin.lz".into();
++        let z = lz11_compress(&stored, 0x13, stored.len() as u32);
++        let mut zpad = z.clone();
++        zpad.extend_from_slice(&[0u8; 16]);
++        let out = patch_stored(&zpad, &pf).unwrap();
++        let nb = IsBin::parse(&lz_decompress(&out).unwrap().data).unwrap();
++        assert_eq!(nb.string_at(nb.word(0x4).unwrap()), Some(&b"STRM_MAP_B2"[..]));
++    }
++
+     #[test]
+     fn is_bin_round_trips() {
+         let b = sample();
+@@ -616,13 +719,16 @@ mod tests {
+         let (Ok(patch), Ok(romfs)) = (std::env::var("FEF_RANDO_PATCH"), std::env::var("FEF_ROMFS")) else { return };
+         let p = Patch::parse(&std::fs::read_to_string(patch).unwrap()).unwrap();
+         let (mut ok, mut refused) = (0, Vec::new());
+-        for f in p.files.iter().filter(|f| f.kind == Kind::Dispos) {
++        let mut kinds_seen = [0usize; 3];
++        for f in p.files.iter().filter(|f| f.kind.in_read()) {
+             let stored = std::fs::read(std::path::Path::new(&romfs).join(&f.rel)).unwrap();
++            kinds_seen[match f.kind { Kind::Dispos => 0, Kind::Person => 1, _ => 2 }] += 1;
+             match patch_stored(&stored, f) {
+                 Ok(out) => {
+                     assert_eq!(out.len(), stored.len());
+-                    // the relocated result shows every cell's new value
+-                    let nb = IsBin::parse(&lz_decompress(&out).unwrap().data).unwrap();
++                    // the relocated result shows every cell's new value (pool cells included)
++                    let raw = if f.kind == Kind::MapConfig { out.clone() } else { lz_decompress(&out).unwrap().data };
++                    let nb = IsBin::parse(&raw).unwrap();
+                     let base = 0x3000_0020;
+                     let img = relocated(&nb, base);
+                     for v in &f.values {
+@@ -640,12 +746,15 @@ mod tests {
+                 Err(e) => refused.push(e.join("; ")),
+             }
+         }
+-        eprintln!("placement files patched in the read: {ok} fit, {} refused", refused.len());
++        eprintln!("files patched in the read: {ok} fit, {} refused (placements {}, person {}, map settings {})",
++                  refused.len(), kinds_seen[0], kinds_seen[1], kinds_seen[2]);
+         for r in &refused {
+             eprintln!("  refused: {r}");
+         }
+         // only size may refuse a file of a made patch (those are laid at the next system
+         // call instead); a guard failure on the clean dump would be a real error
+-        assert!(refused.iter().all(|r| r.contains("does not fit") && !r.contains(';')), "{refused:?}");
++        // (engine round E1: person and map settings files have no later path, so they must fit)
++        assert!(refused.iter().all(|r| r.contains("does not fit") && !r.contains(';') && r.contains("GameData/Dispos/")),
++                "{refused:?}");
+     }
+ }
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 0391ce5..bd95d3b 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -424,7 +424,7 @@ fn placements(system: &System, patch: &Patch) -> Vec<Placement> {
+         }
+         let mut out = Vec::new();
+         for (i, f) in patch.files.iter().enumerate() {
+-            if f.kind != fates_rando::Kind::Dispos {
++            if !f.kind.in_read() {
+                 continue;
+             }
+             match layered.lookup(&f.rel) {
+@@ -437,7 +437,7 @@ fn placements(system: &System, patch: &Patch) -> Vec<Placement> {
+     let Some(romfs) = title.romfs.as_ref() else { return Vec::new() };
+     let mut out = Vec::new();
+     for (i, f) in patch.files.iter().enumerate() {
+-        if f.kind != fates_rando::Kind::Dispos {
++        if !f.kind.in_read() {
+             continue;
+         }
+         match romfs.lookup(&f.rel) {
+@@ -520,6 +520,13 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     // file, never in the read: the round 58 robot check found them wrong in memory on every
+     // map whose file was patched in the read (A004: two units joined with no weapon), while
+     // the in-memory path laid every cell of every other file
++    // (engine round E1) chapter person files and map settings have no in-memory path: they
++    // are laid in the read or not at all, and say so
++    let placement = f.kind == fates_rando::Kind::Dispos;
++    if !f.ptrs.is_empty() && !placement {
++        notice(system, format!("{}: kept original (label pointers are laid only in placement files)", f.rel));
++        return None;
++    }
+     if !f.ptrs.is_empty() {
+         log::info!("fates_rando: {} has label pointers; laid in memory at the next system call after the game stores it", f.rel);
+         system.rando.placements[k].late = true;
+@@ -539,16 +546,21 @@ fn make_placement(system: &mut System, k: usize) -> Option<Arc<Vec<u8>>> {
+     };
+     match crate::fates_rando_file::patch_stored(&stored, &f) {
+         Ok(bytes) => {
+-            log::info!("fates_rando: {} patched in the read ({} cells)", f.rel, f.values.len() + f.ptrs.len());
++            log::info!("fates_rando: {} patched in the read ({} cells, frame {})", f.rel, f.values.len() + f.ptrs.len(), system.frames);
+             Some(Arc::new(bytes))
+         }
+-        Err(bad) if bad.len() == 1 && bad[0].contains("does not fit") => {
++        Err(bad) if placement && bad.len() == 1 && bad[0].contains("does not fit") => {
+             log::info!("fates_rando: {}; laid in memory at the next system call after the game stores it", bad[0]);
+             system.rando.placements[k].late = true;
+             None
+         }
+         Err(bad) => {
+-            notice(system, format!("{}: placements kept original ({} problems, first: {})", f.rel, bad.len(), bad[0]));
++            let what = match f.kind {
++                fates_rando::Kind::Person => "chapter people",
++                fates_rando::Kind::MapConfig => "map settings",
++                _ => "placements",
++            };
++            notice(system, format!("{}: {what} kept original ({} problems, first: {})", f.rel, bad.len(), bad[0]));
+             None
+         }
+     }

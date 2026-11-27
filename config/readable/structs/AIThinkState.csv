@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence,elements
+0x14C,0x4,u32,move_over,medium,"AIThink::IsMoveOver(void) 0x004C8590 answers whether this word is not 0; IsMoveOver(Unit*,int,int) tests it before the unit's tile (Awakening: the forced unit index of the AI sequence); meaning of the value not traced",

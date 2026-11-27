@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x0,4,ptr,scene,low,"The only declared field is a pointer to data this tool does not decode; kept as is"

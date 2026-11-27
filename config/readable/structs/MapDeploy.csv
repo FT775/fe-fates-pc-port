@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence,elements
+0x80C,0x4,u32,move_image,high,"map::Image::Danger::Add 0x0038F3C8 passes this word as this to map::Deploy::MoveImage::Get(int,int) (below 0: tile not reached)",
+0x810,0x4,u32,zone_a,high,"Danger::Add 0x0038F4B8 sets the cannon tiles in the 128-byte tile set this word points to and 0x0038F71C ORs that set into DangerImage.marked_a / all_a (after map::Deploy::UnitMove filled it)",
+0x814,0x4,u32,zone_b,high,"Danger::Add 0x0038F74C ORs the 128-byte tile set this word points to into DangerImage.marked_b / all_b, the sets the danger panel draws",
+0x151C,0x80,u8[128],trick_marks,high,"trick::Data::SetDeploy 0x00526DB4 clears these 128 bytes, then sets bit (i & 7) of byte (i >> 3) for each tile i = x | y << 5 a gimmick's preview marks (the 32x32 map, one bit per tile)",

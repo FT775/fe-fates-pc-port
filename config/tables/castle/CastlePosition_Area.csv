@@ -1,0 +1,5 @@
+offset,size,type,name,confidence,evidence
+0x0,1,s8,x1,medium,"File declares X1 (signed)"
+0x1,1,s8,y1,medium,"File declares Y1 (signed)"
+0x2,1,s8,x2,medium,"File declares X2 (signed)"
+0x3,1,s8,y2,medium,"File declares Y2 (signed)"

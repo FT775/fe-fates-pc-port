@@ -1,0 +1,2 @@
+offset,size,type,name,confidence,evidence
+0x0,4,list:CastleButlerVoice_Voice,voices,high,"castle::ButlerVoice::GetVoiceID (0044E98C) reads row+0x0 -> {count, items}, item stride 12"

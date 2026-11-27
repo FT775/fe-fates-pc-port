@@ -1,0 +1,16 @@
+offset,size,type,name,confidence,evidence,elements
+0x00,4,str:self,cid,high,Chapter::GetTitleName/GetTerrainName/GetTitlePrefix read +0x0 (CID_ string; equals the record label),
+0x04,4,str,battle_map,medium,data: Btl_* battle-background names (3 records none); Paragon FE14 Chapter.yml 'battlefield' (fact),
+0x08,1,u8,chapter_number,high,Chapter::SerializePointer stores +0x8 (u8); equals the record index in every record (Chapter::Get(unsigned char)),
+0x09,1,u8,chapter_type,medium,"read by MemberMenu::Draw / ProcEpilogue::SettingWord / Spot::Rebuild (+0x9 u8; Spot::Rebuild walks back over chapters whose type is not 0, so 0 = main story); values 0-7; Paragon 'type' (fact)",
+0x0A,3,ref8:Chapter[3],next_chapter,high,ChapterComplete 001B64D8 takes the next chapter as +0xA[route byte] (GameUserData+0x2E; docs/ROUTES.md); Spot::Rebuild 003D314C walks forward through +0xA[route]; index 0/1/2 = Birthright/Conquest/Revelation (Route::Type),A|B|C
+0x0D,3,ref8:Chapter[3],required_chapter,high,Spot::Rebuild 003D314C walks the chapter chain backwards through +0xD[route byte] (u8; GameUserData+0x2E) to mark the chapters before the current one; data: the previous chapter on that route (0 = none); Paragon 'route requirement' (fact),A|B|C
+0x10,2,u16,married_character,low,data 0..0x2B (101 zero); Paragon 'married_character' (fact),
+0x12,1,s8,offspring_seal_level,medium,event::Informal GetRank 00431A38 uses the current chapter's +0x12 (s8; +0x13 when GameUserData+0x28 bit 1 is set) as the rank instead of the scenario rank when it is >= 0; data 0..0x28 or -1; Paragon 'offspring_seal_level' (fact); WAS u8 (255 now shows as -1),
+0x13,1,s8,offspring_seal_level_2,medium,event::Informal GetRank 00431A38 reads +0x13 (s8) instead of +0x12 when GameUserData+0x28 bit 1 is set; Paragon (fact); WAS u8,
+0x14,1,u8,route_mask,high,Spot::UpdateSpot / Spot::Rebuild list a chapter when +0x14 & (1 << route byte); values 1/2/4/7 = route bits Birthright/Conquest/Revelation (docs/ROUTES.md),
+0x15,1,u8,unknown_15,low,read by GameUserData::Deserialize (+0x15 u8); values 0-3,
+0x16,2,pad,pad_16,high,zero in every record; no code read seen,
+0x18,1,u8,prep_screen,low,data 0x7F/0x80/0; Paragon 'battle_prep_screen' (fact),
+0x19,1,u8,unknown_19,low,data 0-2,
+0x1A,2,pad,pad_1a,high,zero in every record; no code read seen,

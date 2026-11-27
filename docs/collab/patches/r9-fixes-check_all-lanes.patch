@@ -1,0 +1,49 @@
+diff --git a/tools/check_all.py b/tools/check_all.py
+index e416118..36dd9ab 100644
+--- a/tools/check_all.py
++++ b/tools/check_all.py
+@@ -1886,8 +1886,14 @@ def run_parallel(ctx: Ctx, rows: list[Row], reasons: dict, jobs: int | None, str
+     interrupted = False
+ 
+     def lanes() -> int:
++        """Called with cond held. The count (tasklist, up to 30 s) runs with cond released, so finishing rows
++        never wait on it (round 8 review)."""
+         if time.time() - lanes_cache[0] > 5:
+-            n, why = lanes_now(ctx.root, jobs, counter)
++            cond.release()
++            try:
++                n, why = lanes_now(ctx.root, jobs, counter)
++            finally:
++                cond.acquire()
+             if n != lanes_cache[1] or not lanes_cache[2]:      # say it when the lane count changes
+                 print(f"[check-all] lanes: {n} ({why})", file=stream, flush=True)
+             lanes_cache[:] = [time.time(), n, why]
+diff --git a/tests/test_check_all.py b/tests/test_check_all.py
+index eff7691..152ad5c 100644
+--- a/tests/test_check_all.py
++++ b/tests/test_check_all.py
+@@ -1317,6 +1317,24 @@ class Parallel(unittest.TestCase):
+         self.assertEqual(st, {"p1": "PASS", "f1": "FAIL", "k1": "KNOWN", "dep": "SKIP", "dep2": "PASS",
+                               "fn": "PASS", "sk": "SKIP", "miss": "FAIL"})
+ 
++    def test_lane_count_runs_outside_the_lock(self):
++        """Round 9: a slow tasklist (the counter) must not hold back a row that finishes meanwhile."""
++        rows = [stamp_row("long", 8.0, self.out), stamp_row("short", 5.5, self.out),
++                stamp_row("after", 0.1, self.out, needs=("after:short",))]
++        ctx = self.ctx("lk")
++        seen, calls = [], [0]
++
++        def counter():
++            calls[0] += 1
++            if calls[0] > 1 and not seen:
++                time.sleep(2.0)              # the count is slow; "short" finishes during it
++                seen.append("short" in ctx.results)
++            return 0
++        with open(os.devnull, "w") as quiet:
++            par = CA.run_parallel(ctx, rows, {}, None, stream=quiet, counter=counter)
++        self.assertTrue(all(r["status"] == "PASS" for r in par), par)
++        self.assertEqual(seen, [True], "a row finishing during the lane count waited for the lock")
++
+     def test_rows_overlap_but_locked_rows_never_do(self):
+         CA.PARALLEL_LOCKS.update({"l1": ("build:x",), "l2": ("build:x",)})
+         rows = [stamp_row("a", 2.0, self.out), stamp_row("b", 2.0, self.out),

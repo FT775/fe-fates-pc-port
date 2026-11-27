@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Thu, 26 Nov 2026 05:04:34 -0500
+Subject: [PATCH] page: Fire Emblem Fates picker: show Seal of Flames only when
+ it is added
+
+Round 83, the Seal edition split, round A step A1 (docs/SEAL_EDITION_PLAN.md
+sections 3 and 7, H1-H5; the owner's request for an optional Seal of Flames
+edition and his "Yes, that order" to Grok's order in
+docs/collab/SEAL_EDITION_SPLIT_GROK.md; call 1 taken by default, F-070).
+Grok's rule was an engine build only if the page cannot already hide Seal
+of Flames. It could not: the Choose your game page opened at every windowed
+start of a Fire Emblem Fates program, with Seal of Flames greyed and an
+Install button, and Esc > Switch game was always set. Seal of Flames is
+Laz14's fan mod (gamebanana.com/mods/656034, CC BY-NC-ND 4.0); no byte of
+it is read or shipped, and "installed" is still decided from folder names
+and the profile's own JSON.
+
+A runtime check keyed on SealStatus, one program for both editions, no
+cargo feature, no file moves:
+
+- H1 (game_pick::page_wanted, windowed_start): the page opens only when
+  picker_applies() and Seal of Flames is Installed or Broken (a broken
+  install still gets its repair line). Missing: Fire Emblem Fates starts at
+  once (lib.rs: App::begin, the page's own start path, with nothing
+  remembered, so the player's game-choice.txt stays as it is; a start that
+  fails shows the page with why, as before).
+- H2 (game_pick::switch_offer): apply_choice leaves menus.switch_game empty
+  when the other game is a Seal of Flames that is Missing. Installed: as
+  before; Broken: greyed with the reason, as before.
+- H3: a remembered Seal choice, --game seal or FEF_GAME_CHOICE=seal with a
+  window while Seal of Flames is Missing starts Fire Emblem Fates with one
+  log line. Headless --game seal keeps its error exit, unchanged.
+- H4 (game_pick::sof_script, port_folder): the port-folder finder and the
+  Install button look for tools\seal\sof.py first, then tools\play\sof.py
+  (the Seal edition's new home; the old place keeps working).
+- H5: the headless report's first boot record (FEF_HEADLESS_REPORT) gains
+  "page": "would open", "skipped (Seal not installed)" or "skipped (not a
+  Fire Emblem Fates program)" (game_pick::page_line), so the hide is proved
+  with no window. Headless runs still never open the page; the other
+  record fields and every robot path are unchanged.
+
+Tests (game_pick, no window): new
+with_no_seal_of_flames_the_page_is_skipped_and_there_is_no_switch_game,
+with_seal_of_flames_installed_the_page_opens_and_switch_game_is_offered,
+with_seal_of_flames_broken_the_page_opens_for_the_repair,
+a_remembered_or_asked_for_seal_of_flames_that_is_missing_starts_fates,
+sof_py_is_found_in_tools_seal_first_then_tools_play; changed on purpose:
+the_page_preselects_and_greys_seal_of_flames_when_it_cannot_be_chosen now
+also says the page is not wanted while Seal is missing and is wanted once
+it is installed. Eight planted bugs (page ignores Seal; page hides a broken
+Seal; Switch game always offered; no log line; the remembered Seal started;
+tools\play first; finder ignores tools\seal; report says "would open" when
+skipped) each fail at least one test (build/r83/eng/planted.txt).
+cargo test -p zakuro --lib: 136 passed, 0 failed, 2 ignored (real-game
+tests, as before).
+---
+ crates/zakuro/src/game_pick.rs | 233 +++++++++++++++++++++++++++++++--
+ crates/zakuro/src/lib.rs       |  40 ++++--
+ 2 files changed, 254 insertions(+), 19 deletions(-)
+
+diff --git a/crates/zakuro/src/game_pick.rs b/crates/zakuro/src/game_pick.rs
+index 88baa69..e148966 100644
+--- a/crates/zakuro/src/game_pick.rs
++++ b/crates/zakuro/src/game_pick.rs
+@@ -8,6 +8,10 @@
+ //! - the page shows only in a program made of one game (linked recompiled code) with a
+ //!   window, when the game it starts is Fire Emblem Fates SE USA; everything else is as
+ //!   Zakuro always was;
++//! - and only when Seal of Flames has been added (round 83, the Seal edition split,
++//!   docs/SEAL_EDITION_PLAN.md section 3): with no Seal profile the page is skipped and
++//!   Fire Emblem Fates starts at once, with no Switch game in the Esc menu
++//!   (`windowed_start`, `page_wanted`, `switch_offer`);
+ //! - Fire Emblem Fates keeps exactly today's paths (`--data`, else the system's place);
+ //!   Seal of Flames plays from its own profile folder (`<profile>\data`: saves, states,
+ //!   cheats, its mods folder with the unchanged mod, its log);
+@@ -21,8 +25,9 @@
+ //!   mod's own tables (`Config::fates_rando_game` = `rando_game(Game::Seal)`).
+ //!
+ //! No byte of the mod is read here: "installed" is decided from folder names and the
+-//! profile's own JSON. The Install button runs the port's `tools/play/sof.py install`
+-//! hidden; that tool reads the owner's download, read-only.
++//! profile's own JSON. The Install button runs the port's `sof.py install` hidden
++//! (`tools/seal/sof.py`, else `tools/play/sof.py`); that tool reads the owner's
++//! download, read-only.
+ 
+ use std::path::{Path, PathBuf};
+ use std::sync::mpsc::{channel, Receiver};
+@@ -203,6 +208,60 @@ pub fn seal_status(profile: Option<&Path>, broken: bool) -> SealStatus {
+     SealStatus::Installed
+ }
+ 
++// ------------------------------------------------------------------ whether the page shows
++
++/// round 83 (H1): whether a start with a window shows the Choose your game page: only
++/// in a program the page applies to, and only when Seal of Flames is there (installed,
++/// or there but needing repair, so its repair line can show). With no Seal profile the
++/// page is skipped: a player who never added the mod never sees it.
++pub fn page_wanted(applies: bool, seal: &SealStatus) -> bool {
++    applies && *seal != SealStatus::Missing
++}
++
++/// round 83 (H5): the headless report's line on whether a start with a window would
++/// show the page.
++pub fn page_line(applies: bool, seal: &SealStatus) -> &'static str {
++    if !applies {
++        "skipped (not a Fire Emblem Fates program)"
++    } else if page_wanted(applies, seal) {
++        "would open"
++    } else {
++        "skipped (Seal not installed)"
++    }
++}
++
++/// what a start with a window does in a program the page applies to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Start {
++    /// the Choose your game page, with this game pre-selected.
++    Page(Game),
++    /// no page: this game starts at once (never remembered: the player's own
++    /// game-choice.txt is left as it is), and the log line to write, if any.
++    Play(Game, Option<String>),
++}
++
++/// round 83 (H1, H3): the page when Seal of Flames is there; else Fire Emblem Fates at
++/// once. A remembered or asked-for (`--game seal`, FEF_GAME_CHOICE) Seal of Flames that
++/// is not there starts Fire Emblem Fates too, with one log line saying so.
++pub fn windowed_start(seal: &SealStatus, preselect: Game) -> Start {
++    if page_wanted(true, seal) {
++        return Start::Page(preselect);
++    }
++    let note = (preselect == Game::Seal).then(|| format!("{SEAL_NAME} was asked for but is not installed; starting {FATES_NAME}"));
++    Start::Play(Game::Fates, note)
++}
++
++/// round 83 (H2): the Esc menu's Switch game while `playing` plays: the other game and
++/// why it can't be chosen now; none when the other game is a Seal of Flames that was
++/// never added.
++pub fn switch_offer(playing: Game, seal: &SealStatus) -> Option<(Game, Option<String>)> {
++    let to = playing.other();
++    if to == Game::Seal && *seal == SealStatus::Missing {
++        return None;
++    }
++    Some((to, if to == Game::Seal { seal.reason() } else { None }))
++}
++
+ // ------------------------------------------------------------------ the game's own settings
+ 
+ /// what Fire Emblem Fates' title id has of its own in the settings: its "Settings for
+@@ -287,21 +346,43 @@ pub fn split_for_save(settings: &Settings, owner: &GameBits) -> (Settings, GameB
+ 
+ // ------------------------------------------------------------------ the Install button
+ 
++/// round 83 (H4): where the port keeps sof.py, in the order looked for: the Seal of
++/// Flames edition's `tools\seal\sof.py` first, then the old `tools\play\sof.py`.
++fn sof_places(repo: &Path) -> [PathBuf; 2] {
++    [repo.join("tools").join("seal").join("sof.py"), repo.join("tools").join("play").join("sof.py")]
++}
++
++/// the port's sof.py in this folder: `tools\seal\sof.py` when it is there, else
++/// `tools\play\sof.py` (also when neither is, so an error names a real place).
++pub fn sof_script(repo: &Path) -> PathBuf {
++    let [seal, play] = sof_places(repo);
++    if seal.is_file() {
++        seal
++    } else {
++        play
++    }
++}
++
++/// the first of these folders that holds the port's sof.py (either place).
++fn port_folder<'a>(mut dirs: impl Iterator<Item = &'a Path>) -> Option<PathBuf> {
++    dirs.find(|dir| sof_places(dir).iter().any(|script| script.is_file())).map(Path::to_owned)
++}
++
+ /// the port's folder: FEF_REPO, else the first folder above the program holding
+-/// tools\play\sof.py.
++/// tools\seal\sof.py or tools\play\sof.py.
+ pub fn repo() -> Option<PathBuf> {
+     if let Some(dir) = std::env::var_os("FEF_REPO").filter(|dir| !dir.is_empty()) {
+         return Some(PathBuf::from(dir));
+     }
+     let exe = std::env::current_exe().ok()?;
+-    exe.ancestors().skip(1).take(6).find(|dir| dir.join("tools").join("play").join("sof.py").is_file()).map(Path::to_owned)
++    port_folder(exe.ancestors().skip(1).take(6))
+ }
+ 
+-/// the hidden install command: `python -I <repo>\tools\play\sof.py install`, no window
+-/// (CREATE_NO_WINDOW), no input, its output piped to the log. Returns the creation flags
+-/// too, for the test.
++/// the hidden install command: `python -I <repo>\tools\seal\sof.py install` (else
++/// tools\play\sof.py, `sof_script`), no window (CREATE_NO_WINDOW), no input, its output
++/// piped to the log. Returns the creation flags too, for the test.
+ pub fn install_command(python: &zakuro_core::fates_rando_session::Python, repo: &Path) -> (std::process::Command, u32) {
+-    let script = repo.join("tools").join("play").join("sof.py");
++    let script = sof_script(repo);
+     let args: [&std::ffi::OsStr; 3] = ["-I".as_ref(), script.as_os_str(), "install".as_ref()];
+     let (mut cmd, flags) = zakuro_core::fates_rando_session::python_command(python, &args);
+     cmd.current_dir(repo);
+@@ -313,7 +394,7 @@ fn start_install() -> Receiver<Result<String, String>> {
+     let (send, receive) = channel();
+     std::thread::spawn(move || {
+         let result = (|| {
+-            let repo = repo().ok_or("the port's tools\\play\\sof.py was not found above the program")?;
++            let repo = repo().ok_or("the port's sof.py (tools\\seal or tools\\play) was not found above the program")?;
+             let python = zakuro_core::fates_rando_session::find_python().map_err(|_| "Python 3 was not found".to_owned())?;
+             let (cmd, _) = install_command(&python, &repo);
+             let (code, lines) = zakuro_core::fates_rando_session::run_hidden(cmd, INSTALL_LIMIT)?;
+@@ -600,7 +681,10 @@ mod tests {
+     fn the_page_preselects_and_greys_seal_of_flames_when_it_cannot_be_chosen() {
+         let dir = scratch("page");
+         let mut pick = GamePick::new(Some(dir.clone()), false, Game::Seal);
+-        // not installed: Fire Emblem Fates in its place, and Up/Down stays there
++        // round 83: not installed, the page is not opened at all (Fire Emblem Fates starts);
++        // drawn anyway (a failed start shows it with why), Fire Emblem Fates is in Seal's
++        // place, and Up/Down stays there
++        assert!(!page_wanted(true, &pick.seal));
+         assert_eq!(pick.selected, Game::Fates);
+         pick.move_selection();
+         assert_eq!(pick.selected, Game::Fates);
+@@ -608,6 +692,7 @@ mod tests {
+         assert!(pick.seal.reason().unwrap().contains("Install"));
+         install_fake(&dir);
+         pick.refresh();
++        assert!(page_wanted(true, &pick.seal));
+         pick.move_selection();
+         assert_eq!(pick.selected, Game::Seal);
+         assert_eq!(pick.pad(gilrs::Button::Start), Some(PickAction::Continue(Game::Seal)));
+@@ -618,6 +703,134 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// round 83 (H1, H2, H5): no Seal profile, or a profile folder with no mod in it: no
++    /// page, Fire Emblem Fates at once, nothing to switch to, and the report says so.
++    #[test]
++    fn with_no_seal_of_flames_the_page_is_skipped_and_there_is_no_switch_game() {
++        let dir = scratch("no-seal");
++        for status in [seal_status(None, false), seal_status(Some(&dir), false), seal_status(Some(&dir.join("absent")), false)] {
++            assert_eq!(status, SealStatus::Missing);
++            assert!(!page_wanted(true, &status));
++            assert_eq!(windowed_start(&status, Game::Fates), Start::Play(Game::Fates, None), "no log line for a plain start");
++            assert_eq!(switch_offer(Game::Fates, &status), None, "no greyed Switch game");
++            assert_eq!(page_line(true, &status), "skipped (Seal not installed)");
++        }
++        // the launcher's --seal-broken with no profile at all is still no Seal of Flames
++        assert!(!page_wanted(true, &seal_status(None, true)));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// round 83: Seal of Flames installed: the page as before, with the remembered or
++    /// asked-for game pre-selected, and Switch game both ways.
++    #[test]
++    fn with_seal_of_flames_installed_the_page_opens_and_switch_game_is_offered() {
++        let dir = scratch("seal-in");
++        install_fake(&dir);
++        let status = seal_status(Some(&dir), false);
++        assert_eq!(status, SealStatus::Installed);
++        assert!(page_wanted(true, &status));
++        assert_eq!(windowed_start(&status, Game::Fates), Start::Page(Game::Fates));
++        assert_eq!(windowed_start(&status, Game::Seal), Start::Page(Game::Seal));
++        assert_eq!(switch_offer(Game::Fates, &status), Some((Game::Seal, None)));
++        assert_eq!(switch_offer(Game::Seal, &status), Some((Game::Fates, None)));
++        assert_eq!(page_line(true, &status), "would open");
++        // not a Fire Emblem Fates program: never the page
++        assert!(!page_wanted(false, &status));
++        assert_eq!(page_line(false, &status), "skipped (not a Fire Emblem Fates program)");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// round 83: Seal of Flames there but broken: the page opens (its repair line and
++    /// Install), and Switch game shows greyed with the reason, as before.
++    #[test]
++    fn with_seal_of_flames_broken_the_page_opens_for_the_repair() {
++        let dir = scratch("seal-broken");
++        install_fake(&dir);
++        let launcher_said = seal_status(Some(&dir), true);
++        let mut cases = vec![(launcher_said, true)];
++        std::fs::write(dir.join("profile.json"), "{not json").unwrap();
++        cases.push((seal_status(Some(&dir), false), false));
++        for (status, broken_flag) in cases {
++            assert!(matches!(status, SealStatus::Broken(_)), "{status:?}");
++            assert!(page_wanted(true, &status));
++            assert_eq!(windowed_start(&status, Game::Seal), Start::Page(Game::Seal));
++            assert_eq!(page_line(true, &status), "would open");
++            let (to, why) = switch_offer(Game::Fates, &status).expect("Switch game offered");
++            assert_eq!(to, Game::Seal);
++            assert!(why.unwrap().contains("repair"));
++            // the page pre-selects Fire Emblem Fates, Seal greyed with Install
++            let pick = GamePick::new(Some(dir.clone()), broken_flag, Game::Seal);
++            assert!(matches!(pick.seal, SealStatus::Broken(_)));
++            assert_eq!(pick.selected, Game::Fates);
++            assert!(pick.seal.reason().unwrap().contains("Install"));
++        }
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// round 83 (H3): a remembered Seal of Flames choice, or `--game seal` with a window,
++    /// while Seal of Flames is not installed: Fire Emblem Fates starts, with one log line.
++    #[test]
++    fn a_remembered_or_asked_for_seal_of_flames_that_is_missing_starts_fates() {
++        let dir = scratch("seal-gone");
++        let status = seal_status(Some(&dir), false);
++        let remembered = initial(None, None, Some(Game::Seal), false);
++        let asked = initial(Some(Game::Seal), None, None, false);
++        let variable = initial(None, Some(Game::Seal), None, false);
++        for preselect in [remembered, asked, variable] {
++            assert_eq!(preselect, Game::Seal);
++            match windowed_start(&status, preselect) {
++                Start::Play(game, Some(note)) => {
++                    assert_eq!(game, Game::Fates);
++                    assert!(note.contains("not installed") && note.contains(FATES_NAME), "{note}");
++                }
++                other => panic!("{other:?}"),
++            }
++        }
++        // headless --game seal is not this rule: the start still refuses, as before
++        assert_eq!(initial(Some(Game::Seal), None, None, true), Game::Seal);
++        assert!(status.reason().is_some());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// round 83 (H4): the port's sof.py is looked for in tools/seal first, then
++    /// tools/play; the port's folder is the first one above the program with either.
++    #[test]
++    fn sof_py_is_found_in_tools_seal_first_then_tools_play() {
++        let dir = scratch("sof");
++        let port = dir.join("port");
++        let game = port.join("play").join("game");
++        std::fs::create_dir_all(&game).unwrap();
++        let ancestors = || game.ancestors().take(6).map(Path::to_owned).collect::<Vec<_>>();
++        let found = |list: &[PathBuf]| port_folder(list.iter().map(PathBuf::as_path));
++        let seal_sof = port.join("tools").join("seal").join("sof.py");
++        let play_sof = port.join("tools").join("play").join("sof.py");
++        // neither: no port folder; the script named is the old place
++        assert_eq!(found(&ancestors()), None);
++        assert_eq!(sof_script(&port), play_sof);
++        // the old place only (Vanilla+, and the Seal edition until it moves)
++        std::fs::create_dir_all(port.join("tools").join("play")).unwrap();
++        std::fs::write(&play_sof, "").unwrap();
++        assert_eq!(found(&ancestors()), Some(port.clone()));
++        assert_eq!(sof_script(&port), play_sof);
++        // both: tools/seal wins
++        std::fs::create_dir_all(port.join("tools").join("seal")).unwrap();
++        std::fs::write(&seal_sof, "").unwrap();
++        assert_eq!(sof_script(&port), seal_sof);
++        let python = zakuro_core::fates_rando_session::Python { program: "python".into(), args: vec![] };
++        let (cmd, _) = install_command(&python, &port);
++        let args: Vec<PathBuf> = cmd.get_args().map(PathBuf::from).collect();
++        assert_eq!(args[1], seal_sof);
++        // tools/seal only
++        std::fs::remove_dir_all(port.join("tools").join("play")).unwrap();
++        assert_eq!(found(&ancestors()), Some(port.clone()));
++        assert_eq!(sof_script(&port), seal_sof);
++        // the nearest folder above the program wins
++        std::fs::create_dir_all(port.join("play").join("tools").join("play")).unwrap();
++        std::fs::write(port.join("play").join("tools").join("play").join("sof.py"), "").unwrap();
++        assert_eq!(found(&ancestors()), Some(port.join("play")));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
+     #[test]
+     fn a_seal_session_never_changes_the_owners_game_settings() {
+         let mut settings = Settings::first_run();
+diff --git a/crates/zakuro/src/lib.rs b/crates/zakuro/src/lib.rs
+index 1a9dad6..a1b1f19 100644
+--- a/crates/zakuro/src/lib.rs
++++ b/crates/zakuro/src/lib.rs
+@@ -707,12 +707,21 @@ impl ApplicationHandler for App {
+                 self.backend = Some(backend);
+                 // the game the command line names starts on the device the
+                 // presenter may lend the renderer, once there is one; a Fire
+-                // Emblem Fates program asks which game first
++                // Emblem Fates program asks which game first, but only when Seal
++                // of Flames has been added (round 83): else Fire Emblem Fates at once
+                 if self.picker_applies() {
+                     let remembered = game_pick::choice_file().and_then(|file| game_pick::read_choice(&file));
+                     let preselect = game_pick::initial(self.options.game, game_pick::env_choice(), remembered, false);
+                     self.pick = game_pick::GamePick::new(self.seal_profile.clone(), self.options.seal_broken, preselect);
+-                    self.pick.open = true;
++                    match game_pick::windowed_start(&self.pick.seal, preselect) {
++                        game_pick::Start::Page(_) => self.pick.open = true,
++                        game_pick::Start::Play(game, note) => {
++                            if let Some(note) = note {
++                                log::info!("{note}");
++                            }
++                            self.begin(game, false);
++                        }
++                    }
+                 } else {
+                     self.start();
+                 }
+@@ -1149,9 +1158,8 @@ impl App {
+         self.active = self.settings.clone();
+         self.menus.rando_blocked = false;
+         self.menus.seal_playing = game == game_pick::Game::Seal;
+-        let to = game.other();
+-        let why = (to == game_pick::Game::Seal).then(|| game_pick::seal_status(self.seal_profile.as_deref(), false).reason()).flatten();
+-        self.menus.switch_game = Some((to, why));
++        // round 83: no Switch game when the other game is a Seal of Flames never added
++        self.menus.switch_game = game_pick::switch_offer(game, &game_pick::seal_status(self.seal_profile.as_deref(), false));
+         if game == game_pick::Game::Seal {
+             log::info!("{} chosen; {}", game_pick::SEAL_NAME, game_pick::CREDIT);
+         }
+@@ -1179,13 +1187,23 @@ impl App {
+ 
+     /// Continue on the Choose your game page: remembered, then started.
+     fn pick_continue(&mut self, game: game_pick::Game) {
++        self.begin(game, true);
++    }
++
++    /// starts the game chosen, on the page or (round 83) with no page because Seal of
++    /// Flames was never added: then nothing is remembered, so the player's own
++    /// game-choice.txt stays as it is. A start that fails shows the page with why.
++    fn begin(&mut self, game: game_pick::Game, remember: bool) {
+         if let Err(error) = self.apply_choice(game) {
+             self.pick.error = Some(error);
++            self.pick.open = true;
+             return;
+         }
+-        if let Some(file) = game_pick::choice_file() {
+-            if let Err(error) = game_pick::write_choice(&file, game) {
+-                log::warn!("could not remember the game chosen in {}, {error}", file.display());
++        if remember {
++            if let Some(file) = game_pick::choice_file() {
++                if let Err(error) = game_pick::write_choice(&file, game) {
++                    log::warn!("could not remember the game chosen in {}, {error}", file.display());
++                }
+             }
+         }
+         self.pick.open = false;
+@@ -1269,7 +1287,11 @@ impl App {
+         let pace: Option<f64> = std::env::var("FEF_HEADLESS_PACE").ok().and_then(|v| v.trim().parse().ok());
+         let mut records = Vec::new();
+         if report.is_some() {
+-            records.push(self.headless_record("boot", 0, 0, &ranges));
++            let mut boot = self.headless_record("boot", 0, 0, &ranges);
++            // round 83 (H5): whether a start with a window would show Choose your game
++            let seal = game_pick::seal_status(self.seal_profile.as_deref(), self.options.seal_broken);
++            boot["page"] = game_pick::page_line(self.picker_applies(), &seal).into();
++            records.push(boot);
+         }
+         let start = Instant::now();
+         let mut outcome = FrameOutcome::Completed;

@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: fe13 <engine@localhost>
+Date: Mon, 9 Nov 2026 03:20:04 -0500
+Subject: [PATCH 02/21] gpu: pieces of the bottom screen over the top one, and
+ the bottom screen over it
+
+Two layouts the frontend can pick while the top screen shows alone:
+TopWithPieces (parts of the bottom screen drawn over the top one as rounded
+rectangles, placed by piece_places) and BottomOverTop (the whole bottom
+screen over the middle of the top one). The presenters draw neither: the
+overlay does, through BOTTOM_SCREEN_TEXTURE, an overlay texture id both
+presenters (Vulkan, OpenGL) map to the bottom screen's picture. cut_out finds
+a part's outline on its background in a 320x240 picture.
+
+Nothing changes for the existing layouts.
+
+Adapted from fe-awakening-recomp 832fe86 (github.com/Zelkin1/fe-awakening-recomp,
+MIT, Copyright (c) 2026 the authors of the Fire Emblem: Awakening
+recompilation project), patches/zakuro-local-changes.patch: backend/mod.rs,
+gl.rs, vulkan.rs, vulkan_overlay.rs. Fitted to Zakuro 0.2.32's screen
+rotation (the bottom-over viewport is placed before rotation and offset).
+---
+ crates/zakuro-gpu/src/backend/gl.rs           |  11 +-
+ crates/zakuro-gpu/src/backend/mod.rs          | 268 +++++++++++++++++-
+ crates/zakuro-gpu/src/backend/vulkan.rs       |  25 +-
+ .../zakuro-gpu/src/backend/vulkan_overlay.rs  |  32 ++-
+ crates/zakuro-gpu/src/lib.rs                  |   2 +-
+ 5 files changed, 310 insertions(+), 28 deletions(-)
+
+diff --git a/crates/zakuro-gpu/src/backend/gl.rs b/crates/zakuro-gpu/src/backend/gl.rs
+index 50e6004..073fd10 100644
+--- a/crates/zakuro-gpu/src/backend/gl.rs
++++ b/crates/zakuro-gpu/src/backend/gl.rs
+@@ -4,7 +4,7 @@ use std::collections::HashMap;
+ 
+ use glow::HasContext;
+ 
+-use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
++use super::{place, Overlay, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport, BOTTOM_SCREEN_TEXTURE};
+ 
+ const VERTEX_SHADER: &str = r#"#version 330 core
+ // a single oversized triangle covers the viewport with no vertex buffer.
+@@ -361,7 +361,9 @@ impl Presenter for GlPresenter {
+ 
+         unsafe {
+             self.gl.bind_vertex_array(None);
+-            self.overlay.draw(&self.gl, overlay, self.window);
++            // the overlay can draw parts of the bottom screen
++            let bottom_screen = (self.sizes[1] != (0, 0)).then_some(self.textures[1]);
++            self.overlay.draw(&self.gl, overlay, self.window, bottom_screen);
+         }
+         Ok(())
+     }
+@@ -440,7 +442,7 @@ impl GlOverlay {
+     /// # Safety
+     ///
+     /// the context has to be current.
+-    unsafe fn draw(&mut self, gl: &glow::Context, overlay: &Overlay, window: (u32, u32)) {
++    unsafe fn draw(&mut self, gl: &glow::Context, overlay: &Overlay, window: (u32, u32), bottom_screen: Option<glow::Texture>) {
+         unsafe {
+             for texture in &overlay.textures {
+                 let [width, height] = texture.size;
+@@ -509,7 +511,8 @@ impl GlOverlay {
+                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+                 gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.indices));
+                 for mesh in &overlay.meshes {
+-                    let Some(&texture) = self.textures.get(&mesh.texture) else { continue };
++                    let texture = if mesh.texture == BOTTOM_SCREEN_TEXTURE { bottom_screen } else { self.textures.get(&mesh.texture).copied() };
++                    let Some(texture) = texture else { continue };
+                     let [left, top, right, bottom] = mesh.clip;
+                     let (right, bottom) = (right.min(window.0), bottom.min(window.1));
+                     if left >= right || top >= bottom || mesh.indices.is_empty() {
+diff --git a/crates/zakuro-gpu/src/backend/mod.rs b/crates/zakuro-gpu/src/backend/mod.rs
+index c0c674a..9750b61 100644
+--- a/crates/zakuro-gpu/src/backend/mod.rs
++++ b/crates/zakuro-gpu/src/backend/mod.rs
+@@ -47,6 +47,10 @@ pub struct Overlay {
+     pub free: Vec<u64>,
+ }
+ 
++/// the overlay texture id that stands for the bottom screen's picture, which
++/// the presenter has: an overlay can draw parts of the bottom screen.
++pub const BOTTOM_SCREEN_TEXTURE: u64 = 1;
++
+ /// pixels for a texture of the overlay.
+ pub struct OverlayTexture {
+     pub id: u64,
+@@ -103,6 +107,180 @@ pub enum ScreenLayout {
+     BottomOnly,
+     /// the top screen big, the bottom one small at its lower right.
+     LargeTop,
++    /// the top screen alone, the bottom one drawn over its middle by the
++    /// overlay, width ten-thousandths of the top screen's width.
++    BottomOverTop { width: u16 },
++    /// the top screen alone, with pieces of the bottom one the overlay draws
++    /// over it.
++    TopWithPieces(&'static [Piece]),
++}
++
++/// a part of the bottom screen shown over the top one: the box it is cut
++/// from (x, y, width, height in the bottom screen's pixels), where it goes,
++/// how big (percent of the top screen's scale), the rounded rectangles it is
++/// drawn as, and the marker it moves with, if any, with that marker's place
++/// at rest.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Piece {
++    pub from: [u16; 4],
++    pub across: Anchor,
++    pub down: Anchor,
++    pub size: u16,
++    pub shapes: &'static [Rounded],
++    pub follows: Option<(u32, [u16; 2])>,
++}
++
++/// one rounded rectangle of a piece.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Rounded {
++    pub rect: [u16; 4],
++    pub shift: [i16; 2],
++    pub mirror: bool,
++    pub corners: [u8; 4],
++    pub soft: u8,
++    pub light: bool,
++    pub shade: u8,
++    pub shadow: bool,
++    pub outline: &'static [[u16; 2]],
++    pub cut: Option<Ground>,
++}
++
++/// where the text of a game's battle panels is on the bottom screen, for
++/// banners drawn in their place.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Banners {
++    pub sides: [BannerSide; 2],
++    pub labels: [[u16; 4]; 3],
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct BannerSide {
++    pub name: [u16; 4],
++    pub hp: [u16; 4],
++    pub gauge: [u16; 4],
++    pub weapon: [u16; 4],
++    pub values: [[u16; 4]; 3],
++    pub follows: Option<(u32, [u16; 2])>,
++}
++
++/// the colour of a background a part is cut out of: redder than green by
++/// more than redder, and darker than darker (red + green + blue).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Ground {
++    pub redder: u8,
++    pub darker: u16,
++}
++
++/// the runs of a 320x240 RGBA picture's rectangle that are not the ground
++/// reached from its edges: row, first column, column past the last.
++pub fn cut_out(picture: &[u8], rect: [u16; 4], ground: Ground) -> Vec<[u16; 3]> {
++    let [left, top, width, height] = rect.map(usize::from);
++    if picture.len() < 320 * 240 * 4 || left + width > 320 || top + height > 240 || width == 0 || height == 0 {
++        return Vec::new();
++    }
++    let is_ground = |x: usize, y: usize| {
++        let at = ((top + y) * 320 + left + x) * 4;
++        let [red, green, blue] = [picture[at], picture[at + 1], picture[at + 2]].map(u16::from);
++        red > green + ground.redder as u16 && red + green + blue < ground.darker
++    };
++    let mut reached = vec![false; width * height];
++    let mut stack: Vec<(usize, usize)> = (0..width).map(|x| (x, 0)).chain((0..height).flat_map(|y| [(0, y), (width - 1, y)])).collect();
++    while let Some((x, y)) = stack.pop() {
++        if reached[y * width + x] || !is_ground(x, y) {
++            continue;
++        }
++        reached[y * width + x] = true;
++        if x > 0 {
++            stack.push((x - 1, y));
++        }
++        if x + 1 < width {
++            stack.push((x + 1, y));
++        }
++        if y > 0 {
++            stack.push((x, y - 1));
++        }
++        if y + 1 < height {
++            stack.push((x, y + 1));
++        }
++    }
++    let mut runs = Vec::new();
++    for y in 0..height {
++        let mut x = 0;
++        while x < width {
++            if reached[y * width + x] {
++                x += 1;
++                continue;
++            }
++            let from = x;
++            while x < width && !reached[y * width + x] {
++                x += 1;
++            }
++            runs.push([(top + y) as u16, (left + from) as u16, (left + x) as u16]);
++        }
++    }
++    runs
++}
++
++/// where one rounded rectangle of a piece goes in the window, and the part
++/// of the bottom screen it shows (fractions; a negative width mirrors it).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct PiecePlace {
++    pub viewport: Viewport,
++    pub part: [f32; 4],
++    pub corners: [f32; 4],
++    pub soft: f32,
++    pub light: bool,
++    pub shade: u8,
++    pub shadow: bool,
++    pub outline: &'static [[u16; 2]],
++    pub cut: Option<Ground>,
++}
++
++/// where a piece goes along one side of the top screen: a margin from its
++/// start, an offset from its middle or a margin from its end, in the top
++/// screen's pixels.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Anchor {
++    Start(u16),
++    Middle(i16),
++    End(u16),
++}
++
++/// the places of pieces over the top screen's viewport, moved with the
++/// markers they follow as spans says those were drawn.
++pub fn piece_places(top: Viewport, pieces: &[Piece], spans: &[(u32, [f32; 4])]) -> Vec<PiecePlace> {
++    let scale = top.height / 240.0;
++    let position = |anchor: Anchor, start: f32, length: f32, size: f32| match anchor {
++        Anchor::Start(margin) => start + margin as f32 * scale,
++        Anchor::Middle(offset) => start + (length - size * scale) / 2.0 + offset as f32 * scale,
++        Anchor::End(margin) => start + length - (margin as f32 + size) * scale,
++    };
++    let mut places = Vec::new();
++    for piece in pieces {
++        let [box_left, box_top, box_width, box_height] = piece.from.map(f32::from);
++        let size = piece.size as f32 / 100.0;
++        let x = position(piece.across, top.x, top.width, box_width * size);
++        let y = position(piece.down, top.y, top.height, box_height * size);
++        let step = scale * size;
++        let [moved_x, moved_y] = piece
++            .follows
++            .and_then(|(id, [rest_x, rest_y])| spans.iter().find(|&&(marked, _)| marked == id).map(|&(_, [x, y, ..])| [x - rest_x as f32 / 320.0, y - rest_y as f32 / 240.0]))
++            .map_or([0.0; 2], |moved| moved.map(|by| by.clamp(-0.1, 0.1)));
++        for shape in piece.shapes {
++            let [shape_x, shape_y, shape_width, shape_height] = shape.rect.map(f32::from);
++            let [shift_x, shift_y] = shape.shift.map(f32::from);
++            let (to_x, to_y) = (x + (shape_x + shift_x - box_left) * step, y + (shape_y + shift_y - box_top) * step);
++            let viewport = Viewport { x: to_x, y: to_y, width: shape_width * step, height: shape_height * step };
++            let part = match shape.mirror {
++                false => [shape_x / 320.0 + moved_x, shape_y / 240.0 + moved_y, shape_width / 320.0, shape_height / 240.0],
++                true => [(shape_x + shape_width) / 320.0 + moved_x, shape_y / 240.0 + moved_y, -shape_width / 320.0, shape_height / 240.0],
++            };
++            let corners = shape.corners.map(|radius| radius as f32 * step);
++            let soft = shape.soft as f32 * step;
++            places.push(PiecePlace { viewport, part, corners, soft, light: shape.light, shade: shape.shade, shadow: shape.shadow, outline: shape.outline, cut: shape.cut });
++        }
++    }
++    places
+ }
+ 
+ /// the Orientation of both screens. north is up
+@@ -167,7 +345,7 @@ impl ScreenLayout {
+         match self {
+             ScreenLayout::Stacked => (top_width.max(320.0), 480.0),
+             ScreenLayout::SideBySide => (top_width + 320.0, 240.0),
+-            ScreenLayout::TopOnly => (top_width, 240.0),
++            ScreenLayout::TopOnly | ScreenLayout::BottomOverTop { .. } | ScreenLayout::TopWithPieces(_) => (top_width, 240.0),
+             ScreenLayout::BottomOnly => (320.0, 240.0),
+             ScreenLayout::LargeTop => (top_width + LARGE_TOP_BOTTOM.0 as f32, 240.0),
+         }
+@@ -231,7 +409,16 @@ pub fn layout(window_width: u32, window_height: u32, arrangement: ScreenLayout,
+                 height: 240.0 * small,
+             })
+         }
+-        ScreenLayout::TopOnly => None,
++        ScreenLayout::TopOnly | ScreenLayout::TopWithPieces(_) => None,
++        // in the middle of the top screen, as wide as asked but no taller
++        // than it
++        ScreenLayout::BottomOverTop { width } => {
++            let (top_width, top_height) = (top_w * scale, 240.0 * scale);
++            let width = (top_width * width as f32 / 10_000.0).min(top_height * 320.0 / 240.0);
++            let height = width * 240.0 / 320.0;
++            let whole = |coordinate: f32| if integer { coordinate.floor() } else { coordinate };
++            Some(Viewport { x: whole((top_width - width) / 2.0), y: whole((top_height - height) / 2.0), width, height })
++        }
+         ScreenLayout::BottomOnly => Some(Viewport {
+             x: 0.0,
+             y: 0.0,
+@@ -312,8 +499,10 @@ pub enum Shown {
+ /// when the title drew a picture for the right eye, side by side shows the
+ /// left one's twice otherwise, so a 3D TV keeps its halves.
+ pub fn place(window_width: u32, window_height: u32, arrangement: ScreenLayout, orientation: ScreenOrientation, top_width: f32, integer: bool, stereo: Stereo, right: bool) -> Vec<(Viewport, Shown)> {
++    // the bottom screen over the top one is the overlay's to draw
++    let bottom_over_top = matches!(arrangement, ScreenLayout::BottomOverTop { .. });
+     let screens = |(top, bottom): (Option<Viewport>, Option<Viewport>), eye: Shown| {
+-        top.map(|viewport| (viewport, eye)).into_iter().chain(bottom.map(|viewport| (viewport, Shown::Bottom)))
++        top.map(|viewport| (viewport, eye)).into_iter().chain(bottom.filter(|_| !bottom_over_top).map(|viewport| (viewport, Shown::Bottom)))
+     };
+     let (first, second) = match (right, stereo.swap) {
+         (false, _) => (Shown::Top, Shown::Top),
+@@ -391,6 +580,79 @@ pub trait Presenter {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn a_part_is_cut_out_of_its_ground() {
++        let mut picture = vec![0u8; 320 * 240 * 4];
++        let mut put = |x: usize, y: usize, rgb: [u8; 3]| picture[(y * 320 + x) * 4..][..3].copy_from_slice(&rgb);
++        for y in 0..240 {
++            for x in 0..320 {
++                put(x, y, [18, 10, 2]);
++            }
++        }
++        for y in 21..24 {
++            for x in 11..14 {
++                put(x, y, [40, 120, 30]);
++            }
++        }
++        put(12, 22, [17, 17, 0]);
++        put(13, 24, [18, 10, 2]);
++        for x in 10..15 {
++            put(x, 24, [200, 160, 80]);
++        }
++        put(12, 23, [18, 10, 2]);
++        put(12, 24, [18, 10, 2]);
++        let runs = cut_out(&picture, [10, 20, 5, 5], Ground { redder: 3, darker: 90 });
++        assert_eq!(runs, [[21, 11, 14], [22, 11, 14], [23, 11, 14], [24, 10, 15]]);
++        assert!(cut_out(&picture[..100], [10, 20, 5, 5], Ground { redder: 3, darker: 90 }).is_empty());
++    }
++
++    #[test]
++    fn a_piece_is_its_rounded_rectangles() {
++        const PLAIN: Rounded = Rounded { rect: [0; 4], shift: [0, 0], mirror: false, corners: [0; 4], soft: 0, light: false, shade: 255, shadow: false, outline: &[], cut: None };
++        const SHAPES: &[Rounded] = &[
++            Rounded { rect: [101, 50, 2, 2], corners: [1, 0, 0, 1], soft: 3, light: true, shade: 200, ..PLAIN },
++            Rounded { rect: [100, 51, 4, 1], ..PLAIN },
++            Rounded { rect: [100, 50, 1, 1], shift: [3, 0], mirror: true, ..PLAIN },
++        ];
++        let piece = Piece { from: [100, 50, 4, 2], across: Anchor::End(2), down: Anchor::Start(10), size: 100, shapes: SHAPES, follows: None };
++        let top = Viewport { x: 0.0, y: 0.0, width: 800.0, height: 480.0 };
++        let places = piece_places(top, &[piece], &[]);
++        assert_eq!(places.len(), 3, "a place each");
++        let PiecePlace { viewport: first, part, corners, soft, light, shade, shadow, .. } = places[0];
++        assert_eq!((first.x, first.y, first.width, first.height), (800.0 - 12.0 + 2.0, 20.0, 4.0, 4.0));
++        assert_eq!(part, [101.0 / 320.0, 50.0 / 240.0, 2.0 / 320.0, 2.0 / 240.0]);
++        assert_eq!((corners, soft, light, shade, shadow), ([2.0, 0.0, 0.0, 2.0], 6.0, true, 200, false));
++        let mirrored = places[2];
++        assert_eq!((mirrored.viewport.x, mirrored.viewport.y), (800.0 - 12.0 + 6.0, 20.0));
++        assert_eq!(mirrored.part, [101.0 / 320.0, 50.0 / 240.0, -1.0 / 320.0, 1.0 / 240.0]);
++        let following = Piece { follows: Some((3, [96, 48])), ..piece };
++        let shaken = piece_places(top, &[following], &[(3, [98.0 / 320.0, 48.0 / 240.0, 0.5, 0.4])])[0];
++        assert_eq!(shaken.viewport, places[0].viewport);
++        assert!((shaken.part[0] - 103.0 / 320.0).abs() < 1e-6 && (shaken.part[1] - places[0].part[1]).abs() < 1e-6);
++        let last = places[1].viewport;
++        assert_eq!((last.x, last.y, last.width), (800.0 - 12.0, 22.0, 8.0));
++        let half = piece_places(top, &[Piece { size: 50, ..piece }], &[])[0];
++        assert_eq!((half.viewport.x, half.viewport.y, half.viewport.width, half.viewport.height, half.corners[0]), (800.0 - 4.0 - 4.0 + 1.0, 20.0, 2.0, 2.0, 1.0));
++    }
++
++    #[test]
++    fn the_bottom_screen_goes_over_the_middle_of_the_top_one() {
++        let wide = 240.0 * 16.0 / 9.0;
++        let over = |width| ScreenLayout::BottomOverTop { width };
++        let north = ScreenOrientation::North;
++        let (top, bottom) = layout(1920, 1080, over(3425), north, wide, false);
++        let (alone, _) = layout(1920, 1080, ScreenLayout::TopOnly, north, wide, false);
++        let (top, bottom) = (top.unwrap(), bottom.unwrap());
++        assert_eq!(Some(top), alone);
++        assert_eq!((bottom.width.round(), bottom.height.round()), (658.0, 493.0));
++        assert_eq!(((bottom.x + bottom.width / 2.0).round(), (bottom.y + bottom.height / 2.0).round()), (960.0, 540.0));
++        let full = layout(1920, 1080, over(10_000), north, wide, false).1.unwrap();
++        assert_eq!((full.width.round(), full.height), (1440.0, 1080.0));
++        assert_eq!(over(3425).size(wide), ScreenLayout::TopOnly.size(wide));
++        let places = place(1920, 1080, over(3425), north, wide, false, Stereo::default(), false);
++        assert_eq!(places.iter().map(|(_, shown)| *shown).collect::<Vec<_>>(), [Shown::Top], "the overlay draws the bottom screen");
++    }
++
+     fn bounds(viewport: Viewport) -> (f32, f32, f32, f32) {
+         (viewport.x, viewport.y, viewport.width, viewport.height)
+     }
+diff --git a/crates/zakuro-gpu/src/backend/vulkan.rs b/crates/zakuro-gpu/src/backend/vulkan.rs
+index 5aef453..acc3150 100644
+--- a/crates/zakuro-gpu/src/backend/vulkan.rs
++++ b/crates/zakuro-gpu/src/backend/vulkan.rs
+@@ -690,7 +690,18 @@ impl VulkanPresenter {
+                 )
+                 .expect("begin command buffer");
+         }
+-        painter.upload(device, &self.memory_properties, command_buffer, self.frame, overlay)?;
++        // each screen's set and place in its image
++        let crop = |index: usize| match sources[index] {
++            Source::Nothing => None,
++            Source::Own => Some((self.screens[index].descriptor, WHOLE)),
++            Source::Gpu(gpu) => {
++                let [x, y, width, height] = gpu.area;
++                let [left, top, right, bottom] = gpu.bounds;
++                Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
++            }
++        };
++        // the overlay can draw parts of the bottom screen, from where it is
++        painter.upload(device, &self.memory_properties, command_buffer, self.frame, overlay, crop(1).map(|(_, area)| area))?;
+         unsafe {
+ 
+             for screen in &self.screens {
+@@ -771,16 +782,6 @@ impl VulkanPresenter {
+                     .clear_values(&clear),
+                 vk::SubpassContents::INLINE,
+             );
+-            // each screen's set and place in its image
+-            let crop = |index: usize| match sources[index] {
+-                Source::Nothing => None,
+-                Source::Own => Some((self.screens[index].descriptor, WHOLE)),
+-                Source::Gpu(gpu) => {
+-                    let [x, y, width, height] = gpu.area;
+-                    let [left, top, right, bottom] = gpu.bounds;
+-                    Some((self.gpu_sets[self.frame][index], [x, y, width, height, left, top, right, bottom]))
+-                }
+-            };
+             let places = place(self.extent.width, self.extent.height, self.arrangement, self.orientation, self.top_width, self.integer, self.stereo, right);
+             for (viewport, shown) in places {
+                 let index = match shown {
+@@ -811,7 +812,7 @@ impl VulkanPresenter {
+                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
+             }
+ 
+-            painter.draw(device, command_buffer, self.frame, overlay, self.extent);
++            painter.draw(device, command_buffer, self.frame, overlay, self.extent, crop(1).map(|(set, _)| set));
+             device.cmd_end_render_pass(command_buffer);
+             device.end_command_buffer(command_buffer).expect("end command buffer");
+         }
+diff --git a/crates/zakuro-gpu/src/backend/vulkan_overlay.rs b/crates/zakuro-gpu/src/backend/vulkan_overlay.rs
+index 212c3f7..a5df7ad 100644
+--- a/crates/zakuro-gpu/src/backend/vulkan_overlay.rs
++++ b/crates/zakuro-gpu/src/backend/vulkan_overlay.rs
+@@ -5,7 +5,7 @@ use std::collections::HashMap;
+ use ash::vk;
+ 
+ use super::vulkan::{create_shader_module, fail, find_memory_type, transition, vk_fail};
+-use super::{Overlay, OverlayTexture, OverlayVertex, PresentError};
++use super::{Overlay, OverlayTexture, OverlayVertex, PresentError, BOTTOM_SCREEN_TEXTURE};
+ 
+ const VERTEX_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.vert.spv");
+ const FRAGMENT_SPIRV: &[u8] = include_bytes!("../../shaders/overlay.frag.spv");
+@@ -150,8 +150,6 @@ impl OverlayPainter {
+         }
+     }
+ 
+-    /// records the texture changes and fills this frame's geometry, before
+-    /// the render pass starts.
+     pub(super) fn upload(
+         &mut self,
+         device: &ash::Device,
+@@ -159,6 +157,7 @@ impl OverlayPainter {
+         command_buffer: vk::CommandBuffer,
+         frame: usize,
+         overlay: &Overlay,
++        bottom_screen: Option<[f32; 8]>,
+     ) -> Result<(), PresentError> {
+         let pending = std::mem::take(&mut self.pending);
+         for texture in pending.iter().chain(&overlay.textures) {
+@@ -225,11 +224,26 @@ impl OverlayPainter {
+         let buffer = self.geometry[frame].as_ref().expect("sized above");
+         let (mut vertex_at, mut index_at) = (0usize, self.index_offset as usize);
+         for mesh in &overlay.meshes {
+-            let vertex_bytes = mesh.vertices.len() * size_of::<OverlayVertex>();
++            let remapped: Vec<OverlayVertex>;
++            let vertices = match bottom_screen.filter(|_| mesh.texture == BOTTOM_SCREEN_TEXTURE) {
++                Some([x, y, width, height, low_x, low_y, high_x, high_y]) => {
++                    remapped = mesh
++                        .vertices
++                        .iter()
++                        .map(|vertex| OverlayVertex {
++                            uv: [(x + vertex.uv[0] * width).clamp(low_x, high_x), (y + vertex.uv[1] * height).clamp(low_y, high_y)],
++                            ..*vertex
++                        })
++                        .collect();
++                    &remapped
++                }
++                None => &mesh.vertices,
++            };
++            let vertex_bytes = vertices.len() * size_of::<OverlayVertex>();
+             // SAFETY: the buffer holds every mesh's vertices and indices,
+             // and the vertex type is plain data
+             unsafe {
+-                std::ptr::copy_nonoverlapping(mesh.vertices.as_ptr() as *const u8, buffer.mapped.add(vertex_at), vertex_bytes);
++                std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, buffer.mapped.add(vertex_at), vertex_bytes);
+                 std::ptr::copy_nonoverlapping(mesh.indices.as_ptr() as *const u8, buffer.mapped.add(index_at), mesh.indices.len() * 4);
+             }
+             vertex_at += vertex_bytes;
+@@ -239,7 +253,7 @@ impl OverlayPainter {
+     }
+ 
+     /// records the draws, inside the render pass.
+-    pub(super) fn draw(&self, device: &ash::Device, command_buffer: vk::CommandBuffer, frame: usize, overlay: &Overlay, extent: vk::Extent2D) {
++    pub(super) fn draw(&self, device: &ash::Device, command_buffer: vk::CommandBuffer, frame: usize, overlay: &Overlay, extent: vk::Extent2D, bottom_screen: Option<vk::DescriptorSet>) {
+         let Some(buffer) = &self.geometry[frame] else { return };
+         if overlay.meshes.is_empty() || extent.width == 0 || extent.height == 0 {
+             return;
+@@ -276,7 +290,9 @@ impl OverlayPainter {
+             let count = mesh.indices.len() as u32;
+             let [left, top, right, bottom] = mesh.clip;
+             let (right, bottom) = (right.min(extent.width), bottom.min(extent.height));
+-            if let (Some(texture), true) = (self.textures.get(&mesh.texture), left < right && top < bottom && count > 0) {
++            let descriptor = if mesh.texture == BOTTOM_SCREEN_TEXTURE { bottom_screen } else { self.textures.get(&mesh.texture).map(|texture| texture.descriptor) };
++
++            if let (Some(descriptor), true) = (descriptor, left < right && top < bottom && count > 0) {
+                 // SAFETY: as above
+                 unsafe {
+                     device.cmd_set_scissor(
+@@ -292,7 +308,7 @@ impl OverlayPainter {
+                         vk::PipelineBindPoint::GRAPHICS,
+                         self.pipeline_layout,
+                         0,
+-                        &[texture.descriptor],
++                        &[descriptor],
+                         &[],
+                     );
+                     device.cmd_draw_indexed(command_buffer, count, 1, first_index, first_vertex, 0);
+diff --git a/crates/zakuro-gpu/src/lib.rs b/crates/zakuro-gpu/src/lib.rs
+index 954ebac..dc61e78 100644
+--- a/crates/zakuro-gpu/src/lib.rs
++++ b/crates/zakuro-gpu/src/lib.rs
+@@ -24,7 +24,7 @@ pub mod texture;
+ use format::ColorFormat;
+ pub use interpolation::Matches;
+ use registers::*;
+-pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, PresentError, Presenter, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport};
++pub use backend::{cut_out, layout, piece_places, place, Anchor, BannerSide, Banners, GpuScreen, Ground, Overlay, OverlayMesh, OverlayTexture, OverlayVertex, Piece, PiecePlace, PresentError, Presenter, Rounded, ScreenFilter, ScreenImage, ScreenLayout, ScreenOrientation, Shown, Stereo, StereoMode, Viewport, BOTTOM_SCREEN_TEXTURE};
+ pub use raster::{Marker, Place};
+ pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
+ #[cfg(feature = "vulkan")]

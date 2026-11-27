@@ -1,0 +1,1293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FE Fates port <engine@localhost>
+Date: Wed, 25 Nov 2026 05:30:00 -0500
+Subject: [PATCH] core: Fire Emblem Fates randomizer: names and voices in
+ messages (the full swap's trap in Mess::Get)
+
+Round 74 (docs/ROUND74_PLAN.md A4, docs/rando/FULL_BLOCK.md section 4,
+docs/rando/FULL_SWAP_PLAN.md section 2, owner OK "Yes, start round 74"): new
+module fates_rando_names. Mess::Get (0x003D1CEC; the label kept in r7 from
+0x003D1CF4) returns through 0x003D1DA8 on all three paths (label not found
+from 0x003D1D18, a plain message from 0x003D1D90, a built message from
+0x003D1DA4) with the text in r0; the word there is add sp, sp, #80
+(0xE28DD050, then pop {r4-r8, pc}; read from the owner's dump).
+
+While a randomized run whose folder holds full.txt (rando.py make
+--patch-out writes it beside patch.txt only for look = full; make_run_inner
+keeps it with the run like nuzlocke.json) with something for this game's
+text language (E) is active, the frame hook writes a reserved svc
+(0xEFFEC002; 0xFEC001 is round 71's chest trap) over that word with
+write32_privileged and has the recompiled code checked again, so the
+interpreter runs Mess::Get. kernel::svc::dispatch hands the svc to on_svc:
+at 0x003D1DA8 only (ARM, the cpu past the svc) it does the add itself and,
+unless the label starts with MPID_ (person names and help texts: the table
+cells already point them at the filler's own labels), passes the UTF-16
+text at r0 through one pass: commands ($, a name from a counted table, its
+arguments) are copied, except $Svp commands whose label starts with
+VOICE_<key>_ for a silenced key, which are dropped; plain text gets every
+whole-word old name replaced, all pairs at once, longest first, never
+chained; full_off_chapters (empty this round) pass everything, the chapter
+being the last chapter person file in the Person list (else GameUserData's).
+A changed text is written into the core's own ring of buffers and r0 points
+there; the message file and the game's shared buffer are never written.
+
+The ring: guest addresses 0x50000000-0x500FFFFF, mapped by the core the
+first time a full run arms the trap, pages from FCRAM's Base region (as the
+HLE services' shared memory). Free: a 3DS process is never given an address
+at or above 0x40000000 (every region the game or Zakuro maps lies below it),
+and the core maps only when Memory::mapping_at finds nothing over the range
+(else the trap stays off with a notice). Each changed text takes the next
+4-aligned bytes, wrapping, so the 36 callers that keep two results at once
+(round 73b) keep both. Once mapped it stays mapped, so a held pointer never
+dangles.
+
+Off means original: no full.txt (look = keep: every run the owner's page can
+make, every run before round 74, Randomizer off), nothing for this language
+and no voice key, a file that does not parse (notice "dialogue names kept
+(full.txt: <reason>)"), another seed or another game: neither word
+(0x003D1DA8, 0x003D1784) is ever written and no memory is mapped. The original word goes back when
+the run ends; a save state holding the svc is put right the same way.
+
+New tests the_file_is_read_whole_or_refused,
+no_file_or_another_language_only_means_off,
+names_are_whole_words_in_one_pass_and_never_chain,
+a_silenced_speaker_goes_quiet_and_another_is_kept,
+commands_are_never_touched_and_a_command_next_to_a_name_is_a_word_break,
+the_ring_wraps_and_keeps_the_last_two_results,
+the_trap_changes_a_line_and_leaves_names_and_untouched_texts,
+an_off_chapter_passes_everything,
+the_word_follows_the_pass_and_leaves_a_stranger_alone,
+both_places_are_trapped_and_their_labels_are_found,
+a_built_message_is_returned_as_the_game_built_it,
+a_repeated_text_shares_one_copy_while_it_is_young (made-up names, lines
+and labels only).
+
+Round 74 repair (the one repair build B2, after the robot's P2 proof
+failed on this patch): story scenes and support talks are fetched through
+Mess::GetNoReplace (0x003D16CC, push {r4-r6, lr}; callers
+ProcTalkManager::Initialize and TalkExpander::ExpandMessage(const char*)),
+which returns through its own 0x003D1784 (add sp, sp, #80, the same word,
+then pop {r4-r6, pc}) and never passed the trap: names stayed A's and A's
+$Svp commands stayed. The svc is now written at both places (TRAP_SITES;
+on_svc tells them apart by the address; the recompiled code is checked
+again when either word changes). GetNoReplace keeps no label register (r5
+is reloaded at 0x003D1720), so the label is read from the "<label>_COM"
+both functions print into their stack buffer at sp (format 0x00644CF8).
+Second, a built Mess::Get text (the message at r4 starts with $a: the game
+filled in arguments, the person names already the filler's through the
+table cells) is now returned as built; passing it again chained B -> C
+("Kaze and Rinkah attained support level B." where keep said "Kaze and
+Hana"). Third, a changed text already in the younger half of the ring
+with the same bytes is handed out again instead of written again (the
+talk manager keeps a scene's text for the whole scene, and a menu may
+fetch the same text every frame).
+---
+ crates/zakuro-core/src/fates_rando_names.rs   | 1119 ++++++++++++++++++++++++++
+ crates/zakuro-core/src/fates_rando_session.rs |  17 +
+ crates/zakuro-core/src/kernel/svc.rs          |   3 +
+ crates/zakuro-core/src/lib.rs                 |   1 +
+ 4 files changed, 1140 insertions(+)
+
+diff --git a/crates/zakuro-core/src/fates_rando_names.rs b/crates/zakuro-core/src/fates_rando_names.rs
+new file mode 100644
+index 0000000..a3c0370
+--- /dev/null
++++ b/crates/zakuro-core/src/fates_rando_names.rs
+@@ -0,0 +1,1119 @@
++//! Fire Emblem Fates randomizer, the full swap: names and voices in message text (round 74,
++//! docs/rando/FULL_BLOCK.md section 4, docs/rando/FULL_SWAP_PLAN.md section 2).
++//!
++//! In a run made with "How they look" = full swap, the person standing in A's spot is B: B's
++//! face, name plate and menu name come from the table cells (patch.txt). The story's lines
++//! still name A, and A's voiced lines would still play. This module changes the message
++//! text the game fetches, in guest memory only: no message or script file is ever written.
++//!
++//! **Where.** `Mess::Get` (0x003D1CEC; `push {r4-r8, lr}`, the label kept in r7 from its
++//! entry) has three return paths and all of them pass 0x003D1DA8 (`add sp, sp, #80`, then
++//! `pop {r4-r8, pc}`) with the text in r0: the label-not-found path branches there from
++//! 0x003D1D18, a plain message from 0x003D1D90 (r0 = the text inside the loaded message
++//! file), a built message (arguments `$a`, or a prefix entry) falls into it from 0x003D1DA4
++//! (r0 = the game's one shared message buffer, 0x006DCBDC +4). Words read from the owner's
++//! dump. While a run whose `full.txt` has something for this game is active, the frame hook
++//! writes a reserved svc (0xEFFEC002) over that `add` and has the recompiled code checked
++//! again, so the interpreter runs `Mess::Get` (round 71's chest trap is the same kind,
++//! `fates_rando_chests`). At the svc the host does the `add` itself, reads the text at r0
++//! and, when the pass below changes it, writes the changed text into its own ring of buffers
++//! and points r0 there. Then `pop` returns to the caller as always.
++//!
++//! **The second place** (round 74's repair, found by the robot's P2 proof): story scenes and
++//! support talks do not come through `Mess::Get` but through `Mess::GetNoReplace` (0x003D16CC,
++//! `push {r4-r6, lr}`; called from `ProcTalkManager::Initialize` and
++//! `TalkExpander::ExpandMessage(const char*)`). It is the same lookup without filling in
++//! arguments and has its own return at 0x003D1784 (`add sp, sp, #80`, then `pop {r4-r6, pc}`,
++//! the same word), text in r0. Its label is not kept in a register (r5 is reloaded at
++//! 0x003D1720), but both functions print `<label>_COM` into their stack buffer at sp (the
++//! prefix entry's label, format at 0x00644CF8), so the trap reads the label there. The same
++//! svc number is written at both places; `on_svc` tells them apart by the address.
++//!
++//! **Built messages are left** (the same repair): when `Mess::Get` fills in arguments (the
++//! text at r4 starts with `$a`, the result is the shared buffer), the arguments are names the
++//! game took through the persons' own labels, which already name the filler; passing the built
++//! text again would chain B -> C ("Kaze and Rinkah attained support level B." where keep said
++//! "Kaze and Hana"). Such a text is returned as the game built it.
++//!
++//! **Repeats share one copy.** The talk manager keeps its scene text for the whole scene and a
++//! menu may fetch the same text every frame, so a changed text that is already in the younger
++//! half of the ring (same bytes) is handed out again instead of written again.
++//!
++//! **Why a ring.** Callers keep two results at once (round 73b: 36 places, for example
++//! `ProcFortune::Persistent` passes two texts together to `castle::cut::DrawLowerShop`), so
++//! the game's one shared buffer is not safe. The ring is one block of `RING_SIZE` bytes in
++//! guest memory; each changed text takes the next free bytes, wrapping to the start, so a
++//! result stays valid until a whole ring of later changed text has been written after it.
++//!
++//! **The region.** `RING_VADDR` (0x50000000, 1 MiB), mapped by this module the first time a
++//! full run arms the trap, with pages from the Base region of FCRAM (where the HLE services
++//! take theirs: gsp, hid, apt). Why it is free: a 3DS process is never given an address at
++//! or above 0x40000000 (zakuro_common::memory_map: code image from 0x00100000, heap
++//! 0x08000000-0x10000000, shared memory 0x10000000-0x14000000, the old linear heap
++//! 0x14000000-0x1C000000, VRAM / DSP / config / TLS 0x1F000000-0x1FFFFFFF, the new linear
++//! heap 0x30000000-0x40000000; every fixed `Memory::map` in the core lies below
++//! 0x40000000), so the game's code holds no pointer there; the page table is a flat 32-bit
++//! one, so the recompiled code and the interpreter read it like any page; and the module
++//! maps it only when `Memory::mapping_at` finds nothing over the range (else the trap stays
++//! off, with a notice). Once mapped it stays mapped for the program's life, so a pointer a
++//! caller still holds never dangles; a session that never had a full run never maps it.
++//!
++//! **The pass** (one per text, in this order):
++//! 0. A built `Mess::Get` text (arguments filled in) is left alone (above).
++//! 1. A text whose label (r7) starts with `MPID_` is left alone: person names and help texts
++//!    are fetched through the person's own labels, which the table cells already point at
++//!    the filler's (menus, name plates and the battle window then show B's own name; changing
++//!    it again would chain B -> C).
++//! 2. Commands (`$` and its name, then its arguments, see `command_end`) are copied as they
++//!    are, except a `$Svp` (voice play) command whose label starts with `VOICE_<key>_` for a
++//!    silenced key, which is dropped whole.
++//! 3. In plain text every whole-word occurrence of an old name becomes the new name, all pairs
++//!    in one pass, the longest old name first at each place; replaced text is never scanned
++//!    again (A -> B and B -> C never chain). A word letter is an ASCII letter or digit or a
++//!    code unit in U+00C0..U+024F; a command counts as a word break.
++//! 4. Nothing changes and the original pointer stays when the text has no listed name and no
++//!    silenced voice, or the chapter is on an `off` line.
++//!
++//! **Off means original.** No `full.txt` (look = keep: every run the owner's page can make,
++//! every run made before round 74, Randomizer off), a `full.txt` with nothing for this game's
++//! text language and no voice key, or one that does not parse: neither word (0x003D1DA8,
++//! 0x003D1784) is ever written and no memory is mapped. When the run ends the original word goes back at
++//! the next frame; a save state taken with the svc in memory is put right the same way.
++
++use std::collections::HashSet;
++use std::path::Path;
++
++use crate::fates_rando::{self, Guest};
++use crate::System;
++
++/// `Mess::Get`'s shared return: `add sp, sp, #80`.
++pub const MESS_GET_RETURN: u32 = 0x003D_1DA8;
++/// `Mess::GetNoReplace`'s shared return (story scenes, support talks): `add sp, sp, #80`.
++pub const NOREPLACE_RETURN: u32 = 0x003D_1784;
++/// both places the trap is written, in this order.
++pub const TRAP_SITES: [u32; 2] = [MESS_GET_RETURN, NOREPLACE_RETURN];
++/// the original word at both.
++pub const ORIGINAL_WORD: u32 = 0xE28D_D050;
++/// the end both functions print after the label in their stack buffer (`%s_COM`).
++const COM_SUFFIX: &[u8] = b"_COM";
++/// that buffer's size (`snprintf(sp, 0x50, ...)`).
++const LABEL_BUF: u32 = 0x50;
++/// changed texts remembered for handing out again.
++const RECENT: usize = 64;
++/// the bytes `add sp, sp, #80` gives back.
++pub const STACK_ADD: u32 = 80;
++/// the reserved svc number (round 71's chest trap has 0xFEC001; a later trap takes 0xFEC003).
++pub const SVC_NUMBER: u32 = 0x00FE_C002;
++/// `svc #0xFEC002`
++pub const TRAP_WORD: u32 = 0xEF00_0000 | SVC_NUMBER;
++/// the file in the run folder (`rando.py make --patch-out` writes it beside patch.txt; the
++/// core keeps it with the run, `fates_rando_session::make_run_inner`).
++pub const FILE: &str = "full.txt";
++pub const FORMAT: u32 = 1;
++const MAGIC: &str = "fates-rando-full";
++/// the text language this game shows (`m/@E/`: the only one in Fates USA and Seal of Flames).
++pub const TEXT_LANG: &str = "E";
++/// the ring of buffers: where and how big.
++pub const RING_VADDR: u32 = 0x5000_0000;
++pub const RING_SIZE: u32 = 0x0010_0000;
++/// the longest text the pass reads, in UTF-16 code units (the longest English message is
++/// under 5,000); a longer or unterminated text is left as it is.
++pub const MAX_TEXT_UNITS: usize = 0x4000;
++/// the longest label read from r7.
++const MAX_LABEL: u32 = 64;
++/// the longest name and the longest command argument the pass looks at.
++const MAX_NAME_UNITS: usize = 64;
++const MAX_ARG_UNITS: usize = 64;
++/// labels said in the log once each, at most this many.
++const MAX_LOGGED: usize = 2000;
++
++const DOLLAR: u16 = b'$' as u16;
++const BAR: u16 = b'|' as u16;
++const NEWLINE: u16 = b'\n' as u16;
++
++// --------------------------------------------------------------------------- the file
++
++/// one name pair: in text language `lang`, `old` (A's display name) becomes `new` (B's), both
++/// as UTF-16 code units.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Name {
++    pub lang: String,
++    pub old: Vec<u16>,
++    pub new: Vec<u16>,
++}
++
++/// a run's `full.txt`.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Full {
++    pub seed: String,
++    pub game: String,
++    pub names: Vec<Name>,
++    /// voice keys (ASCII) whose `$Svp VOICE_<key>_...` commands are dropped
++    pub silence: Vec<Vec<u8>>,
++    /// chapters in which nothing is changed
++    pub off: Vec<String>,
++}
++
++fn unhex(s: &str) -> Option<Vec<u8>> {
++    if s.len() % 2 != 0 || s.is_empty() {
++        return None;
++    }
++    (0..s.len()).step_by(2).map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok())).collect()
++}
++
++fn units(b: &[u8]) -> Option<Vec<u16>> {
++    if b.len() % 2 != 0 {
++        return None;
++    }
++    let u: Vec<u16> = b.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
++    (!u.is_empty() && u.len() <= MAX_NAME_UNITS && !u.contains(&0)).then_some(u)
++}
++
++fn key_ok(k: &[u8]) -> bool {
++    !k.is_empty() && k.len() <= 32 && k.iter().all(|&b| b.is_ascii_graphic() && b != b'|' && b != b'$')
++}
++
++fn lang_ok(l: &str) -> bool {
++    !l.is_empty() && l.len() <= 8 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
++}
++
++impl Full {
++    /// reads a `full.txt` (FULL_BLOCK.md section 4). A line it does not know, a missing or
++    /// wrong end line (a file not written whole), a name pair whose old and new are the same
++    /// or an old name listed twice for one language refuses the whole file. Line order is
++    /// not trusted: the pass sorts for itself.
++    pub fn parse(text: &str) -> Result<Full, String> {
++        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
++        if lines.next() != Some(&format!("{MAGIC} {FORMAT}")[..]) {
++            return Err(format!("not a full swap file of format {FORMAT}"));
++        }
++        let mut f = Full::default();
++        let (mut count, mut end) = (0usize, None);
++        for line in lines {
++            if end.is_some() {
++                return Err("a line after end".into());
++            }
++            let bad = || format!("bad line {line:?}");
++            let parts: Vec<&str> = line.split_whitespace().collect();
++            match parts.as_slice() {
++                ["seed", s] if f.seed.is_empty() => f.seed = s.to_string(),
++                ["game", g] if f.game.is_empty() => f.game = g.to_string(),
++                ["n", lang, old, new] => {
++                    let (Some(old), Some(new)) = (unhex(old).and_then(|b| units(&b)), unhex(new).and_then(|b| units(&b)))
++                    else {
++                        return Err(bad());
++                    };
++                    if !lang_ok(lang) || old == new {
++                        return Err(bad());
++                    }
++                    if f.names.iter().any(|n| n.lang == *lang && n.old == old) {
++                        return Err(format!("an old name listed twice ({line:?})"));
++                    }
++                    f.names.push(Name { lang: lang.to_string(), old, new });
++                    count += 1;
++                }
++                ["s", key] => {
++                    let key = unhex(key).filter(|k| key_ok(k)).ok_or_else(bad)?;
++                    if !f.silence.contains(&key) {
++                        f.silence.push(key);
++                    }
++                    count += 1;
++                }
++                ["off", ch] => {
++                    let ch = crate::fates_rando_chests::chapter_key(ch).filter(|k| k == ch).ok_or_else(bad)?;
++                    if !f.off.contains(&ch) {
++                        f.off.push(ch);
++                    }
++                    count += 1;
++                }
++                ["end", n] => {
++                    let n: usize = n.parse().map_err(|_| bad())?;
++                    if n != count {
++                        return Err(format!("end says {n}, the file has {count}"));
++                    }
++                    end = Some(n);
++                }
++                _ => return Err(bad()),
++            }
++        }
++        if end.is_none() {
++            return Err("no end line (the file is not complete)".into());
++        }
++        if f.seed.is_empty() || f.game.is_empty() {
++            return Err("no seed or game line".into());
++        }
++        Ok(f)
++    }
++}
++
++/// the run folder's `full.txt`: None = no file (look = keep: the trap stays off).
++pub fn read_full(run_dir: &Path) -> Option<Result<Full, String>> {
++    match std::fs::read_to_string(run_dir.join(FILE)) {
++        Ok(text) => Some(Full::parse(&text)),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
++        Err(e) => Some(Err(e.to_string())),
++    }
++}
++
++// --------------------------------------------------------------------------- the pass
++
++/// what the pass uses: one language's names, longest first, and the voice prefixes.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Swap {
++    names: Vec<(Vec<u16>, Vec<u16>)>,
++    /// `VOICE_<key>_` as code units
++    voices: Vec<Vec<u16>>,
++    off: Vec<String>,
++    firsts: HashSet<u16>,
++}
++
++impl Swap {
++    /// the pass for text language `lang`; None when it would change nothing (the fast path:
++    /// the trap is then never armed).
++    pub fn new(full: &Full, lang: &str) -> Option<Swap> {
++        let mut names: Vec<(Vec<u16>, Vec<u16>)> =
++            full.names.iter().filter(|n| n.lang == lang).map(|n| (n.old.clone(), n.new.clone())).collect();
++        names.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
++        let voices: Vec<Vec<u16>> = full.silence.iter()
++            .map(|k| b"VOICE_".iter().chain(k.iter()).chain(b"_".iter()).map(|&b| b as u16).collect())
++            .collect();
++        if names.is_empty() && voices.is_empty() {
++            return None;
++        }
++        let firsts = names.iter().map(|n| n.0[0]).collect();
++        Some(Swap { names, voices, off: full.off.clone(), firsts })
++    }
++
++    /// whether chapter `ch` is on an `off` line.
++    pub fn off_in(&self, ch: Option<&str>) -> bool {
++        ch.is_some_and(|c| self.off.iter().any(|o| o == c))
++    }
++
++    pub fn has_off(&self) -> bool {
++        !self.off.is_empty()
++    }
++
++    /// a `$Svp` command (`cmd` = from its `$` through its `|`) of a silenced voice.
++    fn drops(&self, cmd: &[u16]) -> bool {
++        starts(cmd, b"$Svp") && self.voices.iter().any(|v| cmd[4..].starts_with(v))
++    }
++
++    /// the pass over one text (code units, no end mark): Some(changed text), or None when
++    /// nothing changes. `(names replaced, voice commands dropped)` are counted into `stats`.
++    pub fn apply(&self, text: &[u16], stats: &mut (u32, u32)) -> Option<Vec<u16>> {
++        let mut out = Vec::with_capacity(text.len() + 16);
++        let (mut i, mut prev_word, mut changed) = (0usize, false, false);
++        while i < text.len() {
++            let u = text[i];
++            if u == DOLLAR {
++                let end = command_end(text, i);
++                if self.drops(&text[i..end]) {
++                    changed = true;
++                    stats.1 += 1;
++                } else {
++                    out.extend_from_slice(&text[i..end]);
++                }
++                i = end;
++                prev_word = false;
++                continue;
++            }
++            if !prev_word && self.firsts.contains(&u) {
++                let hit = self.names.iter().find(|(old, _)| {
++                    text[i..].starts_with(old) && !text.get(i + old.len()).is_some_and(|&n| word(n))
++                });
++                if let Some((old, new)) = hit {
++                    out.extend_from_slice(new);
++                    i += old.len();
++                    prev_word = true;
++                    changed = true;
++                    stats.0 += 1;
++                    continue;
++                }
++            }
++            out.push(u);
++            prev_word = word(u);
++            i += 1;
++        }
++        changed.then_some(out)
++    }
++}
++
++/// a word letter for the whole-word rule: an ASCII letter or digit, or U+00C0..U+024F.
++pub fn word(u: u16) -> bool {
++    (u < 0x80 && (u as u8).is_ascii_alphanumeric()) || (0x00C0..=0x024F).contains(&u)
++}
++
++fn starts(t: &[u16], s: &[u8]) -> bool {
++    t.len() >= s.len() && t.iter().zip(s).all(|(&a, &b)| a == b as u16)
++}
++
++/// The message commands this game's text uses: the name after `$` and its arguments, `p` =
++/// one argument up to and with its `|`, `d` = digits with no `|`. Read from the English
++/// message files of the owner's game by counting (round 74; every command but a handful of
++/// one-off ones is here). Longest names first where one starts another.
++const COMMANDS: &[(&str, &str)] = &[
++    ("Svp", "p"), ("Ssp", "p"), ("Sbv", "pp"), ("Sbp", "pp"), ("Sbs", "p"), ("Sre", "p"),
++    ("Sls", "pp"), ("Slp", "pp"), ("Slv", "pp"), ("Srp", "pp"),
++    ("Ws", "p"), ("Wm", "pd"), ("Wa", ""), ("Wd", ""), ("Wc", ""), ("Wv", ""),
++    ("Nu", ""), ("Fi", "p"), ("Fo", "p"), ("Fw", "p"), ("VN", "p"), ("VF", "p"),
++    ("E", "p"), ("G", "p"),
++    ("k", ""), ("p", ""), ("w", "p"), ("t", "d"), ("a", ""), ("b", "p"), ("l", "p"), ("c", "p"),
++];
++
++/// where the command starting at `text[i]` (a `$`) ends (the index after it). A known command
++/// takes its arguments; an argument with no `|` within `MAX_ARG_UNITS` (before a `$` or a
++/// line break) ends the command there. An unknown command runs to the first `|` before the
++/// next `$` or line break when there is one near, else over its letters only.
++pub fn command_end(text: &[u16], i: usize) -> usize {
++    let mut j = i + 1;
++    let found = COMMANDS.iter().filter(|(n, _)| starts(&text[j..], n.as_bytes())).max_by_key(|(n, _)| n.len());
++    let Some((name, args)) = found else {
++        let bar = text[j..].iter().take(MAX_ARG_UNITS).position(|&u| u == BAR || u == DOLLAR || u == NEWLINE);
++        if let Some(k) = bar.filter(|&k| text[j + k] == BAR) {
++            return j + k + 1;
++        }
++        while j < text.len() && text[j] < 0x80 && (text[j] as u8).is_ascii_alphabetic() {
++            j += 1;
++        }
++        return j;
++    };
++    j += name.len();
++    for a in args.bytes() {
++        if a == b'p' {
++            let stop = text[j..].iter().take(MAX_ARG_UNITS + 1).position(|&u| u == BAR || u == DOLLAR || u == NEWLINE);
++            match stop {
++                Some(k) if text[j + k] == BAR => j += k + 1,
++                _ => return j,
++            }
++        } else {
++            while j < text.len() && (b'0' as u16..=b'9' as u16).contains(&text[j]) {
++                j += 1;
++            }
++        }
++    }
++    j
++}
++
++// --------------------------------------------------------------------------- guest memory
++
++/// the ring of buffers in guest memory: `base`..`base + size`, the next free byte at `next`.
++/// `total` counts every byte the ring has moved on (with the bytes skipped at a wrap), so a
++/// text placed at `total` = t is whole while `total` - t <= `size`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Ring {
++    pub base: u32,
++    pub size: u32,
++    pub next: u32,
++    pub total: u64,
++    /// recent changed texts: (hash of the bytes, where, how many bytes, `total` when placed)
++    recent: Vec<(u64, u32, u32, u64)>,
++}
++
++fn fnv(bytes: &[u8]) -> u64 {
++    bytes.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01B3))
++}
++
++impl Ring {
++    pub fn new(base: u32, size: u32) -> Ring {
++        Ring { base, size, next: 0, total: 0, recent: Vec::new() }
++    }
++
++    /// where `len` bytes go (4-aligned), wrapping to the start when they do not fit before
++    /// the end; None for a text over a quarter of the ring (left unchanged).
++    pub fn place(&mut self, len: u32) -> Option<u32> {
++        self.place_at(len).map(|(at, _)| at)
++    }
++
++    /// as `place`, with `total` at the place.
++    fn place_at(&mut self, len: u32) -> Option<(u32, u64)> {
++        let need = len.checked_add(3)? & !3;
++        if need == 0 || need > self.size / 4 {
++            return None;
++        }
++        if self.next + need > self.size {
++            self.total += (self.size - self.next) as u64;
++            self.next = 0;
++        }
++        let at = self.base + self.next;
++        let start = self.total;
++        self.next += need;
++        self.total += need as u64;
++        Some((at, start))
++    }
++
++    /// a copy of `bytes` placed not long ago (in the younger half of the ring), still whole.
++    fn young(&self, hash: u64, len: u32) -> impl Iterator<Item = u32> + '_ {
++        self.recent.iter().rev()
++            .filter(move |&&(h, _, l, t)| h == hash && l == len && self.total - t <= (self.size / 2) as u64)
++            .map(|&(_, at, _, _)| at)
++    }
++}
++
++/// the UTF-16 text at `addr` up to its end mark (at most `max` units), read a page piece at
++/// a time; None when unreadable or longer.
++pub fn read_text(g: &mut dyn Guest, addr: u32, max: usize) -> Option<Vec<u16>> {
++    if addr == 0 || addr % 2 != 0 {
++        return None;
++    }
++    let mut out = Vec::new();
++    let mut at = addr;
++    while out.len() < max {
++        let page_left = 0x1000 - (at & 0xFFF);
++        let mut n = page_left.min(((max - out.len()) * 2) as u32).min(0x200) & !1;
++        // a text may end close to the end of what is mapped: smaller pieces then
++        while n >= 2 && !g.readable(at, n) {
++            n = (n / 2) & !1;
++        }
++        if n < 2 {
++            return None;
++        }
++        let mut buf = vec![0u8; n as usize];
++        g.read(at, &mut buf);
++        for c in buf.chunks(2) {
++            let u = u16::from_le_bytes([c[0], c[1]]);
++            if u == 0 {
++                return Some(out);
++            }
++            out.push(u);
++        }
++        at = at.wrapping_add(n);
++    }
++    None
++}
++
++/// the text written into the ring with its end mark; its guest address. The same text placed
++/// not long ago (in the younger half of the ring, its bytes still the same) is handed out
++/// again instead.
++pub fn write_text(g: &mut dyn Guest, ring: &mut Ring, text: &[u16]) -> Option<u32> {
++    let mut bytes: Vec<u8> = text.iter().flat_map(|u| u.to_le_bytes()).collect();
++    bytes.extend_from_slice(&[0, 0]);
++    let (hash, len) = (fnv(&bytes), bytes.len() as u32);
++    let again: Vec<u32> = ring.young(hash, len).collect();
++    for at in again {
++        if g.readable(at, len) {
++            let mut have = vec![0u8; bytes.len()];
++            g.read(at, &mut have);
++            if have == bytes {
++                return Some(at);
++            }
++        }
++    }
++    let (at, start) = ring.place_at(len)?;
++    if !g.readable(at, len) {
++        return None;
++    }
++    g.write(at, &bytes);
++    // texts this one wrote over are forgotten (the young check covers them too)
++    ring.recent.retain(|&(_, a, l, _)| a + l <= at || at + len <= a);
++    if ring.recent.len() >= RECENT {
++        ring.recent.remove(0);
++    }
++    ring.recent.push((hash, at, len, start));
++    Some(at)
++}
++
++/// the chapter the game is in, for `off` lines: the last chapter person file the game loaded
++/// (the Person archive list `Person::Load` appends to, `fates_rando::PERSON_LIST`), else
++/// GameUserData's current chapter. Read only when the file has `off` lines.
++pub fn chapter_now(g: &mut dyn Guest) -> Option<String> {
++    let mut last = None;
++    let mut node = g.r32(fates_rando::PERSON_LIST).unwrap_or(0);
++    for _ in 0..64 {
++        if node == 0 {
++            break;
++        }
++        if let Some(start) = g.r32(node).filter(|&s| s != 0) {
++            if let Some(name) = g.r32(start).filter(|&p| p != 0).and_then(|p| g.cstr(p, 32)) {
++                if let Some(k) = crate::fates_rando_chests::chapter_key(&String::from_utf8_lossy(&name)) {
++                    last = Some(k);
++                }
++            }
++        }
++        node = g.r32(node.wrapping_add(8)).unwrap_or(0);
++    }
++    last.or_else(|| crate::fates_rando_chests::chapter_key(&crate::fates_nuzlocke::chapter(g)))
++}
++
++/// the label at a trap place: `Mess::Get` keeps it in r7; `Mess::GetNoReplace` keeps none, so
++/// it is read from the `<label>_COM` both print into their stack buffer at sp (a label too
++/// long for the buffer is read as far as it goes).
++pub fn label_at(g: &mut dyn Guest, at: u32, r7: u32, sp: u32) -> Vec<u8> {
++    if at == MESS_GET_RETURN {
++        return g.cstr(r7, MAX_LABEL).unwrap_or_default();
++    }
++    let mut l = g.cstr(sp, LABEL_BUF).unwrap_or_default();
++    if l.ends_with(COM_SUFFIX) {
++        l.truncate(l.len() - COM_SUFFIX.len());
++    }
++    l
++}
++
++/// a built `Mess::Get` text: the message at `r4` starts with `$a` (arguments filled in).
++pub fn built(g: &mut dyn Guest, at: u32, r4: u32) -> bool {
++    if at != MESS_GET_RETURN || r4 == 0 || r4 % 2 != 0 || !g.readable(r4, 4) {
++        return false;
++    }
++    let mut b = [0u8; 4];
++    g.read(r4, &mut b);
++    b == [b'$', 0, b'a', 0]
++}
++
++/// what the trap does with one result: the text at `r0` (label `label`; `built` = arguments
++/// filled in by the game) passed through `swap`; Some(new r0) when it changed and was written
++/// into the ring.
++pub fn on_result(swap: &Swap, g: &mut dyn Guest, ring: &mut Ring, r0: u32, label: &[u8], built: bool,
++                 stats: &mut (u32, u32)) -> Option<u32>
++{
++    if built || label.starts_with(b"MPID_") {
++        return None;
++    }
++    let text = read_text(g, r0, MAX_TEXT_UNITS)?;
++    if text.is_empty() {
++        return None;
++    }
++    let changed = swap.apply(&text, stats)?;
++    if swap.has_off() && swap.off_in(chapter_now(g).as_deref()) {
++        return None;
++    }
++    write_text(g, ring, &changed)
++}
++
++// --------------------------------------------------------------------------- the trap
++
++/// the trap's state, kept with the randomizer session (`Session::names`).
++#[derive(Debug, Default)]
++pub struct Names {
++    /// the run whose `full.txt` was read last (None = no run)
++    run: Option<String>,
++    /// its pass, when it changes anything
++    swap: Option<Swap>,
++    /// the ring, once mapped
++    ring: Option<Ring>,
++    /// the words at TRAP_SITES the recompiled code was last checked against
++    lib_words: Option<[u32; 2]>,
++    /// said once: the word is a stranger's, the code cannot tell a changed function, or the
++    /// region is taken
++    noted: bool,
++    logged: HashSet<Vec<u8>>,
++    /// texts changed since the program started
++    pub changed: u64,
++}
++
++impl Names {
++    /// whether a pass is active.
++    pub fn active(&self) -> bool {
++        self.swap.is_some()
++    }
++}
++
++/// what the frame writes at MESS_GET_RETURN (as the chest trap: a stranger's word is left).
++pub fn word_to_write(want: bool, now: u32) -> Option<u32> {
++    match (want, now) {
++        (true, ORIGINAL_WORD) => Some(TRAP_WORD),
++        (false, TRAP_WORD) => Some(ORIGINAL_WORD),
++        _ => None,
++    }
++}
++
++/// the run's game as `full.txt` names it.
++pub fn game_name(fates_rando_game: Option<&str>) -> &str {
++    fates_rando_game.unwrap_or("fates")
++}
++
++/// the pass of a run's `full.txt` for this game: Ok(None) = nothing to do (no file, or
++/// nothing for this language); Err = the file is refused (said in a notice).
++pub fn swap_for(full: Option<Result<Full, String>>, seed: Option<&str>, game: &str) -> Result<Option<Swap>, String> {
++    let full = match full {
++        None => return Ok(None),
++        Some(Err(e)) => return Err(e),
++        Some(Ok(f)) => f,
++    };
++    if seed.is_some_and(|s| s != full.seed) {
++        return Err(format!("its seed {} is not the run's", full.seed));
++    }
++    if full.game != game {
++        return Err(format!("it was made for {}, this game is {game}", full.game));
++    }
++    Ok(Swap::new(&full, TEXT_LANG))
++}
++
++/// the ring's block, mapped now if it is not (Base region pages, RW); None when the range
++/// holds something else or no pages are free.
++fn ensure_ring(system: &mut System) -> Option<Ring> {
++    use crate::memory::{MemoryRegion, MemoryState, Permission};
++    let mapped = system.memory.mapping_at(RING_VADDR).copied();
++    match mapped {
++        Some(m) if m.base == RING_VADDR && m.size >= RING_SIZE => {
++            return Some(system.rando.names.ring.take().unwrap_or(Ring::new(RING_VADDR, RING_SIZE)));
++        }
++        Some(_) => return None,
++        None => {}
++    }
++    if system.memory.mappings().any(|m| {
++        (m.base as u64) < RING_VADDR as u64 + RING_SIZE as u64 && (RING_VADDR as u64) < m.base as u64 + m.size as u64
++    }) {
++        return None;
++    }
++    let block = system.memory.phys.allocate(MemoryRegion::Base, RING_SIZE)?;
++    system.memory.zero_physical(block.addr, block.size);
++    system.memory.map(RING_VADDR, block.addr, block.size, Permission::RW, MemoryState::Private);
++    log::info!("fates_rando: names hook: ring of buffers mapped at 0x{RING_VADDR:08X} (0x{RING_SIZE:X} bytes, Base pages 0x{:08X})",
++               block.addr);
++    Some(Ring::new(RING_VADDR, RING_SIZE))
++}
++
++/// `kernel::svc::dispatch` for SVC_NUMBER: true when it was the trap at one of TRAP_SITES (the
++/// replaced `add sp, sp, #80` done, the text changed when the pass changes it); false for any
++/// other place (the svc is then an unknown one, as before).
++pub fn on_svc(system: &mut System) -> bool {
++    let at = system.cpu.regs[15].wrapping_sub(4);
++    if system.cpu.cpsr.thumb || !TRAP_SITES.contains(&at) {
++        return false;
++    }
++    let taken = system.rando.names.swap.take();
++    if let Some(swap) = taken.as_ref() {
++        if system.rando.names.ring.is_none() || system.memory.mapping_at(RING_VADDR).is_none() {
++            system.rando.names.ring = ensure_ring(system);
++        }
++        if let Some(mut ring) = system.rando.names.ring.take() {
++            let r = &system.cpu.regs;
++            let (r0, r4, r7, sp) = (r[0], r[4], r[7], r[13]);
++            let label = label_at(&mut system.memory, at, r7, sp);
++            let built = built(&mut system.memory, at, r4);
++            let mut stats = (0u32, 0u32);
++            if let Some(new_r0) = on_result(swap, &mut system.memory, &mut ring, r0, &label, built, &mut stats) {
++                system.cpu.regs[0] = new_r0;
++                let n = &mut system.rando.names;
++                n.changed += 1;
++                if n.logged.len() < MAX_LOGGED && n.logged.insert(label.clone()) {
++                    log::info!("fates_rando: names hook: {} changed at 0x{at:08X} ({} names, {} voice commands dropped)",
++                               String::from_utf8_lossy(&label), stats.0, stats.1);
++                }
++            }
++            system.rando.names.ring = Some(ring);
++        }
++    }
++    system.rando.names.swap = taken;
++    system.cpu.regs[13] = system.cpu.regs[13].wrapping_add(STACK_ADD);
++    true
++}
++
++/// once a frame (`fates_rando_session::after_frame`, Fire Emblem Fates only): the pass follows
++/// the active run's `full.txt`, and the word at MESS_GET_RETURN follows the pass.
++pub fn frame(system: &mut System, data: &Path) {
++    let active = system.rando.active();
++    if system.rando.names.run != active {
++        let mut swap = None;
++        if let Some(id) = active.as_deref() {
++            let full = read_full(&crate::fates_rando_session::run_dir(data, id));
++            let seed = system.rando.active_seed();
++            let game = game_name(system.config.fates_rando_game.as_deref()).to_string();
++            match swap_for(full, seed.as_deref(), &game) {
++                Ok(Some(s)) => {
++                    log::info!("fates_rando: {id}: names in dialogue on ({} names, {} voices silenced)", s.names.len(),
++                               s.voices.len());
++                    swap = Some(s);
++                }
++                Ok(None) => {}
++                Err(e) => {
++                    log::warn!("fates_rando: {id}: dialogue names kept ({FILE}: {e})");
++                    system.rando.notices.push(format!("dialogue names kept ({FILE}: {e})"));
++                }
++            }
++        }
++        let n = &mut system.rando.names;
++        n.run = active;
++        n.swap = swap;
++    }
++    let mut want = system.rando.names.swap.is_some();
++    if want && system.recompiled.as_ref().is_some_and(|lib| !lib.checks_itself()) {
++        if !system.rando.names.noted {
++            system.rando.names.noted = true;
++            log::warn!("fates_rando: names in dialogue need the game recompiled again (its code cannot tell a changed \
++                        function); dialogue keeps the old names");
++        }
++        want = false;
++    }
++    if want && system.rando.names.ring.is_none() {
++        system.rando.names.ring = ensure_ring(system);
++        if system.rando.names.ring.is_none() {
++            if !system.rando.names.noted {
++                system.rando.names.noted = true;
++                let text = format!("dialogue names kept (guest memory at 0x{RING_VADDR:08X} is taken or none is free)");
++                log::warn!("fates_rando: {text}");
++                system.rando.notices.push(text);
++            }
++            want = false;
++        }
++    }
++    let mut words = [0u32; 2];
++    for (k, &site) in TRAP_SITES.iter().enumerate() {
++        let Some(now) = Guest::r32(&mut system.memory, site) else { return };
++        match word_to_write(want, now) {
++            Some(word) => {
++                system.memory.write32_privileged(site, word);
++                log::info!("fates_rando: names hook at 0x{site:08X} {}",
++                           if word == TRAP_WORD { "on" } else { "off (the original word back)" });
++            }
++            None if want && now != TRAP_WORD && !system.rando.names.noted => {
++                system.rando.names.noted = true;
++                log::warn!("fates_rando: the message word at 0x{site:08X} is 0x{now:08X}, not the original's; \
++                            the names hook stays off there");
++            }
++            None => {}
++        }
++        let Some(now) = Guest::r32(&mut system.memory, site) else { return };
++        words[k] = now;
++    }
++    if words != system.rando.names.lib_words.unwrap_or([ORIGINAL_WORD; 2]) {
++        if let Some(lib) = system.recompiled.as_mut() {
++            if lib.checks_itself() {
++                let stale = lib.check(&mut system.memory);
++                log::info!("fates_rando: names hook: the recompiled code checked again, {stale} functions run in the interpreter");
++            }
++        }
++        system.rando.names.lib_words = Some(words);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeMap;
++
++    #[derive(Default)]
++    struct Fake {
++        blocks: BTreeMap<u32, Vec<u8>>,
++    }
++
++    impl Fake {
++        fn put(&mut self, at: u32, data: &[u8]) {
++            self.blocks.insert(at, data.to_vec());
++        }
++        fn find(&self, addr: u32, len: u32) -> Option<(u32, usize)> {
++            let (&b, v) = self.blocks.range(..=addr).next_back()?;
++            let o = (addr - b) as usize;
++            (o + len as usize <= v.len()).then_some((b, o))
++        }
++    }
++
++    impl Guest for Fake {
++        fn readable(&self, addr: u32, len: u32) -> bool {
++            self.find(addr, len).is_some()
++        }
++        fn read(&mut self, addr: u32, out: &mut [u8]) {
++            let (b, o) = self.find(addr, out.len() as u32).unwrap();
++            out.copy_from_slice(&self.blocks[&b][o..o + out.len()]);
++        }
++        fn write(&mut self, addr: u32, data: &[u8]) {
++            let (b, o) = self.find(addr, data.len() as u32).unwrap();
++            self.blocks.get_mut(&b).unwrap()[o..o + data.len()].copy_from_slice(data);
++        }
++    }
++
++    fn u(s: &str) -> Vec<u16> {
++        s.encode_utf16().collect()
++    }
++
++    fn hex16(s: &str) -> String {
++        u(s).iter().flat_map(|c| c.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
++    }
++
++    fn hexa(s: &str) -> String {
++        s.bytes().map(|b| format!("{b:02x}")).collect()
++    }
++
++    /// a made-up file: Aaron -> Baker, Baker -> Carla, Carl -> Doran, voices AARON and BAKER
++    /// silenced (the names and keys are ours, no game text).
++    fn file() -> String {
++        format!("fates-rando-full 1\nseed demo-7\ngame fates\n\
++n E {} {}\nn E {} {}\nn E {} {}\ns {}\ns {}\nend 5\n",
++                hex16("Aaron"), hex16("Baker"), hex16("Baker"), hex16("Carla"), hex16("Carl"), hex16("Doran"),
++                hexa("AARON"), hexa("BAKER"))
++    }
++
++    fn swap() -> Swap {
++        Swap::new(&Full::parse(&file()).unwrap(), TEXT_LANG).unwrap()
++    }
++
++    fn run(s: &Swap, text: &str) -> Option<String> {
++        let mut st = (0, 0);
++        s.apply(&u(text), &mut st).map(|v| String::from_utf16(&v).unwrap())
++    }
++
++    #[test]
++    fn the_file_is_read_whole_or_refused() {
++        let f = Full::parse(&file()).unwrap();
++        assert_eq!((f.seed.as_str(), f.game.as_str(), f.names.len(), f.silence.len()), ("demo-7", "fates", 3, 2));
++        assert_eq!(f.names[0], Name { lang: "E".into(), old: u("Aaron"), new: u("Baker") });
++        assert_eq!(f.silence[0], b"AARON".to_vec());
++        let t = file();
++        assert!(Full::parse(&t.replace("end 5\n", "")).is_err(), "cut short");
++        assert!(Full::parse(&t.replace("end 5", "end 4")).is_err());
++        assert!(Full::parse(&t.replace("full 1", "full 2")).is_err());
++        assert!(Full::parse(&format!("{t}s 41\n")).is_err(), "a line after end");
++        assert!(Full::parse(&t.replace(&hex16("Baker"), "4100610")).is_err(), "odd hex");
++        assert!(Full::parse(&t.replace("game fates\n", "")).is_err());
++        // an old name twice, or a pair that changes nothing
++        let twice = t.replace(&format!("n E {} {}", hex16("Carl"), hex16("Doran")),
++                              &format!("n E {} {}", hex16("Aaron"), hex16("Doran")));
++        assert!(Full::parse(&twice).is_err());
++        let same = t.replace(&format!("{} {}", hex16("Carl"), hex16("Doran")), &format!("{} {}", hex16("Carl"), hex16("Carl")));
++        assert!(Full::parse(&same).is_err());
++        // off lines; an empty file of this format is a file (the trap then stays off)
++        let off = Full::parse(&t.replace("end 5", "off C008\nend 6")).unwrap();
++        assert_eq!(off.off, vec!["C008".to_string()]);
++        assert!(Full::parse(&t.replace("end 5", "off c8\nend 6")).is_err());
++        let empty = Full::parse("fates-rando-full 1\nseed s\ngame fates\nend 0\n").unwrap();
++        assert!(Swap::new(&empty, TEXT_LANG).is_none(), "fast path: nothing to do, never armed");
++    }
++
++    #[test]
++    fn no_file_or_another_language_only_means_off() {
++        assert_eq!(swap_for(None, Some("demo-7"), "fates"), Ok(None));
++        let f = file().replace("n E ", "n J ").replace(&format!("s {}\ns {}\n", hexa("AARON"), hexa("BAKER")), "")
++            .replace("end 5", "end 3");
++        assert_eq!(swap_for(Some(Full::parse(&f)), Some("demo-7"), "fates"), Ok(None));
++        // another seed or another game: refused (the notice says dialogue names kept)
++        assert!(swap_for(Some(Full::parse(&file())), Some("other"), "fates").is_err());
++        assert!(swap_for(Some(Full::parse(&file())), Some("demo-7"), "seal").is_err());
++        assert!(swap_for(Some(Err("bad".into())), Some("demo-7"), "fates").is_err());
++        assert!(swap_for(Some(Full::parse(&file())), Some("demo-7"), "fates").unwrap().is_some());
++        assert_eq!(game_name(None), "fates");
++        assert_eq!(game_name(Some("seal")), "seal");
++        let dir = std::env::temp_dir().join(format!("fef-full-test-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        assert!(read_full(&dir).is_none());
++        std::fs::write(dir.join(FILE), file()).unwrap();
++        assert!(read_full(&dir).unwrap().is_ok());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn names_are_whole_words_in_one_pass_and_never_chain() {
++        let s = swap();
++        assert_eq!(run(&s, "Aaron and Baker went home."), Some("Baker and Carla went home.".into()), "A->B, B->C at once");
++        assert_eq!(run(&s, "Aaron's sword"), Some("Baker's sword".into()));
++        assert_eq!(run(&s, "Carla stays, Carl goes"), Some("Carla stays, Doran goes".into()), "longest first, whole word");
++        assert_eq!(run(&s, "Aaronson and xAaron and Aaron2"), None, "not a whole word");
++        assert_eq!(run(&s, "Aaron\u{00E9}"), None, "a Latin letter after the name");
++        assert_eq!(run(&s, "\u{00C0}Aaron"), None);
++        assert_eq!(run(&s, "Nobody here."), None, "nothing to change: the original pointer stays");
++        assert_eq!(run(&s, "AARON shouted"), None, "names are matched as written");
++    }
++
++    #[test]
++    fn a_silenced_speaker_goes_quiet_and_another_is_kept() {
++        let s = swap();
++        let text = "$Wm\u{30A2}|3$w0|$Wa$Ws\u{30A2}|$SvpVOICE_AARON_EVT_01|Hi, Carl.$k\n\
++$p$SvpVOICE_DORAN_EVT_02|Hello.$k";
++        let want = "$Wm\u{30A2}|3$w0|$Wa$Ws\u{30A2}|Hi, Doran.$k\n$p$SvpVOICE_DORAN_EVT_02|Hello.$k";
++        let mut st = (0, 0);
++        let got = String::from_utf16(&s.apply(&u(text), &mut st).unwrap()).unwrap();
++        assert_eq!(got, want);
++        assert_eq!(st, (1, 1));
++        // a voice alone changes the text; a key that only starts like a silenced one does not
++        assert_eq!(run(&s, "$SvpVOICE_BAKER_EVT_09|...").as_deref(), Some("..."));
++        assert_eq!(run(&s, "$SvpVOICE_BAKERY_EVT_09|..."), None);
++        // a sound effect command naming the same key is not a voice play
++        assert_eq!(run(&s, "$SspVOICE_AARON_X|..."), None);
++    }
++
++    #[test]
++    fn commands_are_never_touched_and_a_command_next_to_a_name_is_a_word_break() {
++        let s = swap();
++        // the name right after a command, and a command right after a name
++        assert_eq!(run(&s, "$pAaron!$k"), Some("$pBaker!$k".into()));
++        assert_eq!(run(&s, "Is that Aaron$k\n$pYes."), Some("Is that Baker$k\n$pYes.".into()));
++        // command arguments holding a name are kept
++        assert_eq!(run(&s, "$WsAaron|$WmAaron|3$GAaron,Baker|"), None);
++        assert_eq!(run(&s, "$E\u{901a},|$WaAaron"), Some("$E\u{901a},|$WaBaker".into()));
++        assert_eq!(run(&s, "$t1$WmBaker|7Aaron"), Some("$t1$WmBaker|7Baker".into()), "Wm's place digit is part of it");
++        assert_eq!(run(&s, "$Nu Aaron"), Some("$Nu Baker".into()));
++        // an unknown command runs to its | when one is near, else over its letters
++        assert_eq!(run(&s, "$QzAaron|Aaron"), Some("$QzAaron|Baker".into()));
++        assert_eq!(run(&s, "$Qz Aaron"), Some("$Qz Baker".into()));
++        // a lone $ at the end
++        assert_eq!(run(&s, "Aaron $"), Some("Baker $".into()));
++        assert_eq!(command_end(&u("$k\n"), 0), 2);
++        assert_eq!(command_end(&u("$SbvA|12|x"), 0), 9);
++        assert_eq!(command_end(&u("$Sbv1|x"), 0), 6, "an argument with no | ends the command");
++    }
++
++    #[test]
++    fn the_ring_wraps_and_keeps_the_last_two_results() {
++        const BASE: u32 = 0x5000_0000;
++        let mut m = Fake::default();
++        m.put(BASE, &[0u8; 256]);
++        let mut ring = Ring::new(BASE, 256);
++        let texts = ["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccc", "dddddddddddddddddddddddd",
++                     "eeeeeeeeeeeeeeeeeeeee", "ffffffffffffffffffff"];
++        let mut held: Vec<(u32, &str)> = Vec::new();
++        let mut wrapped = false;
++        for t in texts {
++            let at = write_text(&mut m, &mut ring, &u(t)).unwrap();
++            if let Some(&(last, _)) = held.last() {
++                wrapped |= at < last;
++            }
++            held.push((at, t));
++            // the result before this one and this one are both whole (a caller holding two)
++            for &(a, want) in held.iter().rev().take(2) {
++                assert_eq!(read_text(&mut m, a, 64).map(|v| String::from_utf16(&v).unwrap()).as_deref(), Some(want));
++            }
++            assert!(at % 4 == 0 && at >= BASE && at < BASE + 256);
++        }
++        assert!(wrapped, "six texts of 42-52 bytes go round a 256-byte ring");
++        // a text over a quarter of the ring is not placed (it stays unchanged)
++        assert!(write_text(&mut m, &mut ring, &u(&"x".repeat(40))).is_none());
++    }
++
++    #[test]
++    fn the_trap_changes_a_line_and_leaves_names_and_untouched_texts() {
++        let s = swap();
++        let mut m = Fake::default();
++        const RING: u32 = 0x5000_0000;
++        m.put(RING, &vec![0u8; 0x1000]);
++        let mut ring = Ring::new(RING, 0x1000);
++        // the message file (a line naming Aaron), a name text, a line naming no one, labels
++        let line: Vec<u8> = u("Aaron!").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        let name: Vec<u8> = u("Baker").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        let none: Vec<u8> = u("Hello.").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        m.put(0x3000_0000, &line);
++        m.put(0x3000_1000, &name);
++        m.put(0x3000_2000, &none);
++        m.put(0x3100_0000, b"MID_TEST_1\0");
++        m.put(0x3100_1000, b"MPID_TEST\0");
++        let mut st = (0, 0);
++        let at = on_result(&s, &mut m, &mut ring, 0x3000_0000, b"MID_TEST_1", false, &mut st).unwrap();
++        assert_eq!(String::from_utf16(&read_text(&mut m, at, 64).unwrap()).unwrap(), "Baker!");
++        // the file's own text is never written
++        assert_eq!(read_text(&mut m, 0x3000_0000, 64).unwrap(), u("Aaron!"));
++        // a person's name label (the table cells already point it at the filler): left
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_1000, b"MPID_TEST", false, &mut st), None);
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_2000, b"MID_TEST_1", false, &mut st), None);
++        // unreadable or odd text pointers (the not-found path) are left
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0, b"MID_TEST_1", false, &mut st), None);
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_0001, b"MID_TEST_1", false, &mut st), None);
++        // an unterminated text past the limit is left
++        m.put(0x3200_0000, &vec![0x41u8; 64]);
++        assert_eq!(read_text(&mut m, 0x3200_0000, 16), None);
++    }
++
++    #[test]
++    fn an_off_chapter_passes_everything() {
++        let f = Full::parse(&file().replace("end 5", "off C008\nend 6")).unwrap();
++        let s = Swap::new(&f, TEXT_LANG).unwrap();
++        assert!(s.off_in(Some("C008")) && !s.off_in(Some("C009")) && !s.off_in(None));
++        let mut m = Fake::default();
++        m.put(0x5000_0000, &vec![0u8; 0x1000]);
++        let mut ring = Ring::new(0x5000_0000, 0x1000);
++        let line: Vec<u8> = u("Aaron!").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        m.put(0x3000_0000, &line);
++        m.put(0x3100_0000, b"MID_TEST_1\0");
++        // the Person list's last chapter file names C008: nothing changes; C009: changed
++        let put_chapter = |m: &mut Fake, ch: &[u8]| {
++            let mut node = vec![0u8; 12];
++            node[0..4].copy_from_slice(&0x3400_0020u32.to_le_bytes());
++            m.put(0x3300_0000, &node);
++            let mut blk = vec![0u8; 0x40];
++            blk[0..4].copy_from_slice(&(0x3400_0020u32 + 0x30).to_le_bytes());
++            blk[0x30..0x30 + ch.len()].copy_from_slice(ch);
++            m.put(0x3400_0020, &blk);
++            m.put(fates_rando::PERSON_LIST, &0x3300_0000u32.to_le_bytes());
++        };
++        put_chapter(&mut m, b"C008");
++        assert_eq!(chapter_now(&mut m).as_deref(), Some("C008"));
++        let mut st = (0, 0);
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_0000, b"MID_TEST_1", false, &mut st), None);
++        put_chapter(&mut m, b"C009");
++        assert!(on_result(&s, &mut m, &mut ring, 0x3000_0000, b"MID_TEST_1", false, &mut st).is_some());
++    }
++
++    #[test]
++    fn the_word_follows_the_pass_and_leaves_a_stranger_alone() {
++        assert_eq!(word_to_write(true, ORIGINAL_WORD), Some(TRAP_WORD));
++        assert_eq!(word_to_write(false, TRAP_WORD), Some(ORIGINAL_WORD));
++        assert_eq!(word_to_write(false, ORIGINAL_WORD), None, "off: the original word is never written");
++        assert_eq!(word_to_write(true, TRAP_WORD), None);
++        assert_eq!(word_to_write(true, 0xE1A0_0000), None);
++        assert_eq!(TRAP_WORD, 0xEFFE_C002);
++        assert_ne!(SVC_NUMBER, crate::fates_rando_chests::SVC_NUMBER);
++        assert!(RING_VADDR >= 0x4000_0000, "above every address a 3DS process is given");
++    }
++
++    #[test]
++    fn both_places_are_trapped_and_their_labels_are_found() {
++        assert_eq!(TRAP_SITES, [MESS_GET_RETURN, NOREPLACE_RETURN]);
++        let mut m = Fake::default();
++        m.put(0x3100_0000, b"MID_TEST_1\0");
++        // GetNoReplace: the label is read from the "<label>_COM" in the stack buffer at sp
++        let mut stack = vec![0u8; 0x50];
++        stack[..15].copy_from_slice(b"MID_SCENE_2_COM");
++        m.put(0x0FFF_0000, &stack);
++        assert_eq!(label_at(&mut m, MESS_GET_RETURN, 0x3100_0000, 0x0FFF_0000), b"MID_TEST_1".to_vec());
++        assert_eq!(label_at(&mut m, NOREPLACE_RETURN, 0x3100_0000, 0x0FFF_0000), b"MID_SCENE_2".to_vec());
++        // a person's name label behind GetNoReplace is still left
++        stack[..14].copy_from_slice(b"MPID_TEST_COM\0");
++        m.put(0x0FFF_0000, &stack);
++        let l = label_at(&mut m, NOREPLACE_RETURN, 0, 0x0FFF_0000);
++        assert_eq!(l, b"MPID_TEST".to_vec());
++        let s = swap();
++        m.put(0x5000_0000, &vec![0u8; 0x1000]);
++        let mut ring = Ring::new(0x5000_0000, 0x1000);
++        let line: Vec<u8> = u("Aaron!").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        m.put(0x3000_0000, &line);
++        let mut st = (0, 0);
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_0000, &l, false, &mut st), None);
++        // a scene line with a silenced voice behind GetNoReplace: changed
++        let scene: Vec<u8> = u("$SvpVOICE_AARON_EVT_01|Carl, wait!$k").iter().flat_map(|c| c.to_le_bytes())
++            .chain([0, 0]).collect();
++        m.put(0x3000_4000, &scene);
++        let at = on_result(&s, &mut m, &mut ring, 0x3000_4000, b"MID_SCENE_2", false, &mut st).unwrap();
++        assert_eq!(String::from_utf16(&read_text(&mut m, at, 64).unwrap()).unwrap(), "Doran, wait!$k");
++    }
++
++    #[test]
++    fn a_built_message_is_returned_as_the_game_built_it() {
++        let s = swap();
++        let mut m = Fake::default();
++        m.put(0x5000_0000, &vec![0u8; 0x1000]);
++        let mut ring = Ring::new(0x5000_0000, 0x1000);
++        // the message with arguments ("$a" first) and the shared buffer holding the built text
++        let tmpl: Vec<u8> = u("$a$0 and $1 met.").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        let done: Vec<u8> = u("Baker and Aaron met.").iter().flat_map(|c| c.to_le_bytes()).chain([0, 0]).collect();
++        m.put(0x3000_0000, &tmpl);
++        m.put(0x3000_1000, &done);
++        assert!(built(&mut m, MESS_GET_RETURN, 0x3000_0000));
++        assert!(!built(&mut m, MESS_GET_RETURN, 0x3000_1000), "a plain message");
++        assert!(!built(&mut m, NOREPLACE_RETURN, 0x3000_0000), "GetNoReplace fills nothing in");
++        assert!(!built(&mut m, MESS_GET_RETURN, 0) && !built(&mut m, MESS_GET_RETURN, 0x7000_0000));
++        let mut st = (0, 0);
++        assert_eq!(on_result(&s, &mut m, &mut ring, 0x3000_1000, b"MID_MSG_X", true, &mut st), None, "never B -> C");
++        assert!(on_result(&s, &mut m, &mut ring, 0x3000_1000, b"MID_MSG_X", false, &mut st).is_some());
++    }
++
++    #[test]
++    fn a_repeated_text_shares_one_copy_while_it_is_young() {
++        const BASE: u32 = 0x5000_0000;
++        let mut m = Fake::default();
++        m.put(BASE, &[0u8; 256]);
++        let mut ring = Ring::new(BASE, 256);
++        let a = write_text(&mut m, &mut ring, &u("hello Baker")).unwrap();
++        let used = ring.total;
++        assert_eq!(write_text(&mut m, &mut ring, &u("hello Baker")), Some(a), "the same copy again");
++        assert_eq!(ring.total, used, "nothing written");
++        // after more than half the ring of other text, a fresh copy is written
++        for t in ["xxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
++            write_text(&mut m, &mut ring, &u(t)).unwrap();
++        }
++        let b = write_text(&mut m, &mut ring, &u("hello Baker")).unwrap();
++        assert_ne!(b, a);
++        assert_eq!(String::from_utf16(&read_text(&mut m, b, 64).unwrap()).unwrap(), "hello Baker");
++        // a copy whose bytes were changed is not handed out
++        m.write(b, &[0x41, 0]);
++        let c = write_text(&mut m, &mut ring, &u("hello Baker")).unwrap();
++        assert_ne!(c, b);
++        assert_eq!(String::from_utf16(&read_text(&mut m, c, 64).unwrap()).unwrap(), "hello Baker");
++    }
++}
+diff --git a/crates/zakuro-core/src/fates_rando_session.rs b/crates/zakuro-core/src/fates_rando_session.rs
+index 6dacfaf..14838c7 100644
+--- a/crates/zakuro-core/src/fates_rando_session.rs
++++ b/crates/zakuro-core/src/fates_rando_session.rs
+@@ -99,6 +99,9 @@ pub struct Session {
+     /// round 71: the chest hook (chests, villages and talk gifts; `fates_rando_chests`): the
+     /// active run's chest list and the word at ev::ItemGain
+     pub chests: crate::fates_rando_chests::Chests,
++    /// round 74: the names-in-dialogue trap (the full swap's names and quiet voices;
++    /// `fates_rando_names`): the active run's full.txt and the word in Mess::Get
++    pub names: crate::fates_rando_names::Names,
+ }
+ 
+ /// round 61: the run a PLAY RANDOMIZED profile with Nuzlocke on keeps in its own data folder
+@@ -240,6 +243,11 @@ impl Session {
+         self.run.as_ref().filter(|r| r.gamedata_applied()).map(|r| r.id.clone())
+     }
+ 
++    /// round 74: the active run's seed, as its patch names it (full.txt must name the same).
++    pub fn active_seed(&self) -> Option<String> {
++        self.run.as_ref().filter(|r| r.gamedata_applied()).map(|r| r.patch.seed.clone())
++    }
++
+     /// the original game: the active run's GameData cells put back.
+     pub fn original(&mut self, g: &mut dyn Guest) {
+         self.placements.clear();
+@@ -468,6 +476,9 @@ pub fn after_frame(system: &mut System) {
+     // round 71: the chest hook follows the active run's chest list (nothing without one)
+     let data = data_dir(system);
+     crate::fates_rando_chests::frame(system, &data);
++    // round 74: the names-in-dialogue trap follows the active run's full.txt (nothing without
++    // one: every run made with look = keep)
++    crate::fates_rando_names::frame(system, &data);
+     // engine round E2: the active Nuzlocke game's frame (nothing without one); round 61: while
+     // the unit pool holds a player army (`fates_nuzlocke::in_game`), not GameConfigData +0xB
+     if let Some(n) = system.rando.nuz.as_mut() {
+@@ -1272,6 +1283,12 @@ fn make_run_inner(data: &Path, id: &str, seed: &str, answer: &str, game: Option<
+     if rules.is_file() {
+         keep.push((rules, crate::fates_nuzlocke::RULES_FILE.to_string()));
+     }
++    // round 74: the full swap's names and voices (full.txt beside the patch, only with look =
++    // full: no file = the names trap stays off for this run)
++    let full = work.join(crate::fates_rando_names::FILE);
++    if full.is_file() {
++        keep.push((full, crate::fates_rando_names::FILE.to_string()));
++    }
+     for (from, name) in keep {
+         let _ = std::fs::copy(&from, dir.join(&name));
+     }
+diff --git a/crates/zakuro-core/src/kernel/svc.rs b/crates/zakuro-core/src/kernel/svc.rs
+index ab085b5..d85a6d6 100644
+--- a/crates/zakuro-core/src/kernel/svc.rs
++++ b/crates/zakuro-core/src/kernel/svc.rs
+@@ -106,6 +106,9 @@ pub fn dispatch(system: &mut System, number: u32) {
+         // Fire Emblem Fates' randomizer: the chest hook's svc at ev::ItemGain (round 71;
+         // only while a run with a chest list is active, else that word is the original's)
+         crate::fates_rando_chests::SVC_NUMBER if crate::fates_rando_chests::on_svc(system) => {}
++        // round 74: the names-in-dialogue trap's svc in Mess::Get (only while a run with a
++        // full swap's full.txt is active, else that word is the original's)
++        crate::fates_rando_names::SVC_NUMBER if crate::fates_rando_names::on_svc(system) => {}
+         _ => {
+             log::warn!(
+                 "unimplemented svc 0x{number:02X} at 0x{:08X} (r0={:08X} r1={:08X} r2={:08X} r3={:08X})",
+diff --git a/crates/zakuro-core/src/lib.rs b/crates/zakuro-core/src/lib.rs
+index 3b6b0bb..2d14d63 100644
+--- a/crates/zakuro-core/src/lib.rs
++++ b/crates/zakuro-core/src/lib.rs
+@@ -9,6 +9,7 @@ pub mod fates_nuzlocke;
+ pub mod fates_rando;
+ pub mod fates_rando_chests;
+ pub mod fates_rando_file;
++pub mod fates_rando_names;
+ pub mod fates_rando_session;
+ pub mod game_ui;
+ pub mod cro;
+-- 
+2.55.0.windows.5
+

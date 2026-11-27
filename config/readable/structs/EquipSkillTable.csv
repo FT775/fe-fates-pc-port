@@ -1,0 +1,4 @@
+offset,size,type,name,confidence,evidence,elements
+0x000,0x4,ptr,table,high,"EquipSkill::Get(short) 0x001758E8 returns this word + number * 0x20 (the Skill records, docs/TABLES.md Skill)",
+0x004,0x4,u32,common_count,high,"EquipSkill::GetCommonNum(void) 0x001758B8 returns this word; unit::EquipSkillPool::Tst 0x0053AA80 tests only numbers below it",
+0x008,0x4,u32,count,high,"EquipSkill::GetNum(void) 0x001758FC returns this word",

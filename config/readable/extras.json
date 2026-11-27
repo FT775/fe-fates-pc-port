@@ -1,0 +1,372 @@
+{
+ "_comment": "Per-game address maps for tools/extras/usa_extras.py (built-in visual/speed tweaks relocated from another release's cheat codes). Addresses and instruction-shape descriptions only; no game bytes. The tool uses the entry for config/game.json 'key'.",
+ "fe14": {
+  "status": "todo",
+  "title": "Fire Emblem Fates - Special Edition (USA)",
+  "todo": "TODO(fe14): no extras map yet. The Awakening extras (16:9, smooth map sprites, faster battles, feet hook) come from fe-awakening-recomp's EUR Awakening codes; none of their sites exist in Fates. A Fates map needs its own research (map camera aspect literal, map unit sprite drawer, battle speed control, skinning product) and a source of codes. Keep the fe13 entry as the worked example of the format.",
+  "map": []
+ },
+ "fe13": {
+  "status": "ready",
+  "title": "Fire Emblem: Awakening (USA)",
+  "source_title_id": "000400000009F100",
+  "target_title_id": "00040000000A0500",
+  "source_repo": "github.com/Zelkin1/fe-awakening-recomp (MIT)",
+  "enhancements_txt": "build/ext/fe-awakening-recomp/source/zakuro/crates/zakuro-core/src/enhancements.txt",
+  "text_base": "0x00100000",
+  "text_size": "0x00359B88",
+  "source_cave": [
+   "0x0045AF00",
+   "0x0045B000"
+  ],
+  "target_cave": "0x00459C00",
+  "regions": [
+   {
+    "lo": "0x001D6100",
+    "hi": "0x001D6200",
+    "offset": "0x3BC",
+    "what": "Faster battles: battle speed control (jump tables, cases)"
+   },
+   {
+    "lo": "0x002D1900",
+    "hi": "0x002D1A00",
+    "offset": "0x5D8",
+    "what": "16:9 glow: screen-copy caller"
+   },
+   {
+    "lo": "0x002EA600",
+    "hi": "0x002EA640",
+    "offset": "0x664",
+    "what": "16:9 glow: draw wrapper and the function after it"
+   },
+   {
+    "lo": "0x002FE300",
+    "hi": "0x002FE320",
+    "offset": "0x664",
+    "what": "16:9: camera projection builder"
+   },
+   {
+    "lo": "0x00309000",
+    "hi": "0x00309100",
+    "offset": "0x664",
+    "what": "16:9 glow: callee of the draw wrapper"
+   },
+   {
+    "lo": "0x003D1B00",
+    "hi": "0x003D2100",
+    "offset": "0x9F8",
+    "what": "Smooth map sprites: map unit sprite and HP bar drawer"
+   },
+   {
+    "lo": "0x003D57F0",
+    "hi": "0x003D57F8",
+    "offset": "0x9F8",
+    "what": "16:9: map camera aspect literal"
+   }
+  ],
+  "data_words": [
+   "0x003D57F4",
+   "0x0045AF28",
+   "0x0045AF2C",
+   "0x0045AF30",
+   "0x0045AF70",
+   "0x0045AF74"
+  ],
+  "pointer_words": [
+   "0x001D6168",
+   "0x001D61B4"
+  ],
+  "map": [
+   {
+    "feature": "16:9",
+    "source": "0x002FE310",
+    "target": "0x002FDCAC",
+    "kind": "hook site (BL to cave)",
+    "what": "aspect divide in the perspective projection builder func_002FD940; s17 = camera aspect",
+    "checks": [
+     {
+      "at": "0x002FDCAC",
+      "insn": "vdiv\\.f32\\s+s2, s0, s17$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9",
+    "source": "0x003D57F4",
+    "target": "0x003D4DFC",
+    "kind": "literal (float)",
+    "what": "map camera aspect 5:3, loaded by vldr in func_003D4BD4; patched to 16:9",
+    "checks": [
+     {
+      "word": "0x003D4DFC",
+      "is": "five_thirds"
+     },
+     {
+      "at": "0x003D4C24",
+      "insn": "vldr\\s+s5, \\[pc, #\\d+\\]\\s+@ 0x3d4dfc"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9 glow",
+    "source": "0x002EA610",
+    "target": "0x002E9FAC",
+    "kind": "hook site (BL to cave, cave tail-calls original)",
+    "what": "last call in func_002E9F30 (2D draw wrapper): bl func_00308A7C",
+    "checks": [
+     {
+      "at": "0x002E9FAC",
+      "insn": "bl\\s+0x308a7c$"
+     },
+     {
+      "at": "0x002E9FB0",
+      "insn": "add\\s+sp, sp, #48$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9 glow",
+    "source": "0x003090E0",
+    "target": "0x00308A7C",
+    "kind": "branch target (function)",
+    "what": "callee of the draw wrapper; cave B ends with B to it",
+    "checks": [
+     {
+      "func": "0x00308A7C"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9 glow",
+    "source": "0x002EA620",
+    "target": "0x002E9FBC",
+    "kind": "call target (function)",
+    "what": "screen-copy draw function; cave C calls it again for the 512-row case",
+    "checks": [
+     {
+      "func": "0x002E9FBC"
+     },
+     {
+      "at": "0x002E9FBC",
+      "insn": "push\\s+\\{r4, r5, r6, r7, r8, r9, sl, fp, lr\\}$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9 glow",
+    "source": "0x002D1984",
+    "target": "0x002D13AC",
+    "kind": "hook site (BL to cave)",
+    "what": "stack release right after func_002D132C's call to func_002E9FBC (glow screen copy)",
+    "checks": [
+     {
+      "at": "0x002D13A8",
+      "insn": "bl\\s+0x2e9fbc$"
+     },
+     {
+      "at": "0x002D13AC",
+      "insn": "add\\s+sp, sp, #20$"
+     },
+     {
+      "at": "0x002D139C",
+      "insn": "ldrsb\\s+r0, \\[r0, #48\\]"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "16:9 glow",
+    "source": "0x0018D000",
+    "target": "0x0018D000",
+    "kind": "caller window constant inside cave B (kept as is)",
+    "what": "cave B acts only when func_002E9F30 was called from [0x18D000,0x18D800); in USA that window holds exactly the 12 calls of func_0018D3C4 (the glow passes) and no other caller",
+    "checks": [
+     {
+      "callers_of": "0x002E9F30",
+      "window": [
+       "0x0018D000",
+       "0x0018D800"
+      ],
+      "calls": 12,
+      "owner": "func_0018D3C4"
+     }
+    ],
+    "confidence": "medium"
+   },
+   {
+    "feature": "Smooth map sprites",
+    "source": "0x003D1B18",
+    "target": "0x003D1120",
+    "kind": "NOP site",
+    "what": "store of the whole-pixel X over the exact one (func_003D0E7C)",
+    "checks": [
+     {
+      "at": "0x003D1120",
+      "insn": "vstr\\s+s0, \\[sp, #16\\]$"
+     },
+     {
+      "at": "0x003D1118",
+      "insn": "vstmia\\s+r0, \\{s16-s17\\}$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Smooth map sprites",
+    "source": "0x003D1B24",
+    "target": "0x003D112C",
+    "kind": "NOP site",
+    "what": "store of the whole-pixel Y over the exact one (func_003D0E7C)",
+    "checks": [
+     {
+      "at": "0x003D112C",
+      "insn": "vstr\\s+s0, \\[sp, #20\\]$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Smooth map sprites",
+    "source": "0x003D206C",
+    "target": "0x003D1674",
+    "kind": "replaced block (12 words, 3 kept)",
+    "what": "HP bar fill length: float->int, at-least-1 rule, int->float (func_003D0E7C)",
+    "checks": [
+     {
+      "at": "0x003D1674",
+      "insn": "vcvt\\.s32\\.f32\\s+s0, s0$"
+     },
+     {
+      "at": "0x003D1690",
+      "insn": "ldr\\s+sl, \\[pc"
+     },
+     {
+      "at": "0x003D1694",
+      "insn": "add\\s+r3, sp, #24$"
+     },
+     {
+      "at": "0x003D1698",
+      "insn": "ldm\\s+sl, \\{r0, r1, r2\\}$"
+     },
+     {
+      "at": "0x003D169C",
+      "insn": "vcvt\\.f32\\.s32\\s+s1, s0$"
+     },
+     {
+      "at": "0x003D16A0",
+      "insn": "vcvt\\.f32\\.s32\\s+s0, s0$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Faster battles",
+    "source": "0x001D6168",
+    "target": "0x001D5DAC",
+    "kind": "jump-table entry (pointer)",
+    "what": "leaving-mode table, entry for mode 0 (normal speed), func_001D5D70",
+    "checks": [
+     {
+      "at": "0x001D5DA0",
+      "insn": "ldrcc\\s+pc, \\[pc, r1, lsl #2\\]$"
+     },
+     {
+      "word": "0x001D5DAC",
+      "is": "eq:0x001D5DE4"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Faster battles",
+    "source": "0x001D61A0",
+    "target": "0x001D5DE4",
+    "kind": "branch target (table default case)",
+    "what": "where cave piece 1 returns",
+    "checks": [
+     {
+      "at": "0x001D5DD8",
+      "insn": "vldr\\s+s2, \\[r5, #32\\]$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Faster battles",
+    "source": "0x001D61B4",
+    "target": "0x001D5DF8",
+    "kind": "jump-table entry (pointer)",
+    "what": "entering-mode table, entry for mode 0 (normal speed), func_001D5D70",
+    "checks": [
+     {
+      "at": "0x001D5DEC",
+      "insn": "ldrcc\\s+pc, \\[pc, r1, lsl #2\\]$"
+     },
+     {
+      "word": "0x001D5DF8",
+      "is": "eq:0x001D5E30"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Faster battles",
+    "source": "0x001D61EC",
+    "target": "0x001D5E30",
+    "kind": "branch target (table default case)",
+    "what": "where cave piece 2 returns",
+    "checks": [
+     {
+      "at": "0x001D5E24",
+      "insn": "vldr\\s+s1, \\[r5, #32\\]$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Feet",
+    "source": "0x00306964",
+    "target": "0x00306300",
+    "kind": "hook (function entry)",
+    "what": "skinning product: r0 = out matrix, r1 = world matrix, r2 = inverse bind (3x4 floats)",
+    "checks": [
+     {
+      "func": "0x00306300"
+     },
+     {
+      "at": "0x00306300",
+      "insn": "vpush\\s+\\{d8-d10\\}$"
+     }
+    ],
+    "confidence": "high"
+   },
+   {
+    "feature": "Feet",
+    "source": "0x002607CC",
+    "target": "0x002602A0",
+    "kind": "return address checked by the hook",
+    "what": "instruction after the per-bone bl func_00306300 in the skinning loop of func_002600B4 (r2 = bone + 0xA4)",
+    "checks": [
+     {
+      "at": "0x0026029C",
+      "insn": "bl\\s+0x306300$"
+     },
+     {
+      "at": "0x00260290",
+      "insn": "add\\s+r2, r6, #164$"
+     },
+     {
+      "at": "0x002602A0",
+      "insn": "add\\s+r5, r5, #48$"
+     }
+    ],
+    "confidence": "high"
+   }
+  ]
+ }
+}
